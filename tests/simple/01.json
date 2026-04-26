@@ -1,0 +1,119 @@
+[
+  {
+    "name": "add eax, ebx (32-bit register to register)",
+    "bytes": [1, 216],
+    "initial": {
+      "regs": {
+        "eax": 100,
+        "ebx": 200,
+        "ecx": 0,
+        "edx": 0,
+        "esp": 4096,
+        "ebp": 0,
+        "esi": 0,
+        "edi": 0,
+        "cs": 0,
+        "ds": 0,
+        "es": 0,
+        "ss": 0,
+        "fs": 0,
+        "gs": 0,
+        "ip": 0,
+        "eflags": 2,
+        "d": 1
+      },
+      "ram": [
+        [0, 1],
+        [1, 216],
+        [2, 144]
+      ]
+    },
+    "final": {
+      "regs": {
+        "eax": 300,
+        "ip": 2,
+        "eflags": 2
+      },
+      "ram": []
+    },
+    "idx": 0
+  },
+  {
+    "name": "add ecx, edx (with carry flag set)",
+    "bytes": [1, 209],
+    "initial": {
+      "regs": {
+        "eax": 0,
+        "ebx": 0,
+        "ecx": 4294967295,
+        "edx": 1,
+        "esp": 4096,
+        "ebp": 0,
+        "esi": 0,
+        "edi": 0,
+        "cs": 0,
+        "ds": 0,
+        "es": 0,
+        "ss": 0,
+        "fs": 0,
+        "gs": 0,
+        "ip": 0,
+        "d": 1,
+        "eflags": 2
+      },
+      "ram": [
+        [0, 1],
+        [1, 209],
+        [2, 144]
+      ]
+    },
+    "final": {
+      "regs": {
+        "ecx": 0,
+        "ip": 2,
+        "eflags": 87
+      },
+      "ram": []
+    },
+    "idx": 1
+  },
+  {
+    "name": "add esi, edi (32-bit)",
+    "bytes": [1, 254],
+    "initial": {
+      "regs": {
+        "eax": 0,
+        "ebx": 0,
+        "ecx": 0,
+        "edx": 0,
+        "esp": 4096,
+        "ebp": 0,
+        "esi": 1000000,
+        "edi": 2000000,
+        "cs": 0,
+        "ds": 0,
+        "es": 0,
+        "ss": 0,
+        "fs": 0,
+        "gs": 0,
+        "ip": 0,
+        "d": 1,
+        "eflags": 2
+      },
+      "ram": [
+        [0, 1],
+        [1, 254],
+        [2, 144]
+      ]
+    },
+    "final": {
+      "regs": {
+        "esi": 3000000,
+        "ip": 2,
+        "eflags": 6
+      },
+      "ram": []
+    },
+    "idx": 2
+  }
+]

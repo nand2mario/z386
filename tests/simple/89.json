@@ -1,0 +1,119 @@
+[
+  {
+    "name": "mov eax, ebx (32-bit register to register)",
+    "bytes": [137, 216],
+    "initial": {
+      "regs": {
+        "eax": 0,
+        "ebx": 305419896,
+        "ecx": 0,
+        "edx": 0,
+        "esp": 4096,
+        "ebp": 0,
+        "esi": 0,
+        "edi": 0,
+        "cs": 0,
+        "ds": 0,
+        "es": 0,
+        "ss": 0,
+        "fs": 0,
+        "gs": 0,
+        "ip": 0,
+        "d": 1,
+        "eflags": 2
+      },
+      "ram": [
+        [0, 137],
+        [1, 216],
+        [2, 144]
+      ]
+    },
+    "final": {
+      "regs": {
+        "eax": 305419896,
+        "ip": 2,
+        "eflags": 2
+      },
+      "ram": []
+    },
+    "idx": 0
+  },
+  {
+    "name": "mov ecx, edx (32-bit register to register)",
+    "bytes": [137, 209],
+    "initial": {
+      "regs": {
+        "eax": 0,
+        "ebx": 0,
+        "ecx": 0,
+        "edx": 2863311530,
+        "esp": 4096,
+        "ebp": 0,
+        "esi": 0,
+        "edi": 0,
+        "cs": 0,
+        "ds": 0,
+        "es": 0,
+        "ss": 0,
+        "fs": 0,
+        "gs": 0,
+        "ip": 0,
+        "d": 1,
+        "eflags": 2
+      },
+      "ram": [
+        [0, 137],
+        [1, 209],
+        [2, 144]
+      ]
+    },
+    "final": {
+      "regs": {
+        "ecx": 2863311530,
+        "ip": 2,
+        "eflags": 2
+      },
+      "ram": []
+    },
+    "idx": 1
+  },
+  {
+    "name": "mov esi, edi (32-bit register to register)",
+    "bytes": [137, 254],
+    "initial": {
+      "regs": {
+        "eax": 0,
+        "ebx": 0,
+        "ecx": 0,
+        "edx": 0,
+        "esp": 4096,
+        "ebp": 0,
+        "esi": 0,
+        "edi": 1431655765,
+        "cs": 0,
+        "ds": 0,
+        "es": 0,
+        "ss": 0,
+        "fs": 0,
+        "gs": 0,
+        "ip": 0,
+        "d": 1,
+        "eflags": 2
+      },
+      "ram": [
+        [0, 137],
+        [1, 254],
+        [2, 144]
+      ]
+    },
+    "final": {
+      "regs": {
+        "esi": 1431655765,
+        "ip": 2,
+        "eflags": 2
+      },
+      "ram": []
+    },
+    "idx": 2
+  }
+]

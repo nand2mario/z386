@@ -1,0 +1,116 @@
+[
+  {
+    "name": "inc eax",
+    "bytes": [64],
+    "initial": {
+      "regs": {
+        "eax": 0,
+        "ebx": 0,
+        "ecx": 0,
+        "edx": 0,
+        "esp": 4096,
+        "ebp": 0,
+        "esi": 0,
+        "edi": 0,
+        "cs": 0,
+        "ds": 0,
+        "es": 0,
+        "ss": 0,
+        "fs": 0,
+        "gs": 0,
+        "ip": 0,
+        "d": 1,
+        "eflags": 2
+      },
+      "ram": [
+        [0, 64],
+        [1, 144]
+      ]
+    },
+    "final": {
+      "regs": {
+        "eax": 1,
+        "ip": 1,
+        "eflags": 2
+      },
+      "ram": []
+    },
+    "idx": 0
+  },
+  {
+    "name": "inc ecx (test zero flag clear)",
+    "bytes": [65],
+    "initial": {
+      "regs": {
+        "eax": 0,
+        "ebx": 0,
+        "ecx": 0,
+        "edx": 0,
+        "esp": 4096,
+        "ebp": 0,
+        "esi": 0,
+        "edi": 0,
+        "cs": 0,
+        "ds": 0,
+        "es": 0,
+        "ss": 0,
+        "fs": 0,
+        "gs": 0,
+        "ip": 0,
+        "d": 1,
+        "eflags": 66
+      },
+      "ram": [
+        [0, 65],
+        [1, 144]
+      ]
+    },
+    "final": {
+      "regs": {
+        "ecx": 1,
+        "ip": 1,
+        "eflags": 2
+      },
+      "ram": []
+    },
+    "idx": 1
+  },
+  {
+    "name": "inc edx (boundary test -1 to 0)",
+    "bytes": [66],
+    "initial": {
+      "regs": {
+        "eax": 0,
+        "ebx": 0,
+        "ecx": 0,
+        "edx": 4294967295,
+        "esp": 4096,
+        "ebp": 0,
+        "esi": 0,
+        "edi": 0,
+        "cs": 0,
+        "ds": 0,
+        "es": 0,
+        "ss": 0,
+        "fs": 0,
+        "gs": 0,
+        "ip": 0,
+        "d": 1,
+        "eflags": 2
+      },
+      "ram": [
+        [0, 66],
+        [1, 144]
+      ]
+    },
+    "final": {
+      "regs": {
+        "edx": 0,
+        "ip": 1,
+        "eflags": 86
+      },
+      "ram": []
+    },
+    "idx": 2
+  }
+]

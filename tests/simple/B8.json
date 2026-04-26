@@ -1,0 +1,128 @@
+[
+  {
+    "name": "mov eax, imm32 (load immediate 0x12345678)",
+    "bytes": [184, 120, 86, 52, 18],
+    "initial": {
+      "regs": {
+        "eax": 0,
+        "ebx": 0,
+        "ecx": 0,
+        "edx": 0,
+        "esp": 4096,
+        "ebp": 0,
+        "esi": 0,
+        "edi": 0,
+        "cs": 0,
+        "ds": 0,
+        "es": 0,
+        "ss": 0,
+        "fs": 0,
+        "gs": 0,
+        "ip": 0,
+        "d": 1,
+        "eflags": 2
+      },
+      "ram": [
+        [0, 184],
+        [1, 120],
+        [2, 86],
+        [3, 52],
+        [4, 18],
+        [5, 144]
+      ]
+    },
+    "final": {
+      "regs": {
+        "eax": 305419896,
+        "ip": 5,
+        "eflags": 2
+      },
+      "ram": []
+    },
+    "idx": 0
+  },
+  {
+    "name": "mov ebx, imm32 (load immediate 0xDEADBEEF)",
+    "bytes": [187, 239, 190, 173, 222],
+    "initial": {
+      "regs": {
+        "eax": 0,
+        "ebx": 0,
+        "ecx": 0,
+        "edx": 0,
+        "esp": 4096,
+        "ebp": 0,
+        "esi": 0,
+        "edi": 0,
+        "cs": 0,
+        "ds": 0,
+        "es": 0,
+        "ss": 0,
+        "fs": 0,
+        "gs": 0,
+        "ip": 0,
+        "d": 1,
+        "eflags": 2
+      },
+      "ram": [
+        [0, 187],
+        [1, 239],
+        [2, 190],
+        [3, 173],
+        [4, 222],
+        [5, 144]
+      ]
+    },
+    "final": {
+      "regs": {
+        "ebx": 3735928559,
+        "ip": 5,
+        "eflags": 2
+      },
+      "ram": []
+    },
+    "idx": 1
+  },
+  {
+    "name": "mov ecx, imm32 (load immediate 0x00000001)",
+    "bytes": [185, 1, 0, 0, 0],
+    "initial": {
+      "regs": {
+        "eax": 0,
+        "ebx": 0,
+        "ecx": 0,
+        "edx": 0,
+        "esp": 4096,
+        "ebp": 0,
+        "esi": 0,
+        "edi": 0,
+        "cs": 0,
+        "ds": 0,
+        "es": 0,
+        "ss": 0,
+        "fs": 0,
+        "gs": 0,
+        "ip": 0,
+        "d": 1,
+        "eflags": 2
+      },
+      "ram": [
+        [0, 185],
+        [1, 1],
+        [2, 0],
+        [3, 0],
+        [4, 0],
+        [5, 144]
+      ]
+    },
+    "final": {
+      "regs": {
+        "ecx": 1,
+        "ip": 5,
+        "eflags": 2
+      },
+      "ram": []
+    },
+    "idx": 2
+  }
+]
