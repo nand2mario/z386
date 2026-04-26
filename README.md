@@ -14,3 +14,4 @@ Comparison with ao486 on DE10-Nano:
 |Frequency| 85Mhz | 90Mhz |
 |DOOM FPS (max details)| 16.5 | 21.0 |
 
+Credits: z386 is written by nand2mario and builds on the Intel 386 microcode disassembly and silicon reverse engineering work of [reenigne](https://www.reenigne.org/blog/), [gloriouscow](https://github.com/dbalsom), [smartest blob](https://github.com/a-mcego), and [Ken Shirriff](https://www.righto.com/).
