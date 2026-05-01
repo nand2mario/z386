@@ -29,7 +29,7 @@ altsyncram #(
 	    .outdata_reg_a("UNREGISTERED"),
 	    .address_aclr_a("NONE"),
 	    .outdata_aclr_a("NONE"),
-    .init_file("../17.z386/ucode45.mif"),
+    .init_file("ucode45.mif"),
     .ram_block_type("M10K"),
     .intended_device_family("Cyclone V"),
     .lpm_type("altsyncram")
