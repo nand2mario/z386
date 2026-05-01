@@ -11,66 +11,66 @@ module protection_unit
     import z386_pkg::*;
 (
     // Clock and reset (for 2-stage pipeline)
-    input  logic        clk,
-    input  logic        reset_n,
-    input  logic        pipe_en,          // Pipeline advance enable (matches ROM latch condition)
+    input               clk,
+    input               reset_n,
+    input               pipe_en,          // Pipeline advance enable (matches ROM latch condition)
 
     // Test Control (alu_src field of microcode)
-    input  logic [5:0]  test_const,       // Test constant (ABCDEF field), selects protection test type
-    input  logic [3:0]  aluop_type,       // Lower 4 bits of aluop (TUVWXYZ[3:0]), controls Tiny PLA mux
+    input        [5:0]  test_const,       // Test constant (ABCDEF field), selects protection test type
+    input        [3:0]  aluop_type,       // Lower 4 bits of aluop (TUVWXYZ[3:0]), controls Tiny PLA mux
 
     // Narrowed descriptor attribute bundle used by the protection datapath.
     // This avoids forwarding an entire 32-bit descriptor word when only a
     // small subset of bits participates in the critical path.
-    input  logic        descriptor_g,
-    input  logic        descriptor_p,
-    input  logic [1:0]  descriptor_dpl,
-    input  logic        descriptor_s,
-    input  logic [3:0]  descriptor_type,
-    input  logic [1:0]  descriptor_rpl,
-    input  logic        descriptor_low16_nonzero,
+    input               descriptor_g,
+    input               descriptor_p,
+    input        [1:0]  descriptor_dpl,
+    input               descriptor_s,
+    input        [3:0]  descriptor_type,
+    input        [1:0]  descriptor_rpl,
+    input               descriptor_low16_nonzero,
 
     // Selector fields (from segment register or temp register)
-    input  logic [1:0]  selector_rpl,     // Requested Privilege Level (bits[1:0])
-    input  logic        selector_ti,      // Table Indicator (0=GDT, 1=LDT)
-    input  logic        selector_null,    // Null selector (TI=0 AND Index=0)
-    input  logic        selector_oob,     // Selector exceeds GDT/LDT limit
+    input        [1:0]  selector_rpl,     // Requested Privilege Level (bits[1:0])
+    input               selector_ti,      // Table Indicator (0=GDT, 1=LDT)
+    input               selector_null,    // Null selector (TI=0 AND Index=0)
+    input               selector_oob,     // Selector exceeds GDT/LDT limit
 
     // Processor State
-    input  logic [1:0]  cpl,              // Current Privilege Level (CS[1:0])
-    input  logic        pe_mode,          // Protected mode enabled (CR0.PE)
+    input        [1:0]  cpl,              // Current Privilege Level (CS[1:0])
+    input               pe_mode,          // Protected mode enabled (CR0.PE)
 
     // CR0 flags for FPU tests (multiplexed into state vector)
-    input  logic        cr0_et,           // CR0.ET (1=287, 0=387)
-    input  logic        cr0_ts,           // CR0.TS (Task Switched)
-    input  logic        cr0_em,           // CR0.EM (Emulation)
-    input  logic        cr0_mp,           // CR0.MP (Monitor Coprocessor)
+    input               cr0_et,           // CR0.ET (1=287, 0=387)
+    input               cr0_ts,           // CR0.TS (Task Switched)
+    input               cr0_em,           // CR0.EM (Emulation)
+    input               cr0_mp,           // CR0.MP (Monitor Coprocessor)
 
     // ARPL support: latched source RPL from READ_RPL
-    input  logic [1:0]  arpl_rpl,         // Source selector RPL (latched by READ_RPL at uc=6B6)
+    input        [1:0]  arpl_rpl,         // Source selector RPL (latched by READ_RPL at uc=6B6)
 
 
-    input  logic        test_en,          // Enable protection test
+    input               test_en,          // Enable protection test
 
     // Test mode for verification (bypasses Tiny PLA preprocessing)
-    input  logic        test_mode,        // 1 = Direct state vector mode (for testbench)
+    input               test_mode,        // 1 = Direct state vector mode (for testbench)
                                           // 0 = Normal mode (full descriptor processing)
-    input  logic [9:0]  test_state_vector,// Direct state vector input (test mode only)
+    input        [9:0]  test_state_vector,// Direct state vector input (test mode only)
                                           // Format: [9:0] = {p1, p2, b13, b12, p, u, x, ce, rw, a}
 
     //--------------------------------------------------------------------------
     // Outputs (to microcode sequencer and control logic)
     //--------------------------------------------------------------------------
-    output logic [11:0] jump_addr,        // Microcode jump address
-    output logic        jump_valid,       // jump_addr is a redirect (vs 0x000 = CONTINUE)
+    output       [11:0] jump_addr,        // Microcode jump address
+    output              jump_valid,       // jump_addr is a redirect (vs 0x000 = CONTINUE)
 
-    output logic        stack_op,         // K flag: Stack operation / update CPL
-    output logic        limit_check,      // L flag: Perform limit/type validation
-    output logic        validation_ok,    // M flag: Descriptor validated, safe to commit
-    output logic        set_accessed,     // N flag: Set Accessed bit in descriptor
+    output              stack_op,         // K flag: Stack operation / update CPL
+    output              limit_check,      // L flag: Perform limit/type validation
+    output              validation_ok,    // M flag: Descriptor validated, safe to commit
+    output              set_accessed,     // N flag: Set Accessed bit in descriptor
 
-    output logic        result_valid,     // Pipelined result is valid (fires 2 cycles after test)
-    output logic        is_checking_test  // Result is from a "checking" test (not PTGEN action)
+    output              result_valid,     // Pipelined result is valid (fires 2 cycles after test)
+    output              is_checking_test  // Result is from a "checking" test (not PTGEN action)
 );
 
 //==============================================================================
@@ -1294,7 +1294,7 @@ assign is_checking_test = s2_is_checking_test;
 
 `ifdef SIMULATION
     // Test constant name lookup for debug
-    function automatic string test_name(input logic [5:0] tc);
+    function automatic string test_name(input [5:0] tc);
         case (tc)
             TST_LD_NONSS:   return "TST_LD_NONSS";
             TST_SEL_RET:    return "TST_SEL_RET";

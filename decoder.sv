@@ -7,31 +7,31 @@
 module decoder
     import z386_pkg::*;
 (
-    input  logic        clk,
-    input  logic        reset_n,
+    input               clk,
+    input               reset_n,
 
     // Prefetch queue interface
-    input  logic [7:0]  q_bus,          // Byte from prefetch queue
-    input  logic [31:0] q_window,       // 4-byte aligned window at current queue head
-    input  logic [4:0]  pf_count,       // Buffered prefetch bytes available
-    input  logic        pf_empty,       // Prefetch queue empty
-    output logic [2:0]  q_pop_bytes,    // Pop 1/2/4 bytes from prefetch queue
+    input        [7:0]  q_bus,          // Byte from prefetch queue
+    input        [31:0] q_window,       // 4-byte aligned window at current queue head
+    input        [4:0]  pf_count,       // Buffered prefetch bytes available
+    input               pf_empty,       // Prefetch queue empty
+    output       [2:0]  q_pop_bytes,    // Pop 1/2/4 bytes from prefetch queue
 
     // Mode signals
-    input  logic        D,              // Default operand size (CS.D bit)
-    input  logic        mode_32,        // 32-bit mode
-    input  logic        pe_enable,      // Protected mode enable (CR0.PE)
+    input               D,              // Default operand size (CS.D bit)
+    input               mode_32,        // 32-bit mode
+    input               pe_enable,      // Protected mode enable (CR0.PE)
 
     // Control signals
-    input  logic        q_flush,        // Flush decoder on branch
-    input  logic        i_pop,          // Pop decoded instruction from queue
-    input  logic        halted,         // CPU is halted
-    input  logic        stall,          // Stall decoder
+    input               q_flush,        // Flush decoder on branch
+    input               i_pop,          // Pop decoded instruction from queue
+    input               halted,         // CPU is halted
+    input               stall,          // Stall decoder
 
     // Decoded instruction output
     output dec_entry_t  i_bus,          // Decoded instruction
-    output logic        decq_empty,     // Instruction queue empty
-    output logic        decq_full       // Instruction queue full
+    output              decq_empty,     // Instruction queue empty
+    output              decq_full       // Instruction queue full
 );
 
 // Decode state machine
@@ -105,7 +105,7 @@ localparam DECQ_PTR_W = 2;
 reg [DECQ_PTR_W-1:0] decq_rptr;
 reg [DECQ_PTR_W-1:0] decq_wptr;
 reg [2:0]            decq_count;
-dec_entry_t          decq [0:DECQ_DEPTH-1];
+(* ramstyle = "logic" *) dec_entry_t decq [0:DECQ_DEPTH-1];
 
 assign i_bus = decq[decq_rptr];   // Instruction queue head
 assign decq_empty = (decq_count == 3'd0);

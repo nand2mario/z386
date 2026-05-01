@@ -19,20 +19,20 @@ module paging_walker
     input               wp_enable,      // CR0.WP - write protect
 
     // Result interface
-    output logic        walk_done,
-    output logic        walk_fault,
-    output logic [2:0]  fault_code,     // [2]=U, [1]=W, [0]=P
-    output logic [19:0] result_pfn,
-    output logic        result_writable,
-    output logic        result_user,
-    output logic        result_dirty,
-    output logic        result_accessed,
+    output reg          walk_done,
+    output reg          walk_fault,
+    output reg   [2:0]  fault_code,     // [2]=U, [1]=W, [0]=P
+    output reg   [19:0] result_pfn,
+    output reg          result_writable,
+    output reg          result_user,
+    output reg          result_dirty,
+    output reg          result_accessed,
 
     // Memory interface for page table reads and write-backs
-    output logic        mem_rd,
-    output logic        mem_wr,
-    output logic [31:0] mem_addr,
-    output logic [31:0] mem_wdata,
+    output reg          mem_rd,
+    output reg          mem_wr,
+    output reg   [31:0] mem_addr,
+    output reg   [31:0] mem_wdata,
     input        [31:0] mem_data,
     input               mem_ready
 );

@@ -384,7 +384,7 @@ wire        mem_is_dtable;
 wire        stack_push_mode;
 wire        tss_access_flag;
 wire [31:0] mem_linear_addr;
-wire [31:0] seg_lar_result, seg_llim_result;
+wire [31:0] seg_lar_result, seg_llim_result, seg_lbas_result;
 // Internalized: addr_size, mem_seg_base_r, pm_seg_limit_r, mem_seg_base, mem_ea
 
 // Segmentation unit command encoder
@@ -444,6 +444,7 @@ segmentation_unit seg_unit (
     .seg_cache        (seg_cache),
     .lar_result       (seg_lar_result),
     .llim_result      (seg_llim_result),
+    .lbas_result      (seg_lbas_result),
     // Segment state
     .seg_sel          (mem_seg_sel),
     .is_dtable        (mem_is_dtable),
@@ -523,12 +524,12 @@ always_comb begin
                 end
             end
             BUSOP_SDEL: begin
-                if (pe && !gate_detect_cond)
+                if (pe && !gate_detect_cond) begin
                     seg_cmd = SEG_CMD_SDEL;
-            end
-            BUSOP_LLIM: begin
-                if (pe && !gate_detect_cond)
-                    seg_cmd = SEG_CMD_DESC;
+                    // SDEL's descriptor-low operand is encoded in the ALU source
+                    // field. Most sites use TMPC, but cross-privilege CALL uses TMPD.
+                    seg_cmd_data = alu_src_data;
+                end
             end
             BUSOP_SPCR: begin
                 seg_cmd = SEG_CMD_SPCR;
@@ -931,7 +932,13 @@ reg        instr_eip_written;       // EIP was written during instruction (RPTI 
 reg        gate_in_progress;        // Prevent second LDTST (at 5C3) from re-triggering gate detection
 
 // Prefetch restart address (used by BUSOP_PREF / q_flush)
-wire [31:0] pf_flush_ip = op_size[1] ? ind_effective : {16'h0, ind_effective[15:0]};
+wire        pref_writes_ip = (uc_dest == DEST_EIP || uc_dest == DEST_eIP || uc_dest == DEST_IP);
+wire [31:0] pref_ip_raw = pref_writes_ip ? alu_result : ind_effective;
+wire [31:0] pf_flush_ip =
+    (uc_dest == DEST_EIP) ? (D ? pref_ip_raw : {16'h0, pref_ip_raw[15:0]}) :
+    (uc_dest == DEST_eIP) ? (is_dword ? pref_ip_raw : {16'h0, pref_ip_raw[15:0]}) :
+    (uc_dest == DEST_IP)  ? {16'h0, pref_ip_raw[15:0]} :
+    (op_size[1] ? ind_effective : {16'h0, ind_effective[15:0]});
 assign pf_flush_addr = pe_mode_toggle_now ? (CS_base + EIP) : (CS_base + pf_flush_ip);
 
 wire delay_slot_writes_esp = i_rni_delay && (uc_dest == DEST_eSP || uc_dest == DEST_ESP ||
@@ -1656,7 +1663,7 @@ end
 
 // MUL/IMUL overflow: check if upper portion is sign-extension of result
 function automatic logic mul_overflow_flag(
-    input [31:0] upper, input logic sign, input [1:0] op_size);
+    input [31:0] upper, input sign, input [1:0] op_size);
     case (op_size)
         2'd0:    mul_overflow_flag = (upper[7:0]  != {8{sign}});
         2'd1:    mul_overflow_flag = (upper[15:0] != {16{sign}});
@@ -2238,14 +2245,6 @@ always_ff @(posedge clk) begin
         if (write_rpl_s2)
             SLCTR[1:0] <= desc_raw_hi[14:13];
 
-        // DESC (BUSOP_LLIM): write LDTR/TR selector when loading LDT/TR descriptor
-        if (uc_exec && pe && !gate_detect_now && uc_buscode == BUSOP_LLIM) begin
-            if (uc_dest == DEST_DESLDT || uc_dest == DEST_LDTR)
-                LDTR <= SLCTR[15:0];
-            if (uc_dest == DEST_DES_TR || uc_dest == DEST_TR)
-                TR <= SLCTR[15:0];
-        end
-
     end
 
     // TMPeIP/TMPeSP: save EIP/ESP at instruction start and fault entry
@@ -2395,6 +2394,9 @@ always_ff @(posedge clk) begin
                 end
                 BUSOP_LLIM: begin  // LLIM result from segmentation unit
                     IND <= seg_llim_result;
+                end
+                BUSOP_LBAS: begin  // LBAS result from segmentation unit
+                    IND <= seg_lbas_result;
                 end
                 BUSOP_LPCR: begin  // LPCR (0x34) - Load Page Cache Register into IRF2 (IND)
                     case (uc_dest)
@@ -2602,7 +2604,11 @@ always @(posedge clk) begin
     end
 end
 
+`ifdef Z386_ALTERA_ALU
+alu_alt u_alu (
+`else
 alu u_alu (
+`endif
     .op(alu_op5),
     .src(alu_src),
     .dst(alu_dst),
@@ -3117,7 +3123,7 @@ begin
 end
 endfunction
 
-function automatic logic div_get_sign_bit(input logic [31:0] val, input logic [1:0] sz);
+function automatic logic div_get_sign_bit(input [31:0] val, input [1:0] sz);
     case (sz)
         2'd0: return val[7];
         2'd1: return val[15];
@@ -3125,7 +3131,7 @@ function automatic logic div_get_sign_bit(input logic [31:0] val, input logic [1
     endcase
 endfunction
 
-function automatic logic [31:0] div_mask_to_size(input logic [31:0] val, input logic [1:0] sz);
+function automatic logic [31:0] div_mask_to_size(input [31:0] val, input [1:0] sz);
     case (sz)
         2'd0: return {24'h0, val[7:0]};
         2'd1: return {16'h0, val[15:0]};
@@ -3133,7 +3139,7 @@ function automatic logic [31:0] div_mask_to_size(input logic [31:0] val, input l
     endcase
 endfunction
 
-function automatic logic [31:0] div_negate_to_size(input logic [31:0] val, input logic [1:0] sz);
+function automatic logic [31:0] div_negate_to_size(input [31:0] val, input [1:0] sz);
     case (sz)
         2'd0: return {24'h0, (~val[7:0]) + 8'h1};
         2'd1: return {16'h0, (~val[15:0]) + 16'h1};
@@ -3142,14 +3148,14 @@ function automatic logic [31:0] div_negate_to_size(input logic [31:0] val, input
 endfunction
 
 task automatic div7_calc(
-    input  logic [31:0] q_in,
-    input  logic [31:0] r_in,
-    input  logic [31:0] d_in,
-    input  logic        r_nonneg_prev_in,
-    input  logic [1:0]  op_size_in,
-    output logic [31:0] q_out,
-    output logic [31:0] r_out,
-    output logic        r_nonneg_out
+    input        [31:0] q_in,
+    input        [31:0] r_in,
+    input        [31:0] d_in,
+    input               r_nonneg_prev_in,
+    input        [1:0]  op_size_in,
+    output       [31:0] q_out,
+    output       [31:0] r_out,
+    output              r_nonneg_out
 );
     int unsigned width;
     logic [31:0] q;

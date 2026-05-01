@@ -6,7 +6,7 @@
 //   [15:12]: control bits
 //
 function automatic logic [15:0] pla_entry_lookup(
-    input logic [12:0] addr_in
+    input [12:0] addr_in
 );
     casez (addr_in)
         // Entries with zero output

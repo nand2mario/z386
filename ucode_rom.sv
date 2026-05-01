@@ -4,13 +4,13 @@
 module ucode_rom #(
     parameter INIT_HEX = "ucode45.hex"
 ) (
-    input  wire        clk,
-    input  wire        ce,
-    input  wire [11:0] addr,
-    output wire [44:0] q,
-    output wire [5:0]  q_shift_source,
-    output wire [5:0]  q_shift_alu_src,
-    output wire [6:0]  q_shift_aluop
+    input              clk,
+    input              ce,
+    input       [11:0] addr,
+    output      [44:0] q,
+    output      [5:0]  q_shift_source,
+    output      [5:0]  q_shift_alu_src,
+    output      [6:0]  q_shift_aluop
 );
 
 (* preserve *) reg [5:0] q_shift_source_r;

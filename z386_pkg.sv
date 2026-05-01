@@ -614,6 +614,7 @@ localparam BUSOP_RD = 6'h16;          // RD - Memory read
 // Write operations
 localparam BUSOP_WR_WORD = 6'h11;     // WR w - Word write (PUSH seg, MOV [mem],Sreg)
 localparam BUSOP_WR = 6'h12;          // WR - Memory write
+localparam BUSOP_WR_D = 6'h13;        // WR D - Dword write (SGDT/SIDT base store)
 localparam BUSOP_WR_OPR = 6'h1A;      // wr - Write-back using OPR_R (string ops, PUSH [mem])
 
 // Check write (probe)
@@ -855,7 +856,7 @@ function automatic [31:0] split_write_second(input [31:0] data, input [1:0] addr
 endfunction
 
 // Even parity calculation
-function automatic logic even_parity(input [31:0] value, input logic use32);
+function automatic logic even_parity(input [31:0] value, input use32);
     if (use32)
         even_parity = ~^value;
     else
@@ -866,11 +867,11 @@ endfunction
 // LOCK is valid if and only if: instruction performs read-modify-write on memory operand
 // Returns 1 if LOCK prefix is INVALID (should trigger #UD)
 function automatic logic check_lock_invalid(
-    input logic [1:0] rep_lock,
-    input logic       has_0f,
-    input logic [7:0] opcode,
-    input logic       has_modrm,
-    input logic [7:0] modrm
+    input [1:0] rep_lock,
+    input       has_0f,
+    input [7:0] opcode,
+    input       has_modrm,
+    input [7:0] modrm
 );
     // All variable declarations must be at the top
     logic lock_prefix;

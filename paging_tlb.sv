@@ -16,20 +16,20 @@ module paging_tlb
 
     // Registered lookup interface (combinational output)
     input        [31:0] linear_addr,
-    output logic        hit,
-    output logic [31:0] physical_addr,
-    output logic        writable,       // Combined PDE & PTE R/W
-    output logic        user,           // Combined PDE & PTE U/S
-    output logic        dirty,          // D bit from PTE
+    output reg          hit,
+    output reg   [31:0] physical_addr,
+    output reg          writable,       // Combined PDE & PTE R/W
+    output reg          user,           // Combined PDE & PTE U/S
+    output reg          dirty,          // D bit from PTE
 
     // Live demand lookup interface. This keeps the idle demand fast path off
     // the registered-address mux used by prefetch/walker lookups.
     input        [31:0] linear_addr_live,
-    output logic        live_hit,
-    output logic [31:0] live_physical_addr,
-    output logic        live_writable,
-    output logic        live_user,
-    output logic        live_dirty,
+    output reg          live_hit,
+    output reg   [31:0] live_physical_addr,
+    output reg          live_writable,
+    output reg          live_user,
+    output reg          live_dirty,
 
     // Update interface (from page walker)
     input               update_valid,

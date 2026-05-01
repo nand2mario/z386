@@ -552,6 +552,7 @@ always_ff @(posedge clk or negedge reset_n) begin
         pf_fault <= 1'b0;
         fault_code <= 3'b000;
         walk_request <= 1'b0;
+        lookup_cancel_pulse_r <= 1'b0;
         mem_accepted <= 1'b0;
 
         // Clear walker pending on completion
@@ -907,7 +908,7 @@ always_ff @(posedge clk or negedge reset_n) begin
 end
 
 // Latch mem request parameters (shared by crossing and TLB miss paths)
-task automatic latch_mem_request(input [31:0] addr, input logic crossing);
+task automatic latch_mem_request(input [31:0] addr, input crossing);
     req_linear <= addr;
     req_op_size <= mem_op_size;
     req_is_write <= is_write_access;

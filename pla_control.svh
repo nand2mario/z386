@@ -10,9 +10,9 @@
 //   [11:0] - bits abcdefghijkl
 //
 function automatic logic [11:0] pla_control_lookup(
-    input logic [6:0] state,
-    input logic [7:0] instruction,
-    input logic [4:0] mode
+    input [6:0] state,
+    input [7:0] instruction,
+    input [4:0] mode
 );
     logic [19:0] addr_key;
     addr_key = {state, instruction, mode};

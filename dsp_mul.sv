@@ -5,22 +5,22 @@
 // Computes 32x32->64 bit multiplication in 4 cycles instead of 32.
 //
 module dsp_mul (
-    input  logic        clk,
-    input  logic        reset_n,
+    input               clk,
+    input               reset_n,
 
     // Control
-    input  logic        start,          // Start multiplication
-    input  logic [1:0]  op_size,        // 0=byte, 1=word, 2=dword
-    input  logic        is_signed,      // IMUL vs MUL
+    input               start,          // Start multiplication
+    input        [1:0]  op_size,        // 0=byte, 1=word, 2=dword
+    input               is_signed,      // IMUL vs MUL
 
     // Operands
-    input  logic [31:0] multiplicand,   // MULTMP
-    input  logic [31:0] multiplier,     // TMPB
+    input        [31:0] multiplicand,   // MULTMP
+    input        [31:0] multiplier,     // TMPB
 
     // Result - positioned for z386 compatibility
-    output logic [63:0] product,        // Full 64-bit result
-    output logic        done,           // Result valid for this cycle
-    output logic        active          // Multiplication in progress (only for 32-bit)
+    output reg   [63:0] product,        // Full 64-bit result
+    output              done,           // Result valid for this cycle
+    output reg          active          // Multiplication in progress (only for 32-bit)
 );
 
     wire [15:0] Alo = multiplicand[15:0];

@@ -28,6 +28,7 @@ module segmentation_unit
     output seg_desc_t  seg_cache [0:10],   // Descriptor caches (SEG_ES=0..SEG_GDT=10)
     output     [31:0]  lar_result,         // LAR combinational readback (keyed by seg_target)
     output     [31:0]  llim_result,        // LLIM combinational readback (keyed by seg_target)
+    output     [31:0]  lbas_result,        // LBAS combinational readback (keyed by seg_target)
 
     // Segment state (set by commands, used by address translation and z386)
     output reg [3:0]   seg_sel,            // Active segment for memory ops
@@ -139,12 +140,13 @@ function automatic [3:0] effective_target(input [3:0] target);
     effective_target = (target == SEG_NONE) ? desc_write_seg : target;
 endfunction
 
-// LAR/LLIM: z386 routes these to IND in same cycle
+// LAR/LLIM/LBAS: z386 routes these to IND in same cycle
 seg_desc_t lar_desc;
 wire [7:0] lar_ar_byte = {lar_desc.P, lar_desc.DPL, lar_desc.S, lar_desc.seg_type};
 assign lar_desc = (seg_target <= SEG_GDT) ? seg_cache[seg_target] : '0;
 assign lar_result = {16'h0, lar_ar_byte, 8'h0};
 assign llim_result = seg_effective_limit(lar_desc);
+assign lbas_result = lar_desc.base;
 
 // Testbench can't force unpacked array struct elements, so use individual regs
 `ifdef VERILATOR
@@ -249,7 +251,7 @@ always_ff @(posedge clk) begin
                     seg_cache[desc_write_seg] <= null_desc;
                 end else begin
                     automatic seg_desc_t sdel_merged;
-                    sdel_merged = merge_sdel(seg_cache[desc_write_seg], desc_lo);
+                    sdel_merged = merge_sdel(seg_cache[desc_write_seg], seg_data);
                     seg_cache[desc_write_seg] <= sdel_merged;
                     if (desc_write_seg == SEG_TR)
                         seg_cache[SEG_TR].seg_type[1] <= 1'b1;
