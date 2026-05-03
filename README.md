@@ -5,6 +5,8 @@ z386 is a compact 80386-compatible CPU core written in SystemVerilog and built a
 
 The project is intended as an educational reconstruction, a usable MiSTer PC core, and a reusable embedded x86 CPU core.
 
+*For the MiSTer core based on z386, see [z386_MiSTer](https://github.com/nand2mario/z386_MiSTer).*
+
 Comparison with ao486 on a DE10-Nano:
 
 |     | z386 | ao486 |
@@ -16,6 +18,10 @@ Comparison with ao486 on a DE10-Nano:
 |Frequency| 85 MHz | 90 MHz |
 |DOOM FPS (max details)| 16.5 | 21.0 |
 
-For the MiSTer core based on z386, see [z386_MiSTer](https://github.com/nand2mario/z386_MiSTer).
+z386 was written from January 2026 to April 2026. These blog posts record the process of studying the 386 microarchitecture and building z386:
+* [80386 Multiplication and Division](https://nand2mario.github.io/posts/2026/80386_multiplication_and_division/)
+* [80386 Barrel Shifter](https://nand2mario.github.io/posts/2026/80386_barrel_shifter/)
+* [80386 Protection](https://nand2mario.github.io/posts/2026/80386_protection/)
+* [80386 Memory Pipeline](https://nand2mario.github.io/posts/2026/80386_memory_pipeline/)
 
 z386 is written by nand2mario. It builds on Intel 386 microcode disassembly and silicon reverse-engineering work by [reenigne](https://www.reenigne.org/blog/), [gloriouscow](https://github.com/dbalsom), [smartest blob](https://github.com/a-mcego), and [Ken Shirriff](https://www.righto.com/).
