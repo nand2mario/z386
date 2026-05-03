@@ -1,9 +1,11 @@
 
-# z386 - 80386 FPGA CPU running original 386 microcode
+# z386 - an 80386-class FPGA CPU built around original microcode
 
-z386 is a compact 80386-compatible CPU core written in SystemVerilog and driven by the original Intel 386 microcode. Rather than implementing x86 instruction behavior directly in RTL, it recreates the processor around a microcode sequencer and the supporting units needed by a real 386: prefetch, decode, segmentation, paging, protection checks, ALU, and bus access. It is intended as an educational reference, a potential ao486 replacement for MiSTer, and a reusable embedded x86 CPU core.
+z386 is a compact 80386-compatible CPU core written in SystemVerilog and built around the original Intel 386 microcode. Instead of implementing each x86 instruction as a separate RTL behavior, z386 implements the hardware structures the microcode expects to control: instruction prefetch, decode, the microcode sequencer, segmentation, paging, protection checks, ALU, shifter, and bus access.
 
-Comparison with ao486 on DE10-Nano:
+The project is intended as an educational reconstruction, a usable MiSTer PC core, and a reusable embedded x86 CPU core.
+
+Comparison with ao486 on a DE10-Nano:
 
 |     | z386 | ao486 |
 |-----|------|-------|
@@ -11,7 +13,9 @@ Comparison with ao486 on DE10-Nano:
 |ALUTs| 18K  | 21K   |
 |Registers| 5K | 6.5K |
 |BRAM| 116K | 131K |
-|Frequency| 85Mhz | 90Mhz |
+|Frequency| 85 MHz | 90 MHz |
 |DOOM FPS (max details)| 16.5 | 21.0 |
 
-Credits: z386 is written by nand2mario and builds on the Intel 386 microcode disassembly and silicon reverse engineering work of [reenigne](https://www.reenigne.org/blog/), [gloriouscow](https://github.com/dbalsom), [smartest blob](https://github.com/a-mcego), and [Ken Shirriff](https://www.righto.com/).
+For the MiSTer core based on z386, see [z386_MiSTer](https://github.com/nand2mario/z386_MiSTer).
+
+z386 is written by nand2mario. It builds on Intel 386 microcode disassembly and silicon reverse-engineering work by [reenigne](https://www.reenigne.org/blog/), [gloriouscow](https://github.com/dbalsom), [smartest blob](https://github.com/a-mcego), and [Ken Shirriff](https://www.righto.com/).
