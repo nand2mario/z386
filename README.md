@@ -23,5 +23,6 @@ z386 was written mainly from January to April 2026. These blog posts record the 
 * [80386 Barrel Shifter](https://nand2mario.github.io/posts/2026/80386_barrel_shifter/)
 * [80386 Protection](https://nand2mario.github.io/posts/2026/80386_protection/)
 * [80386 Memory Pipeline](https://nand2mario.github.io/posts/2026/80386_memory_pipeline/)
+* [z386: An Open-Source 80386 Built Around Original Microcode](https://nand2mario.github.io/posts/2026/z386/)
 
 z386 was written by nand2mario. It builds on Intel 386 microcode disassembly and silicon reverse-engineering work by [reenigne](https://www.reenigne.org/blog/), [gloriouscow](https://github.com/dbalsom), [smartest blob](https://github.com/a-mcego), and [Ken Shirriff](https://www.righto.com/).
