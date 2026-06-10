@@ -25,6 +25,7 @@ module tb_z386;
     // CPU bus interface (32-bit, ready/valid)
     wire [31:2] addr;       // 4-byte aligned address
     wire [3:0]  be;         // Byte enables
+    wire [7:0]  burstcount;
     wire [31:0] dout;       // Data output from CPU
     wire        valid, write, io;
     reg  [31:0] din;        // Data input to CPU
@@ -40,6 +41,7 @@ module tb_z386;
         .reset_n(reset_n),
         .addr(addr),
         .be(be),
+        .burstcount(burstcount),
         .din(din),
         .dout(dout),
         .valid(valid),
@@ -50,11 +52,8 @@ module tb_z386;
         .intr(intr),
         .nmi(nmi),
         .inta(inta),
-        .cache_lookup(),
-        .cache_lookup_addr(),
-        .cache_lookup_write(),
-        .cache_lookup_cancel(),
-        .cache_lookup_ready(1'b1),
+        .snoop_addr(32'h0),
+        .snoop_valid(1'b0),
         .single_step(1'b1), // Halt after each instruction for single-step tests
         .dbg_CS(),
         .dbg_EIP(),
@@ -93,33 +92,61 @@ module tb_z386;
     int ram_addrs [0:1023];
     int ram_cnt = 0;
 
-    // Memory behavior with 1-cycle ready/valid latency
+    reg read_active = 1'b0;
+    reg [31:0] read_base = 32'h0;
+    reg [7:0] read_remaining = 8'd0;
+    reg [7:0] read_index = 8'd0;
+
+    // Memory behavior with same-cycle ready/valid accept when idle.
     always @(posedge clk) begin
-        ready <= 1'b0;
+        ready <= !read_active;
         resp_valid <= 1'b0;
         din <= 32'h00000000;
 
-        if (valid && !ready) begin
-            ready <= 1'b1;  // Accept the request
+        if (read_active) begin
+            reg [31:0] byte_addr;
+            byte_addr = read_base + {22'h0, read_index, 2'b00};
+            resp_valid <= 1'b1;
+            din <= {mem[byte_addr+3], mem[byte_addr+2],
+                    mem[byte_addr+1], mem[byte_addr+0]};
+            $display("TB RESP addr=%08x be=%b din=%08x [%02x %02x %02x %02x]",
+                     byte_addr, be,
+                     {mem[byte_addr+3], mem[byte_addr+2], mem[byte_addr+1], mem[byte_addr+0]},
+                     mem[byte_addr+3], mem[byte_addr+2], mem[byte_addr+1], mem[byte_addr+0]);
+            fetch_count <= fetch_count + 1;
+            read_index <= read_index + 8'd1;
+            read_remaining <= read_remaining - 8'd1;
+            if (read_remaining == 8'd1)
+                read_active <= 1'b0;
+        end
 
+        if (valid && ready && !read_active) begin
             if (!write) begin
                 // Read
-                resp_valid <= 1'b1;
                 if (io) begin
+                    resp_valid <= 1'b1;
                     din <= 32'hFFFFFFFF;  // I/O reads return 0xFF
+                    fetch_count <= fetch_count + 1;
                 end else begin
                     reg [31:0] byte_addr;
+                    reg [7:0] burst_len;
                     byte_addr = {addr, 2'b00};
-
+                    burst_len = (burstcount == 8'd0) ? 8'd1 : burstcount;
+                    resp_valid <= 1'b1;
                     din <= {mem[byte_addr+3], mem[byte_addr+2],
                             mem[byte_addr+1], mem[byte_addr+0]};
+                    ready <= (burst_len <= 8'd1);
+                    read_active <= (burst_len > 8'd1);
+                    read_base <= byte_addr;
+                    read_remaining <= (burst_len > 8'd1) ? (burst_len - 8'd1) : 8'd0;
+                    read_index <= 8'd1;
 
                     $display("TB RESP addr=%08x be=%b din=%08x [%02x %02x %02x %02x]",
                              byte_addr, be,
                              {mem[byte_addr+3], mem[byte_addr+2], mem[byte_addr+1], mem[byte_addr+0]},
                              mem[byte_addr+3], mem[byte_addr+2], mem[byte_addr+1], mem[byte_addr+0]);
+                    fetch_count <= fetch_count + 1;
                 end
-                fetch_count <= fetch_count + 1;
             end else begin
                 // Write
                 if (!io) begin
@@ -168,6 +195,27 @@ module tb_z386;
     function automatic [15:0] extract_seg_flags(input z386_pkg::seg_desc_t desc);
         extract_seg_flags = {desc.seg_type, desc.S, desc.DPL, desc.P, desc.D_B, desc.G, desc.A, 5'b0};
     endfunction
+
+    task automatic wait_dcache_store_drain();
+        int k;
+        begin
+            // Single-step result checks read the external RAM model directly.
+            // Posted stores may retire architecturally before they drain to
+            // that RAM, so wait for the dcache write-through queue to empty.
+            #1;
+            k = 0;
+            while (k < 64 &&
+                   (dut.dcache_inst.storeq_count != 0 ||
+                    dut.dcache_inst.storeq_draining ||
+                    dut.dcache_inst.mem_valid_r)) begin
+                @(posedge clk);
+                #1;
+                k++;
+            end
+            @(posedge clk);
+            #1;
+        end
+    endtask
 
     // Load memory from file and initialize registers via plusargs
     string memfile;
@@ -390,10 +438,9 @@ module tb_z386;
                          dut.uc_dest, dut.uc_opcode, dut.uc_buscode, dut.alu_result, dut.SIGMA, dut.use_shifter_result);
             end
             if ($test$plusargs("trace_decode") && dut.decoder_inst.decq_count != 0) begin
-                $display("DECODE opcode=%02x entry=%03x modrm=%02x has_modrm=%0d ctl_first=%03x entry=%04x 0f=%0d rep=%0d",
+                $display("DECODE opcode=%02x entry=%03x modrm=%02x has_modrm=%0d dec_state=%0d 0f=%0d rep=%0d",
                          dut.i_bus.opcode, dut.i_bus.entry_point, dut.i_bus.modrm, dut.i_bus.has_modrm,
-                         dut.decoder_inst.dec_ctl_first,
-                         dut.decoder_inst.entry_2nd_pass ? dut.decoder_inst.modrm_entry_result : dut.decoder_inst.idle_entry_result,
+                         dut.decoder_inst.dec_state,
                          dut.i_bus.has_0f, dut.i_bus.has_rep);
             end
 
@@ -405,7 +452,7 @@ module tb_z386;
 
             if (stop_on_halt && instruction_count >= 2) begin
                 $display("Completed 2 instructions at cycle %0d", cycle);
-                #50;  // Let things settle
+                wait_dcache_store_drain();
 
                 // Print final register state
                 $display("RESULT REG: eax=0x%08x ecx=0x%08x edx=0x%08x ebx=0x%08x",
@@ -453,7 +500,7 @@ module tb_z386;
 
             if (stop_after_first && dbg_first_done) begin
                 $display("First instruction completed at cycle %0d", cycle);
-                #50;  // Let things settle
+                wait_dcache_store_drain();
 
                 // Print final register state
                 $display("RESULT REG: eax=0x%08x ecx=0x%08x edx=0x%08x ebx=0x%08x",
