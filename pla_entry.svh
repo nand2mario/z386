@@ -4,6 +4,11 @@
 // Output[15:0]
 //   [11:0]: microcode entry point
 //   [15:12]: control bits
+// Active 21.z386/22.z386_MiSTer decoder usage:
+//   [11:0]  entry point
+//   [13:12] stack operation flags
+//   [15:14] currently unused, preserved to keep the table visibly tied to
+//           doc/microcode/decoder23.txt.
 //
 function automatic logic [15:0] pla_entry_lookup(
     input [12:0] addr_in
