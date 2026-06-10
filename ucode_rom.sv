@@ -7,6 +7,7 @@ module ucode_rom #(
     input              clk,
     input              ce,
     input       [11:0] addr,
+    output      [44:0] q_early,
     output      [44:0] q,
     output      [5:0]  q_shift_source,
     output      [5:0]  q_shift_alu_src,
@@ -57,6 +58,7 @@ always_ff @(posedge clk) begin
 end
 
 assign q = q_r;
+assign q_early = q_mem;
 `else
 `ifdef Z386_QUARTUS_LOGIC_UCODE
 (* ramstyle = "logic" *) reg [44:0] microcode_rom [0:2559];
@@ -81,6 +83,7 @@ end
 	end
 
 assign q = q_r;
+assign q_early = q_mem;
 `endif
 
 assign q_shift_source = q_shift_source_r;

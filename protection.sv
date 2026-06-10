@@ -37,7 +37,7 @@ module protection_unit
     input               selector_oob,     // Selector exceeds GDT/LDT limit
 
     // Processor State
-    input        [1:0]  cpl,              // Current Privilege Level (CS[1:0])
+    input        [1:0]  cpl,              // Current Privilege Level
     input               pe_mode,          // Protected mode enabled (CR0.PE)
 
     // CR0 flags for FPU tests (multiplexed into state vector)

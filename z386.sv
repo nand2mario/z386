@@ -14,6 +14,9 @@
 //
 module z386
     import z386_pkg::*;
+#(
+    parameter PROTECT_UMA_ROM = 0
+)
 (
     input              clk,
     input              reset_n,
@@ -21,6 +24,7 @@ module z386
     // 32-bit bus interface (ready/valid handshake)
     output     [31:2]  addr,        // Physical address [31:2]
     output      [3:0]  be,          // Byte enables
+    output      [7:0]  burstcount,  // Burst length in DWORDs
     input      [31:0]  din,         // Data input
     output     [31:0]  dout,        // Data output
     output             valid,       // Request valid (held until ready)
@@ -34,12 +38,9 @@ module z386
     input              nmi,         // Non-maskable interrupt
     output             inta,        // Interrupt acknowledge
 
-    // VIPT cache: early lookup handshake (from paging unit, 1 cycle before BIU)
-    output             cache_lookup,
-    output     [31:0]  cache_lookup_addr,
-    output             cache_lookup_write,
-    output             cache_lookup_cancel,
-    input              cache_lookup_ready,
+    // External memory writers can invalidate matching L1 lines.
+    input      [31:0]  snoop_addr,
+    input              snoop_valid,
 
     // Debug/test control
     input              single_step, // Halt after each instruction (for single-step tests)
@@ -98,8 +99,13 @@ reg [1:0]  op_size;                 // Runtime operand size: 0=byte, 1=word, 2=d
 reg [1:0]  op_size_decode;          // Decoded operand size (saved at i_pop, restored by BITSDE)
 reg [1:0]  srcreg_size;             // Same as op_size most of the time, different for MOVZX/MOVSX and etc
 reg [1:0]  srcreg_size_decode;      // Decoded srcreg_size (saved at i_pop, restored by BITSDE)
+(* preserve *) reg [1:0] op_size_src;            // Local copy for generic source mux fanout
+(* preserve *) reg [1:0] op_size_src_decode;
+(* preserve *) reg [1:0] srcreg_size_src;
+(* preserve *) reg [1:0] srcreg_size_src_decode;
 wire       is_dword = (op_size == 2'd2); // Runtime dword flag
 wire       is_word = (op_size == 2'd1);  // Runtime word flag
+wire       is_dword_src = (op_size_src == 2'd2);
 
 // ALU signals (35-bit for MUL/DIV iteration support)
 reg [31:0] alu_dst, alu_src;        // ALU inputs this cycle
@@ -108,7 +114,7 @@ reg [31:0] alu_src_r;               // Registered alu_src for jumps (32-bit)
 wire [31:0] alu_result;
 
 // Shifter
-wire [63:0] shift_result;
+wire [31:0] shift_result;
 
 // ALU source data for operand access
 wire [31:0] alu_src_data = read_uc_alu_source(uc_alu_src);
@@ -139,7 +145,7 @@ assign dbg_EIP = EIP;
 assign dbg_CS_base = CS_base;
 assign dbg_pe  = pe;
 assign dbg_vm  = vm;
-wire [1:0] cpl = vm ? 2'd3 : !pe ? 2'd0 : CS[1:0];  // CPL: 3 in V86, 0 in real mode
+wire [1:0] cpl = vm ? 2'd3 : !pe ? 2'd0 : seg_cache[SEG_CS].DPL;  // CPL: 3 in V86, 0 in real mode
 wire       pg_enable = CR0[31];     // Paging enabled
 wire       wp_enable = CR0[16];     // Write protect
 wire [31:0] page_dir_base = CR3 & 32'hFFFFF000;  // Page directory base
@@ -147,17 +153,17 @@ wire [31:0] page_dir_base = CR3 & 32'hFFFFF000;  // Page directory base
 reg [2:0]  latched_pf_code;         // Latched page fault error code (for LPCR microcode access)
 reg [31:0] latched_pf_addr;         // Latched faulting linear address (for LPCR microcode access)
 
-wire [7:0] q_bus;                   // 8-bit output to decoder
 wire [31:0] q_window;               // 4-byte aligned window at queue head
 wire       pf_full;
 wire       pf_empty;
-wire [4:0] pf_count;                // Prefetch bytes currently buffered
+wire [5:0] pf_count;                // Prefetch bytes currently buffered
 wire [2:0] q_pop_bytes;             // Pop 1/2/4 bytes from queue
 wire       q_flush;                 // Flush queue (branch/jump) - combinational for i.immediate gating
 wire       pe_mode_toggle_now;      // CR0.PE changed this cycle: re-decode next bytes in new mode
+reg        uc_ctl_pref;             // Previous-cycle predecode: current uop is BUSOP_PREF
 
 assign pe_mode_toggle_now = uc_exec && (uc_dest == DEST_CR0) && (dest_value[0] != CR0[0]);
-assign q_flush = (uc_exec && uc_buscode == BUSOP_PREF && !uc_cond_jump_taken_prev) || pe_mode_toggle_now;
+assign q_flush = (uc_exec && uc_ctl_pref && !uc_cond_jump_taken_prev) || pe_mode_toggle_now;
 
 wire        page_fault;             // Page fault (declared fully at paging unit instantiation)
 wire [1:0]  prot_cpl;               // CPL for protection unit (declared fully near protection logic)
@@ -171,8 +177,9 @@ wire        mem_complete_now;       // combinational, request completing THIS cy
 // Prefetch ↔ paging unit toggle signals
 wire        pf_req_toggle;
 wire [31:0] pf_linear_addr;
+wire        pf_redirect_queued;
 wire        pf_ack_toggle;
-wire [31:0] pf_rdata;
+wire [127:0] pf_rdata;
 wire        pf_fault;
 
 //
@@ -181,8 +188,9 @@ wire        pf_fault;
 // After a jump, the next micro-op still executes (delay slot) before jump takes effect.
 reg [11:0] uaddr_now;               // Next address, launched early to the ucode ROM
 reg [11:0] uaddr;                   // Address being fetched in the current ucode pipeline
-wire [44:0] uc;                     // Current microcode word + pre-computed bits (37-44)
 reg [11:0] uc_addr;                 // Address of current uc (for debug)
+wire [44:0] uc;                     // Current microcode word + pre-computed bits (37-44)
+wire [44:0] uc_next;
 
 // Instruction Life cycle: entry -> pop -> first -> RNI -> RNI delay slot -> inactive
 wire       i_entry;                 // Load entry point into uaddr, set init_cycle (queue NOT popped yet)
@@ -202,14 +210,17 @@ assign     i_entry = i_entry_raw && !any_fault;
 
 // i_pop: actually pop the instruction queue
 wire       interrupt_at_boundary = i_rni_delay && interrupt_pending && !single_step;
-assign     i_pop = init_cycle && !stall && !page_fault && !interrupt_at_boundary;
+assign     i_pop = init_cycle && !stall && !page_fault && !interrupt_at_boundary && !q_flush;
 
-// Stall: hold pipeline when bus is busy AND current word needs bus/DLY, or
-// WIO is waiting for interrupt.
-wire       stall_mem = ((mem_req_r || (mem_servicing && !mem_complete_now)) && uc_bus_or_dly);
+// Stall: hold the current memory uop until paging can accept it, then hold DLY
+// while the accepted request is owned by paging.  Use mem_req_current for the
+// ready interlock so same-cycle segment-fault detection does not feed back into
+// the global stall/protection-pipeline enable path.
+wire       stall_mem = (mem_req_current && !mem_accepted) ||
+                       ((mem_servicing && !mem_complete_now) && uc_bus_or_dly);
 wire       stall_wio = (uc_is_wio && !interrupt_pending && !single_step);
 wire       stall = stall_mem || stall_wio;
-wire       stall_mem_uc_exec = ((mem_req_r || (mem_servicing && !mem_complete_now)) && uc_bus_or_dly);
+wire       stall_mem_uc_exec = stall_mem;
 wire       stall_uc_exec = stall_mem_uc_exec || stall_wio;
 
 // Repeat
@@ -234,15 +245,18 @@ wire       decq_full;         // Decoder instruction queue full
 // The microcode ROM contains 2560 entries of 37-bit ucode + 8-bit predecode
 wire        microcode_rom_ce = !stall && !repeat_active;
 wire [44:0] uc_rom_q;
+wire [44:0] uc_rom_early;
 wire [5:0]  uc_source_shift;
 wire [5:0]  uc_alu_src_shift;
 wire [6:0]  uc_aluop_shift;
-assign uc = reset_n ? uc_rom_q : 45'h0;
+assign uc = uc_rom_q;
+assign uc_next = uc_rom_early;
 
 ucode_rom microcode_rom (
     .clk(clk),
     .ce(microcode_rom_ce),
     .addr(uaddr_now),
+    .q_early(uc_rom_early),
     .q(uc_rom_q),
     .q_shift_source(uc_source_shift),
     .q_shift_alu_src(uc_alu_src_shift),
@@ -280,44 +294,274 @@ wire        prot_stack_op;          // K flag: Stack operation/CPL update
 wire        prot_result_valid;      // Pipelined result is valid (2 cycles after test)
 wire        prot_is_checking_test;  // Result is from a "checking" test (not PTGEN)
 
-wire        pg_req_valid;
-wire [31:0] pg_req_phys_addr;
-wire        pg_req_write;
-wire [3:0]  pg_req_be;
-wire [31:0] pg_req_wdata;
-wire        pg_req_is_io;
-wire        pg_req_is_inta;
-wire        pg_req_accepted;
-wire        pg_req_complete;
-wire [31:0] biu_rdata;
+wire        dcache_req_valid;
+wire [31:0] dcache_req_phys_addr;
+wire        dcache_req_write;
+wire [3:0]  dcache_req_be;
+wire [31:0] dcache_req_wdata;
+wire        dcache_req_is_io;
+wire        dcache_req_is_inta;
+wire        dcache_req_accepted;
+wire        dcache_req_complete;
+wire [31:0] dcache_rdata;
+wire        icache_req_valid;
+wire [31:0] icache_req_phys_addr;
+wire        icache_req_accepted;
+wire        icache_req_complete;
+wire [127:0] icache_rdata;
 wire        pg_rd_ind_active;
 
-// BIU: thin external bus driver
-biu biu_inst (
+wire [31:0] dcache_cpu_dout;
+wire        dcache_cpu_ready;
+wire        dcache_cpu_resp_valid;
+wire [31:0] dcache_mem_addr;
+wire [31:0] dcache_mem_din;
+wire  [3:0] dcache_mem_be;
+wire  [7:0] dcache_mem_burstcount;
+wire        dcache_mem_valid;
+wire        dcache_mem_write;
+wire        dcache_mem_ready;
+wire        dcache_mem_resp_valid;
+
+wire [31:0] icache_cpu_dout;
+wire [127:0] icache_cpu_line;
+wire        icache_cpu_ready;
+wire        icache_cpu_resp_valid;
+wire [31:0] icache_mem_addr;
+wire  [3:0] icache_mem_be;
+wire  [7:0] icache_mem_burstcount;
+wire        icache_mem_valid;
+wire        icache_mem_ready;
+wire        icache_mem_resp_valid;
+
+reg   [7:0] dcache_rd_pending;
+reg   [7:0] icache_rd_pending;
+reg         dcache_cpu_rd_pending;
+reg         icache_cpu_rd_pending;
+reg         direct_rd_pending;
+
+wire dcache_cpu_req = dcache_req_valid && !dcache_req_is_io && !dcache_req_is_inta;
+wire dcache_direct_req = dcache_req_valid && (dcache_req_is_io || dcache_req_is_inta);
+wire dcache_read_pending = (dcache_rd_pending != 8'd0);
+wire icache_read_pending = (icache_rd_pending != 8'd0);
+wire dcache_read_accept = dcache_cpu_req && !dcache_req_write && dcache_cpu_ready;
+wire icache_read_accept = icache_req_valid && icache_cpu_ready;
+wire dcache_read_done = dcache_cpu_resp_valid && (dcache_cpu_rd_pending || dcache_read_accept);
+wire icache_read_done = icache_cpu_resp_valid && (icache_cpu_rd_pending || icache_read_accept);
+wire ext_direct_req = dcache_direct_req && !direct_rd_pending &&
+                      !dcache_read_pending && !icache_read_pending;
+wire ext_dcache_req = dcache_mem_valid && !ext_direct_req &&
+                      !direct_rd_pending && !icache_read_pending;
+wire ext_icache_req = icache_mem_valid && !ext_direct_req && !ext_dcache_req &&
+                      !direct_rd_pending && !dcache_read_pending;
+
+localparam [1:0] EXT_SRC_NONE   = 2'd0;
+localparam [1:0] EXT_SRC_DIRECT = 2'd1;
+localparam [1:0] EXT_SRC_DCACHE = 2'd2;
+localparam [1:0] EXT_SRC_ICACHE = 2'd3;
+
+reg        ext_valid_r;
+reg [1:0]  ext_src_r;
+reg [31:2] ext_addr_r;
+reg [3:0]  ext_be_r;
+reg [7:0]  ext_burstcount_r;
+reg [31:0] ext_dout_r;
+reg        ext_write_r;
+reg        ext_io_r;
+reg        ext_inta_r;
+
+wire ext_direct_accept = ext_valid_r && ready && (ext_src_r == EXT_SRC_DIRECT);
+wire ext_dcache_accept = ext_valid_r && ready && (ext_src_r == EXT_SRC_DCACHE);
+wire ext_icache_accept = ext_valid_r && ready && (ext_src_r == EXT_SRC_ICACHE);
+wire direct_rd_resp_now = resp_valid && (direct_rd_pending || (ext_direct_accept && !ext_write_r));
+wire icache_write_snoop = dcache_cpu_req && dcache_req_write && dcache_cpu_ready;
+reg        icache_write_snoop_pending;
+reg [31:0] icache_write_snoop_addr_r;
+reg [31:0] icache_write_snoop_data_r;
+reg  [3:0] icache_write_snoop_be_r;
+wire [31:0] icache_snoop_addr = snoop_valid ? snoop_addr : icache_write_snoop_addr_r;
+wire icache_snoop_valid = snoop_valid || icache_write_snoop_pending;
+wire [31:0] icache_snoop_data = snoop_valid ? 32'h0 : icache_write_snoop_data_r;
+wire  [3:0] icache_snoop_be = snoop_valid ? 4'h0 : icache_write_snoop_be_r;
+wire        icache_snoop_patch = !snoop_valid && icache_write_snoop_pending;
+
+assign dcache_req_accepted = dcache_cpu_req ? dcache_cpu_ready : ext_direct_accept;
+assign dcache_req_complete = dcache_cpu_resp_valid ||
+                             (dcache_cpu_req && dcache_req_write && dcache_cpu_ready) ||
+                             direct_rd_resp_now ||
+                             (ext_direct_accept && ext_write_r);
+assign dcache_rdata = dcache_cpu_resp_valid ? dcache_cpu_dout : din;
+assign icache_req_accepted = icache_cpu_ready;
+assign icache_req_complete = icache_cpu_resp_valid;
+assign icache_rdata = icache_cpu_line;
+
+assign addr       = ext_addr_r;
+assign be         = ext_be_r;
+assign burstcount = ext_burstcount_r;
+assign dout       = ext_dout_r;
+assign valid      = ext_valid_r;
+assign write      = ext_valid_r && ext_write_r;
+assign io         = ext_valid_r && ext_io_r;
+assign inta       = ext_valid_r && ext_inta_r;
+
+assign dcache_mem_ready = ext_dcache_accept;
+assign icache_mem_ready = ext_icache_accept;
+assign dcache_mem_resp_valid = dcache_read_pending && resp_valid;
+assign icache_mem_resp_valid = icache_read_pending && resp_valid;
+
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        ext_valid_r <= 1'b0;
+        ext_src_r <= EXT_SRC_NONE;
+        ext_addr_r <= 30'h0;
+        ext_be_r <= 4'h0;
+        ext_burstcount_r <= 8'h0;
+        ext_dout_r <= 32'h0;
+        ext_write_r <= 1'b0;
+        ext_io_r <= 1'b0;
+        ext_inta_r <= 1'b0;
+        dcache_rd_pending <= 8'd0;
+        icache_rd_pending <= 8'd0;
+        dcache_cpu_rd_pending <= 1'b0;
+        icache_cpu_rd_pending <= 1'b0;
+        direct_rd_pending <= 1'b0;
+        icache_write_snoop_pending <= 1'b0;
+        icache_write_snoop_addr_r <= 32'h0;
+        icache_write_snoop_data_r <= 32'h0;
+        icache_write_snoop_be_r <= 4'h0;
+    end else begin
+        if (icache_write_snoop) begin
+            // Keep dcache write finalization off the icache RAM write path.
+            // The icache snoop is posted one cycle later.
+            icache_write_snoop_pending <= 1'b1;
+            icache_write_snoop_addr_r <= dcache_req_phys_addr;
+            icache_write_snoop_data_r <= dcache_req_wdata;
+            icache_write_snoop_be_r <= dcache_req_be;
+        end else if (icache_write_snoop_pending && !snoop_valid) begin
+            icache_write_snoop_pending <= 1'b0;
+        end
+
+        if (ext_valid_r) begin
+            if (ready) begin
+                ext_valid_r <= 1'b0;
+                ext_src_r <= EXT_SRC_NONE;
+            end
+        end else if (ext_direct_req) begin
+            ext_valid_r <= 1'b1;
+            ext_src_r <= EXT_SRC_DIRECT;
+            ext_addr_r <= dcache_req_phys_addr[31:2];
+            ext_be_r <= dcache_req_be;
+            ext_burstcount_r <= 8'd1;
+            ext_dout_r <= dcache_req_wdata;
+            ext_write_r <= dcache_req_write;
+            ext_io_r <= dcache_req_is_io;
+            ext_inta_r <= dcache_req_is_inta;
+        end else if (ext_dcache_req) begin
+            ext_valid_r <= 1'b1;
+            ext_src_r <= EXT_SRC_DCACHE;
+            ext_addr_r <= dcache_mem_addr[31:2];
+            ext_be_r <= dcache_mem_be;
+            ext_burstcount_r <= dcache_mem_burstcount;
+            ext_dout_r <= dcache_mem_din;
+            ext_write_r <= dcache_mem_write;
+            ext_io_r <= 1'b0;
+            ext_inta_r <= 1'b0;
+        end else if (ext_icache_req) begin
+            ext_valid_r <= 1'b1;
+            ext_src_r <= EXT_SRC_ICACHE;
+            ext_addr_r <= icache_mem_addr[31:2];
+            ext_be_r <= icache_mem_be;
+            ext_burstcount_r <= icache_mem_burstcount;
+            ext_dout_r <= 32'h0;
+            ext_write_r <= 1'b0;
+            ext_io_r <= 1'b0;
+            ext_inta_r <= 1'b0;
+        end
+
+        if (ext_dcache_accept && !dcache_mem_write)
+            dcache_rd_pending <= dcache_mem_burstcount;
+        else if (dcache_read_pending && resp_valid)
+            dcache_rd_pending <= dcache_rd_pending - 8'd1;
+
+        if (ext_icache_accept)
+            icache_rd_pending <= icache_mem_burstcount;
+        else if (icache_read_pending && resp_valid)
+            icache_rd_pending <= icache_rd_pending - 8'd1;
+
+        if (dcache_read_accept && !dcache_read_done)
+            dcache_cpu_rd_pending <= 1'b1;
+        else if (dcache_read_done)
+            dcache_cpu_rd_pending <= 1'b0;
+
+        if (icache_read_accept && !icache_read_done)
+            icache_cpu_rd_pending <= 1'b1;
+        else if (icache_read_done)
+            icache_cpu_rd_pending <= 1'b0;
+
+        if (ext_direct_accept && !ext_write_r && !resp_valid)
+            direct_rd_pending <= 1'b1;
+        else if (direct_rd_pending && resp_valid)
+            direct_rd_pending <= 1'b0;
+    end
+end
+
+l1_cache #(
+    .PROTECT_UMA_ROM(PROTECT_UMA_ROM)
+) dcache_inst (
     .clk(clk),
-    .reset_n(reset_n),
-    // External bus (ready/valid)
-    .bus_addr(addr),
-    .bus_be(be),
-    .bus_din(din),
-    .bus_dout(dout),
-    .bus_valid(valid),
-    .bus_write(write),
-    .bus_io(io),
-    .bus_ready(ready),
-    .bus_resp_valid(resp_valid),
-    .bus_inta(inta),
-    // Single request port from paging unit
-    .req_valid(pg_req_valid),
-    .req_phys_addr(pg_req_phys_addr),
-    .req_write(pg_req_write),
-    .req_be(pg_req_be),
-    .req_wdata(pg_req_wdata),
-    .req_is_io(pg_req_is_io),
-    .req_is_inta(pg_req_is_inta),
-    .req_accepted(pg_req_accepted),
-    .req_complete(pg_req_complete),
-    .rdata(biu_rdata)
+    .reset(!reset_n),
+
+    .cpu_addr(dcache_req_phys_addr),
+    .cpu_din(dcache_req_wdata),
+    .cpu_dout(dcache_cpu_dout),
+    .cpu_be(dcache_req_be),
+    .cpu_valid(dcache_cpu_req),
+    .cpu_write(dcache_req_write),
+    .cpu_ready(dcache_cpu_ready),
+    .cpu_resp_valid(dcache_cpu_resp_valid),
+
+    .mem_addr(dcache_mem_addr),
+    .mem_din(dcache_mem_din),
+    .mem_dout(din),
+    .mem_be(dcache_mem_be),
+    .mem_burstcount(dcache_mem_burstcount),
+    .mem_busy(ext_valid_r || ext_direct_req || direct_rd_pending || icache_read_pending),
+    .mem_valid(dcache_mem_valid),
+    .mem_write(dcache_mem_write),
+    .mem_ready(dcache_mem_ready),
+    .mem_resp_valid(dcache_mem_resp_valid),
+
+    .snoop_addr(snoop_addr),
+    .snoop_valid(snoop_valid),
+    .cache_enable(1'b1)
+);
+
+l1_icache icache_inst (
+    .clk(clk),
+    .reset(!reset_n),
+
+    .cpu_addr(icache_req_phys_addr),
+    .cpu_dout(icache_cpu_dout),
+    .cpu_line(icache_cpu_line),
+    .cpu_valid(icache_req_valid),
+    .cpu_ready(icache_cpu_ready),
+    .cpu_resp_valid(icache_cpu_resp_valid),
+
+    .mem_addr(icache_mem_addr),
+    .mem_dout(din),
+    .mem_be(icache_mem_be),
+    .mem_burstcount(icache_mem_burstcount),
+    .mem_busy(ext_valid_r || ext_direct_req || direct_rd_pending || dcache_read_pending || dcache_mem_valid),
+    .mem_valid(icache_mem_valid),
+    .mem_ready(icache_mem_ready),
+    .mem_resp_valid(icache_mem_resp_valid),
+
+    .snoop_addr(icache_snoop_addr),
+    .snoop_data(icache_snoop_data),
+    .snoop_be(icache_snoop_be),
+    .snoop_patch(icache_snoop_patch),
+    .snoop_valid(icache_snoop_valid),
+    .cache_enable(1'b1)
 );
 
 // Prefetch Unit: 16-byte circular buffer
@@ -325,7 +569,6 @@ prefetch prefetch_inst (
     .clk(clk),
     .reset_n(reset_n),
     // Queue output to decoder
-    .q_bus(q_bus),
     .q_window(q_window),
     .q_full(pf_full),
     .q_empty(pf_empty),
@@ -337,6 +580,7 @@ prefetch prefetch_inst (
     // Toggle interface to paging unit
     .pf_req_toggle(pf_req_toggle),
     .pf_linear_addr(pf_linear_addr),
+    .pf_redirect_queued(pf_redirect_queued),
     .pf_ack_toggle(pf_ack_toggle),
     .pf_rdata(pf_rdata),
     .pf_fault(pf_fault),
@@ -352,7 +596,6 @@ decoder decoder_inst (
     .reset_n    (reset_n),
 
     // Prefetch queue interface
-    .q_bus      (q_bus),
     .q_window   (q_window),
     .pf_count   (pf_count),
     .pf_empty   (pf_empty),
@@ -426,6 +669,7 @@ wire [31:0] ind_effective;
 wire        mem_op_eligible, gp_fault_mem_op, gp_fault_wr_op, ss_segment_fault;
 reg         copy_stack_dpl_s2, conform_dpl_s2;
 reg  [1:0]  copy_dpl_s2;
+reg  [1:0]  conform_dpl_value_s2;
 
 segmentation_unit seg_unit (
     .clk              (clk),
@@ -441,6 +685,7 @@ segmentation_unit seg_unit (
     .copy_stack_dpl_s2(copy_stack_dpl_s2),
     .copy_dpl_s2      (copy_dpl_s2),
     .conform_dpl_s2   (conform_dpl_s2),
+    .conform_dpl_value_s2(conform_dpl_value_s2),
     .seg_cache        (seg_cache),
     .lar_result       (seg_lar_result),
     .llim_result      (seg_llim_result),
@@ -544,6 +789,31 @@ end  // always_comb
 // Paging Unit
 //=============================================================================
 
+// Entry-point predecode used one cycle before i_pop: suppress prefetch when the
+// next instruction's first uop is a demand read.  The table is generated from
+// pla_entry.svh outputs intersected with ucode45 bit39=mem and bit40=not-write.
+function automatic logic entry_first_is_read_busop(input [11:0] entry);
+    case (entry)
+        12'h00B, 12'h00F, 12'h019, 12'h027,
+        12'h02C, 12'h031, 12'h035, 12'h039,
+        12'h04A, 12'h04E, 12'h06F, 12'h072,
+        12'h07C, 12'h081, 12'h091, 12'h097,
+        12'h09F, 12'h0A2, 12'h0A7, 12'h0AC,
+        12'h0B1, 12'h0BB, 12'h0C2, 12'h0C9,
+        12'h0D0, 12'h108, 12'h10C, 12'h11E,
+        12'h124, 12'h12A, 12'h12D, 12'h12F,
+        12'h142, 12'h160, 12'h177, 12'h184,
+        12'h1AF, 12'h1BD, 12'h1C1, 12'h1CF,
+        12'h1E1, 12'h1EB, 12'h1F3, 12'h2DA,
+        12'h2F5, 12'h2FC, 12'h6AA, 12'h6E4,
+        12'h6EA, 12'h700, 12'h706, 12'h803,
+        12'h818:
+            entry_first_is_read_busop = 1'b1;
+        default:
+            entry_first_is_read_busop = 1'b0;
+    endcase
+endfunction
+
 // Memory operation detection — pre-computed in ROM bits 39-43
 wire pg_mem_busop    = uc_is_mem_busop;
 wire pg_is_write     = uc_is_write;
@@ -577,20 +847,30 @@ wire io_busop_wr = (uc_buscode == BUSOP_WR || uc_buscode == BUSOP_WR_OPR) && (me
 // IACK bus operation (interrupt acknowledge)
 wire iack_busop = (uc_buscode == BUSOP_IACK);
 
-// Interrupt pending: NMI has priority over INTR
-wire interrupt_pending = nmi_pending || (intr_pending && EFLAGS[9]);
+// Interrupt pending: NMI has priority over INTR. Include a same-cycle NMI
+// edge so an NMI arriving on an instruction-completion boundary is accepted at
+// that boundary instead of waiting for the next instruction.
+wire nmi_edge = nmi && !nmi_prev && !nmi_blocked;
+wire nmi_request_active = nmi_pending || nmi_edge;
+wire interrupt_pending = nmi_request_active || (intr_pending && EFLAGS[9]);
+wire nmi_accept_boundary = i_rni_delay && !stall && !page_fault &&
+                           nmi_request_active && !single_step;
 
 // STI shadow: real 386 suppresses interrupt recognition for one instruction after STI.
 reg inhibit_interrupts;
 
-// Common gate for memory/IO operations: executing and bus is free
-assign mem_op_eligible = uc_exec && !mem_servicing && !mem_req_r;
+// Current RD/WR/IACK uop request.  z386 does not keep a local pending copy:
+// the current micro-op drives paging.valid and stalls until paging.ready.
+assign mem_op_eligible = !halted && uc_active && !fault_suppress_delay_slot &&
+                         !interrupt_entry && !mem_servicing;
 
-wire mem_req_upcoming = mem_op_eligible && (
+wire mem_req_current = mem_op_eligible && (
     (pg_mem_busop && (mem_seg_sel != SEG_IO)) ||
     (io_busop_rd || io_busop_wr) ||
     iack_busop
 );
+
+wire mem_req_upcoming = uc_next[39];    // delay prefetch on upcoming demand memory
 
 wire mem_is_io = (mem_seg_sel == SEG_IO);
 
@@ -600,21 +880,25 @@ wire implicit_supervisor = mem_is_dtable || (mem_seg_sel == SEG_TR) ||
                            descsw_mode || (vm && CS[1:0] == 2'b00);
 wire [1:0] pg_cpl = implicit_supervisor ? 2'b00 : cpl;
 
-// Registered paging unit inputs
-reg         mem_req_r;
+// Registered fault redirect state.
 reg         gp_fault_r;
 reg         ss_fault_r;
-reg  [31:0] mem_linear_addr_r;
-reg  [1:0]  mem_eff_size_r;
-reg         mem_write_r;
-reg  [31:0] mem_wdata_r;
-reg         mem_rd_ind_r;
-reg         mem_is_write_access_r;
-reg         mem_check_only_r;
-reg  [1:0]  mem_cpl_r;
-reg         mem_is_io_r;
-reg         mem_is_inta_r;
-reg  [3:0]  mem_be_r;
+
+wire        mem_req_to_paging = mem_req_current && !gp_fault_trigger;
+wire        mem_write_now = pg_is_write || (io_busop_wr && mem_is_io);
+wire [3:0]  mem_be_now = iack_busop ? 4'b1111 :
+                          calc_be(mem_eff_size, mem_linear_addr[1:0]);
+wire [31:0] paging_linear_addr = iack_busop ? IND : mem_linear_addr;
+wire [1:0]  paging_mem_eff_size = mem_eff_size;
+wire        paging_mem_write = mem_write_now;
+wire [31:0] paging_mem_wdata = mem_wdata;
+wire        paging_mem_rd_ind = (uc_buscode == BUSOP_RD_IND);
+wire        paging_is_write_access = pg_is_write || pg_is_check_write;
+wire        paging_mem_check_only = pg_is_check_write;
+wire [1:0]  paging_cpl = pg_cpl;
+wire        paging_mem_is_io = mem_is_io;
+wire        paging_mem_is_inta = iack_busop;
+wire [3:0]  paging_mem_be = mem_be_now;
 
 // Paging unit instantiation
 paging_unit paging_inst (
@@ -624,43 +908,51 @@ paging_unit paging_inst (
     .cr3                (CR3),
     .cr3_write          (cr3_write),
 
-    // Memory/IO request (registered pipeline — one cycle after mem_req_upcoming)
-    // gp_fault_r cancels faulting requests (registered in parallel with mem_req_r)
-    .mem_req            (mem_req_r),        // valid: held until mem_accepted pulses
+    // Memory/IO request: current RD/WR/IACK uop is held by stall until accepted.
+    .mem_req            (mem_req_to_paging),
+    .mem_lookup_valid   (mem_req_current),
     .mem_req_upcoming   (mem_req_upcoming),      // suppresses prefetch start to minimize contention
     .mem_accepted       (mem_accepted),     // ready: request accepted this cycle
     .mem_servicing      (mem_servicing),
     .mem_complete_now   (mem_complete_now), // combinational: bus op completing this cycle
-    .linear_addr        (mem_linear_addr_r),
-    .mem_op_size        (mem_eff_size_r),
-    .mem_write          (mem_write_r),
-    .mem_wdata          (mem_wdata_r),
-    .mem_rd_ind         (mem_rd_ind_r),
-    .is_write_access    (mem_is_write_access_r),
-    .mem_check_only     (mem_check_only_r),
-    .cpl                (mem_cpl_r),
-    .mem_is_io          (mem_is_io_r),
-    .mem_is_inta        (mem_is_inta_r),
-    .mem_be             (mem_be_r),
+    .linear_addr        (paging_linear_addr),
+    .mem_op_size        (paging_mem_eff_size),
+    .mem_write          (paging_mem_write),
+    .mem_wdata          (paging_mem_wdata),
+    .mem_rd_ind         (paging_mem_rd_ind),
+    .is_write_access    (paging_is_write_access),
+    .mem_check_only     (paging_mem_check_only),
+    .cpl                (paging_cpl),
+    .mem_is_io          (paging_mem_is_io),
+    .mem_is_inta        (paging_mem_is_inta),
+    .mem_be             (paging_mem_be),
 
     // Prefetch (toggle protocol)
     .pf_req_toggle      (pf_req_toggle),
     .pf_ack_toggle      (pf_ack_toggle),
+    .pf_redirect_queued (pf_redirect_queued),
     .pf_linear_addr     (pf_linear_addr),
     .pf_rdata           (pf_rdata),
     .pf_fault           (pf_fault),
 
-    // BIU interface
-    .biu_req_valid      (pg_req_valid),
-    .biu_req_phys_addr  (pg_req_phys_addr),
-    .biu_req_write      (pg_req_write),
-    .biu_req_be         (pg_req_be),
-    .biu_req_wdata      (pg_req_wdata),
-    .biu_req_is_io      (pg_req_is_io),
-    .biu_req_is_inta    (pg_req_is_inta),
-    .biu_req_accepted   (pg_req_accepted),
-    .biu_req_complete   (pg_req_complete),
-    .biu_rdata          (biu_rdata),
+    // Demand-side physical request interface
+    .dcache_req_valid   (dcache_req_valid),
+    .dcache_req_phys_addr(dcache_req_phys_addr),
+    .dcache_req_write   (dcache_req_write),
+    .dcache_req_be      (dcache_req_be),
+    .dcache_req_wdata   (dcache_req_wdata),
+    .dcache_req_is_io   (dcache_req_is_io),
+    .dcache_req_is_inta (dcache_req_is_inta),
+    .dcache_req_accepted(dcache_req_accepted),
+    .dcache_req_complete(dcache_req_complete),
+    .dcache_rdata       (dcache_rdata),
+
+    // Instruction-prefetch physical request interface
+    .icache_req_valid   (icache_req_valid),
+    .icache_req_phys_addr(icache_req_phys_addr),
+    .icache_req_accepted(icache_req_accepted),
+    .icache_req_complete(icache_req_complete),
+    .icache_rdata       (icache_rdata),
 
     // OPR_R
     .OPR_R              (OPR_R),
@@ -669,42 +961,16 @@ paging_unit paging_inst (
     .page_fault         (page_fault),
     .fault_code         (pg_fault_code),
     .cr2_out            (pg_cr2_out),
-    .rd_ind_active      (pg_rd_ind_active),
-    .cache_lookup       (cache_lookup),
-    .cache_lookup_addr  (cache_lookup_addr),
-    .cache_lookup_write (cache_lookup_write),
-    .cache_lookup_cancel(cache_lookup_cancel),
-    .cache_lookup_ready (cache_lookup_ready)
+    .rd_ind_active      (pg_rd_ind_active)
 );
 
 always_ff @(posedge clk) begin
     if (!reset_n) begin
-        mem_req_r <= 1'b0;
         gp_fault_r <= 1'b0;
         ss_fault_r <= 1'b0;
     end else begin
         gp_fault_r <= gp_fault_trigger;
         ss_fault_r <= ss_segment_fault;
-        // Don't assert mem_req_r if GP fault fires same cycle
-        if (mem_req_upcoming && !gp_fault_trigger)
-            mem_req_r <= 1'b1;
-        // Clear when paging unit accepts (ready pulse) or GP fault cancels
-        if (mem_req_r && (mem_accepted || gp_fault_r))
-            mem_req_r <= 1'b0;
-    end
-    if (mem_req_upcoming) begin
-        mem_linear_addr_r     <= iack_busop ? IND : mem_linear_addr;
-        mem_eff_size_r        <= mem_eff_size;
-        mem_write_r           <= pg_is_write || (io_busop_wr && mem_is_io);
-        mem_wdata_r           <= mem_wdata;
-        mem_rd_ind_r          <= (uc_buscode == BUSOP_RD_IND);
-        mem_is_write_access_r <= pg_is_write || pg_is_check_write;
-        mem_check_only_r      <= pg_is_check_write;
-        mem_cpl_r             <= pg_cpl;
-        mem_is_io_r           <= mem_is_io;
-        mem_is_inta_r         <= iack_busop;
-        mem_be_r              <= iack_busop ? 4'b1111 :
-                                 calc_be(mem_eff_size, mem_linear_addr[1:0]);
     end
 end
 
@@ -775,7 +1041,7 @@ protection_unit protection_unit_inst (
     .selector_oob     (selector_oob_wire),           // Selector exceeds GDT/LDT limit
 
     // Processor state
-    .cpl              (prot_cpl),                    // CPL (pending after WRITE_RPL, else CS[1:0])
+    .cpl              (prot_cpl),                    // CPL (pending after WRITE_RPL, else effective CPL)
     .pe_mode          (pe),                  // Protected mode active
 
     // CR0 flags for FPU tests
@@ -862,6 +1128,15 @@ wire [6:0] uc_aluop     = uc[17:11];  // TUVWXYZ: ALU operation / jump condition
 wire [2:0] uc_opcode    = uc[10:8];   // 012: opcode (RNI, RPT, etc.)
 wire [1:0] uc_subcode   = uc[7:6];    // 34: subcode (DLY, etc.)
 assign uc_buscode       = uc[5:0];    // 56789&: bus operation code
+wire [5:0] uc_next_buscode = uc_next[5:0];
+
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        uc_ctl_pref <= 1'b0;
+    end else if (microcode_rom_ce) begin
+        uc_ctl_pref <= (uc_next_buscode == BUSOP_PREF);
+    end
+end
 
 reg [11:0] microcode_return_stack [0:3]; // 4-entry return address stack
 reg [1:0]  microcode_sp;                 // Stack pointer (0-3)
@@ -931,14 +1206,10 @@ reg        jcc_active;              // Currently executing a Jcc instruction (fo
 reg        instr_eip_written;       // EIP was written during instruction (RPTI restart)
 reg        gate_in_progress;        // Prevent second LDTST (at 5C3) from re-triggering gate detection
 
-// Prefetch restart address (used by BUSOP_PREF / q_flush)
-wire        pref_writes_ip = (uc_dest == DEST_EIP || uc_dest == DEST_eIP || uc_dest == DEST_IP);
-wire [31:0] pref_ip_raw = pref_writes_ip ? alu_result : ind_effective;
-wire [31:0] pf_flush_ip =
-    (uc_dest == DEST_EIP) ? (D ? pref_ip_raw : {16'h0, pref_ip_raw[15:0]}) :
-    (uc_dest == DEST_eIP) ? (is_dword ? pref_ip_raw : {16'h0, pref_ip_raw[15:0]}) :
-    (uc_dest == DEST_IP)  ? {16'h0, pref_ip_raw[15:0]} :
-    (op_size[1] ? ind_effective : {16'h0, ind_effective[15:0]});
+// Microcode PREF restarts from IND.  Any required IP width adjustment belongs
+// to the uop that prepared IND, not to the data operand size of the interrupted
+// instruction.
+wire [31:0] pf_flush_ip = ind_effective;
 assign pf_flush_addr = pe_mode_toggle_now ? (CS_base + EIP) : (CS_base + pf_flush_ip);
 
 wire delay_slot_writes_esp = i_rni_delay && (uc_dest == DEST_eSP || uc_dest == DEST_ESP ||
@@ -1041,6 +1312,7 @@ reg set_rpl_redirect_s1, set_rpl_redirect_s2;
 reg copy_stack_dpl_s1;
 reg [1:0] copy_dpl_s1;
 reg conform_dpl_s1;
+reg [1:0] conform_dpl_value_s1;
 reg write_rpl_s1, write_rpl_s2;
 reg cpl_transition;
 
@@ -1062,6 +1334,8 @@ always_ff @(posedge clk) begin
         arpl_m_flag_s2 <= 0;
         conform_dpl_s1 <= 0;
         conform_dpl_s2 <= 0;
+        conform_dpl_value_s1 <= 2'b00;
+        conform_dpl_value_s2 <= 2'b00;
     end else if (prot_pipe_en) begin
         set_rpl_redirect_s1 <= uc_exec && pe &&
             (uc_aluop == ALUJMP_PTGEN) && (uc_alu_src == 6'h2D) &&
@@ -1073,6 +1347,8 @@ always_ff @(posedge clk) begin
             (uc_aluop == ALUJMP_PTGEN) && (uc_alu_src == 6'h2D) &&
             seg_cache[SEG_CS].conforming;
         conform_dpl_s2 <= conform_dpl_s1;
+        conform_dpl_value_s1 <= CS[1:0];
+        conform_dpl_value_s2 <= conform_dpl_value_s1;
         copy_stack_dpl_s1 <= uc_exec && pe &&
             (uc_aluop == ALUJMP_PTGEN) && (uc_alu_src == 6'h2E);
         copy_stack_dpl_s2 <= copy_stack_dpl_s1;
@@ -1172,7 +1448,7 @@ always_comb begin
         uaddr_now = ss_fault_r ? UADDR_STACK_FAULT : UADDR_GENERAL_FAULT1;
 
     if (i_rni_delay && !stall && !page_fault) begin
-        if (nmi_pending && !single_step)
+        if (nmi_request_active && !single_step)
             uaddr_now = UADDR_NMI;
         else if (intr_pending && EFLAGS[9] && !single_step && !inhibit_interrupts)
             uaddr_now = UADDR_HARDWARE_IRQ;
@@ -1291,9 +1567,14 @@ always_ff @(posedge clk) begin
             gate_in_progress <= 1'b0;
         end
 
-        // Clear stack_init_pending and i_first after one cycle
-        if (stack_init_pending) stack_init_pending <= 1'b0;
-        if (i_first) i_first <= 1'b0;
+        // Keep first-cycle decode context live while the first uop is stalled.
+        // First-uop memory requests use ind_effective/ea_comb directly; if
+        // paging cannot accept the request immediately, the retry must still
+        // see the same first-uop EA instead of falling back to registered IND.
+        if (!stall) begin
+            if (stack_init_pending) stack_init_pending <= 1'b0;
+            if (i_first) i_first <= 1'b0;
+        end
 
         // Queue flush: init_cycle<=0 wins over i_entry's init_cycle<=1
         if (q_flush) begin
@@ -1304,7 +1585,7 @@ always_ff @(posedge clk) begin
 
         // Interrupt recognition at instruction completion. MUST be last in the always_ff
         if (i_rni_delay && !stall && !page_fault) begin
-            if (nmi_pending && !single_step) begin
+            if (nmi_request_active && !single_step) begin
                 uc_active <= 1'b1;
                 interrupt_entry <= 1'b1;
                 init_cycle <= 1'b0;
@@ -1337,7 +1618,7 @@ always_ff @(posedge clk) begin
     end else begin
         // NMI edge detection (every cycle)
         nmi_prev <= nmi;
-        if (nmi && !nmi_prev && !nmi_blocked)
+        if (nmi_edge && !nmi_accept_boundary)
             nmi_pending <= 1'b1;
 
         // INTR is level-sensitive: latch when asserted with IF=1
@@ -1367,7 +1648,7 @@ always_ff @(posedge clk) begin
         end
 
         // NMI entry: clear pending (matches completion handler in sequencer)
-        if (i_rni_delay && !stall && !page_fault && nmi_pending && !single_step)
+        if (nmi_accept_boundary)
             nmi_pending <= 1'b0;
     end
 end
@@ -1561,7 +1842,7 @@ always_ff @(posedge clk) begin
                 SIGMA <= alu_dst;
                 if (!instr_is_shxd) case (i.modrm[5:3])
                     RCL:         SIGMA <= (instr_cf << (width-1))  |
-                                          ((alu_dst & width_mask) >> 1);  // RCL
+                                          ((alu_dst & shift_width_mask) >> 1);  // RCL
                     RCR:         SIGMA <= {alu_dst, instr_cf};            // RCL
                     SHL,SHR,SAL: SIGMA <= 0;                              // SHL/SHR/SAL
                     SAR:         SIGMA <= op_size == 2'd0 ? {32{alu_dst[7]}} :
@@ -1575,7 +1856,7 @@ always_ff @(posedge clk) begin
             ALUJMP_SHIFT2,
             ALUJMP_BITTST:
             begin
-                SIGMA <= shift_result[31:0];
+                SIGMA <= shift_result;
             end
 
             ALUJMP_IMUL3: begin
@@ -1751,7 +2032,9 @@ always_ff @(posedge clk) begin
                 end
                 ALUJMP_SHIFT2: if (shift_size != 5'd0) begin
                     if (shift_SET_Nzs) begin
-                        EFLAGS <= SET_Nzs_flags(EFLAGS, shift_result, width);
+                        EFLAGS[2] <= shift_pf;
+                        EFLAGS[6] <= shift_zf;
+                        EFLAGS[7] <= shift_sf;
                     end
                     if (instr_is_shxd) begin
                         // SHLD/SHRD: CF = last bit shifted out
@@ -1948,6 +2231,8 @@ always_ff @(posedge clk) begin
     if (!reset_n) begin
         op_size <= 2'd1;  // Default to word size (16-bit real mode)
         srcreg_size <= 2'd1;
+        op_size_src <= 2'd1;
+        srcreg_size_src <= 2'd1;
     end else if (i_pop && !halted) begin
         // Instruction start: set op_size from decoded instruction
         automatic logic init_is_setcc = i_bus.has_0f && (i_bus.opcode[7:4] == 4'b1001);  // 0F 90-9F
@@ -1963,18 +2248,28 @@ always_ff @(posedge clk) begin
         automatic logic [1:0] init_op_size = init_byte ? 2'd0 :
                                              init_is_movzx_word ? 2'd2 :
                                              (i_bus.data32 ? 2'd2 : 2'd1);
+        automatic logic [1:0] init_srcreg_size = init_is_movzx_movsx ? (i_bus.opcode[0] ? 2'd1 : 2'd0) : init_op_size;
         op_size <= init_op_size;
         op_size_decode <= init_op_size;
+        op_size_src <= init_op_size;
+        op_size_src_decode <= init_op_size;
         // srcreg_size: for MOVZX/MOVSX, source is byte (B6/BE) or word (B7/BF)
-        srcreg_size <= init_is_movzx_movsx ? (i_bus.opcode[0] ? 2'd1 : 2'd0) : init_op_size;
-        srcreg_size_decode <= init_is_movzx_movsx ? (i_bus.opcode[0] ? 2'd1 : 2'd0) : init_op_size;
+        srcreg_size <= init_srcreg_size;
+        srcreg_size_decode <= init_srcreg_size;
+        srcreg_size_src <= init_srcreg_size;
+        srcreg_size_src_decode <= init_srcreg_size;
     end else if (uc_exec) begin
         // Microcode BITS operations
         case (uc_aluop)
-            ALUJMP_BITS8:  begin op_size <= 2'd0; srcreg_size <= 2'd0; end
-            ALUJMP_BITS16: begin op_size <= 2'd1; srcreg_size <= 2'd1; end
-            ALUJMP_BITS32: begin op_size <= 2'd2; srcreg_size <= 2'd2; end
-            ALUJMP_BITSDE: begin op_size <= op_size_decode; srcreg_size <= srcreg_size_decode; end
+            ALUJMP_BITS8:  begin op_size <= 2'd0; srcreg_size <= 2'd0; op_size_src <= 2'd0; srcreg_size_src <= 2'd0; end
+            ALUJMP_BITS16: begin op_size <= 2'd1; srcreg_size <= 2'd1; op_size_src <= 2'd1; srcreg_size_src <= 2'd1; end
+            ALUJMP_BITS32: begin op_size <= 2'd2; srcreg_size <= 2'd2; op_size_src <= 2'd2; srcreg_size_src <= 2'd2; end
+            ALUJMP_BITSDE: begin
+                op_size <= op_size_decode;
+                srcreg_size <= srcreg_size_decode;
+                op_size_src <= op_size_src_decode;
+                srcreg_size_src <= srcreg_size_src_decode;
+            end
             default: ;
         endcase
     end
@@ -2134,7 +2429,8 @@ always_ff @(posedge clk) begin
 
             DEST_CR0: begin
                 CR0 <= dest_value;
-                // When entering protected mode, clear CS RPL bits so CPL=0
+                // Entering protected mode makes CPL 0 until a later control
+                // transfer establishes a different visible CS RPL.
                 if (dest_value[0] && !CR0[0])
                     CS[1:0] <= 2'b00;
             end
@@ -2368,6 +2664,8 @@ always_ff @(posedge clk) begin
                     automatic logic [31:0] ind_val = alu_dst;
                     if (uc_dest == DEST_DESSTK && (!pe || !seg_cache[SEG_SS].D_B))
                         ind_val = {16'h0, ind_val[15:0]};
+                    else if (uc_dest == DEST_DESCOD && !is_dword)
+                        ind_val = {16'h0, ind_val[15:0]};
                     if (uc_dest == DEST_DESIDT)
                         ind_val = seg_cache[SEG_IDT].base + ind_val;
                     IND <= ind_val;
@@ -2577,9 +2875,11 @@ wire uc_is_dword_op    = uc[43];
 wire uc_jpereq_fwd     = uc[44];
 
 always_comb begin
-    alu_dst = read_uc_source(uc_source);              // NOPQRS
-    alu_src = read_uc_alu_source(uc_alu_src);         // ABCDEF
-    alu_op5 = map_alu_op(uc_aluop);                   // TUVWXYZ
+    // Use the ROM-delay-cycle field registers for the hot ALU datapath. They
+    // are aligned with uc, but avoid feeding ALU muxes from the wide ucode word.
+    alu_dst = read_uc_source(uc_source_shift);        // NOPQRS
+    alu_src = read_uc_alu_source(uc_alu_src_shift);   // ABCDEF
+    alu_op5 = map_alu_op(uc_aluop_shift);             // TUVWXYZ
 end
 
 // Register alu_src for jump operations
@@ -2692,6 +2992,13 @@ wire  [63:0] shifted = shift_in >> shift_count;
 // For SAR with overflow, result is sign-extended (all 1s if negative, all 0s if positive)
 wire [31:0]  sar_overflow_result = shift_lo[width-1] ? 32'hFFFFFFFF : 32'h0;
 assign       shift_result = shift_overflow ? (is_sar ? sar_overflow_result : 32'h0) : shifted[31:0];
+wire         shift_pf = ~^shift_result[7:0];
+wire         shift_zf = (op_size == 2'd0) ? (shift_result[7:0] == 8'h0) :
+                        (op_size == 2'd1) ? (shift_result[15:0] == 16'h0) :
+                                            (shift_result == 32'h0);
+wire         shift_sf = (op_size == 2'd0) ? shift_result[7] :
+                        (op_size == 2'd1) ? shift_result[15] :
+                                            shift_result[31];
 
 // flags related
 reg          shift_SET_Nzs;
@@ -2704,7 +3011,9 @@ wire         shift_cf = shift_swap ? shift_last_out_msb : shift_last_out_lsb;
 logic [63:0] concat;
 logic [5:0]  shift_amt;
 wire  [5:0]  width = (op_size == 2'd0) ? 6'd8 : (op_size == 2'd1) ? 6'd16 : 6'd32;
-wire  [31:0] width_mask = (33'd1 << width) - 33'd1;
+wire  [31:0] shift_width_mask = (op_size == 2'd0) ? 32'h0000_00FF :
+                                (op_size == 2'd1) ? 32'h0000_FFFF :
+                                                    32'hFFFF_FFFF;
 
 // Barrel shifter ops
 always_ff @(posedge clk) begin
@@ -2713,7 +3022,11 @@ always_ff @(posedge clk) begin
         automatic logic [5:0] count_mod;
         automatic logic [5:0] count_raw;
         count_raw = alu_src[4:0];  // Count masked to 5 bits
-        count_mod = count_raw % width;  // Reduce count modulo width (for ROL/ROR only)
+        case (op_size)            // Reduce count modulo width (for ROL/ROR only)
+            2'd0:    count_mod = {3'd0, count_raw[2:0]};  // mod 8
+            2'd1:    count_mod = {2'd0, count_raw[3:0]};  // mod 16
+            default: count_mod = count_raw;               // mod 32, count is already 0..31
+        endcase
         shift_size = count_raw;  // Store original count for OF check (count==1)
 
         if (instr_is_shxd) begin   // i.opcode[3], 1: SHRD, 0: SHLD
@@ -2784,23 +3097,6 @@ end
 
 // Combined result: use shifter result when second pass or exec_new_val completes
 wire use_shifter_result = (uc_aluop == ALUJMP_SHIFT2) || (uc_aluop == ALUJMP_SHIFT);
-
-function automatic [31:0] SET_Nzs_flags(
-    input [31:0] flags_in,
-    input [31:0] value,
-    input int unsigned width
-);
-    logic [31:0] flags_out;
-    logic [32:0] mask;
-begin
-    flags_out = flags_in;
-    mask = (33'd1 << width) - 33'd1;
-    flags_out[2] = ~^value[7:0];
-    flags_out[6] = ((value & mask[31:0]) == 0);
-    flags_out[7] = (value >> (width - 1)) & 1'b1;
-    SET_Nzs_flags = flags_out;
-end
-endfunction
 
 assign dest_value = alu_dst;
 
@@ -3021,8 +3317,8 @@ function automatic [31:0] read_uc_source(input [5:0] src_field);
         SRC_TMP_TR: read_uc_source = SLCTR;  // encoding 0x13 = SLCTR2 (32-bit: full descriptor hi for LAR/LSL)
         SRC_COUNTR: read_uc_source = COUNTR;
         SRC_PROTUN: read_uc_source = PROTUN;
-        SRC_TMPeIP: read_uc_source = i_reg_addr32 ? TMPeIP : {16'h0, TMPeIP[15:0]};  // Saved IP for RPTI
-        SRC_TMPeSP: read_uc_source = is_dword ? TMPeSP : {16'h0, TMPeSP[15:0]};  // Saved SP for fault
+        SRC_TMPeIP: read_uc_source = TMPeIP;  // Saved restart IP; destination/IND setup owns width truncation
+        SRC_TMPeSP: read_uc_source = is_dword_src ? TMPeSP : {16'h0, TMPeSP[15:0]};  // Saved SP for fault
         SRC_DR6: read_uc_source = DR6;
         SRC_DR7: read_uc_source = DR7;
         SRC_CSOPCD: read_uc_source = CSOPCD;
@@ -3040,13 +3336,13 @@ function automatic [31:0] read_uc_source(input [5:0] src_field);
         SRC_TR: read_uc_source = {16'h0, TR};
         SRC_SLCTR: read_uc_source = SLCTR;
         SRC_eAX_AL: // Size-aware accumulator for string ops (STOS/LODS/SCAS)
-            read_uc_source = op_size == 2'd0 ? {24'h0, EAX[7:0]} :   // AL
-                             op_size == 2'd1 ? {16'h0, EAX[15:0]} :  // AX
-                                                   EAX;                  // EAX
+            read_uc_source = op_size_src == 2'd0 ? {24'h0, EAX[7:0]} :   // AL
+                             op_size_src == 2'd1 ? {16'h0, EAX[15:0]} :  // AX
+                                                       EAX;               // EAX
         SRC_eDX_AH: // Size-aware upper dividend/accumulator for DIV/MUL/CWD/CDQ
-            read_uc_source = op_size == 2'd0 ? {24'h0, EAX[15:8]} :   // AH
-                             op_size == 2'd1 ? {16'h0, EDX[15:0]} :   // DX
-                                                   EDX;                   // EDX
+            read_uc_source = op_size_src == 2'd0 ? {24'h0, EAX[15:8]} :   // AH
+                             op_size_src == 2'd1 ? {16'h0, EDX[15:0]} :   // DX
+                                                       EDX;                // EDX
         SRC_OPR_R: read_uc_source = OPR_R;
         SRC_IRF2: read_uc_source = IND;          // IRF2 is IND
         SRC_EA: read_uc_source = ea_r;         // use registered as EA is not used in i_first
@@ -3055,16 +3351,17 @@ function automatic [31:0] read_uc_source(input [5:0] src_field);
         SRC_COUNTR2: read_uc_source = COUNTR;
         SRC_IRF: begin  // Indirect Register File read (PUSHA/PUSHAD)
             // COUNTR indexes: 7=EDI, 6=ESI, 5=EBP, 4=ESP, 3=EBX, 2=EDX, 1=ECX, 0=EAX
-            // Uses is_dword (from op_size) so BITS16/BITS32 affects register width
+            // Uses is_dword_src so BITS16/BITS32 affects register width without
+            // routing global op_size through this generic source mux.
             case (COUNTR[2:0])
-                3'd0: read_uc_source = is_dword ? EAX : {16'h0, EAX[15:0]};
-                3'd1: read_uc_source = is_dword ? ECX : {16'h0, ECX[15:0]};
-                3'd2: read_uc_source = is_dword ? EDX : {16'h0, EDX[15:0]};
-                3'd3: read_uc_source = is_dword ? EBX : {16'h0, EBX[15:0]};
-                3'd4: read_uc_source = is_dword ? ESP : {16'h0, ESP[15:0]};  // Original ESP
-                3'd5: read_uc_source = is_dword ? EBP : {16'h0, EBP[15:0]};
-                3'd6: read_uc_source = is_dword ? ESI : {16'h0, ESI[15:0]};
-                3'd7: read_uc_source = is_dword ? EDI : {16'h0, EDI[15:0]};
+                3'd0: read_uc_source = is_dword_src ? EAX : {16'h0, EAX[15:0]};
+                3'd1: read_uc_source = is_dword_src ? ECX : {16'h0, ECX[15:0]};
+                3'd2: read_uc_source = is_dword_src ? EDX : {16'h0, EDX[15:0]};
+                3'd3: read_uc_source = is_dword_src ? EBX : {16'h0, EBX[15:0]};
+                3'd4: read_uc_source = is_dword_src ? ESP : {16'h0, ESP[15:0]};  // Original ESP
+                3'd5: read_uc_source = is_dword_src ? EBP : {16'h0, EBP[15:0]};
+                3'd6: read_uc_source = is_dword_src ? ESI : {16'h0, ESI[15:0]};
+                3'd7: read_uc_source = is_dword_src ? EDI : {16'h0, EDI[15:0]};
             endcase
         end
         SRC_SEGREG: begin
@@ -3078,8 +3375,8 @@ function automatic [31:0] read_uc_source(input [5:0] src_field);
                 default: read_uc_source = 32'h0;
             endcase
         end
-        SRC_DSTREG: read_uc_source = read_gpr(i_reg_dst_reg_sel, srcreg_size);
-        SRC_SRCREG: read_uc_source = read_gpr(i_reg_src_reg_sel, op_size);
+        SRC_DSTREG: read_uc_source = read_gpr(i_reg_dst_reg_sel, srcreg_size_src);
+        SRC_SRCREG: read_uc_source = read_gpr(i_reg_src_reg_sel, op_size_src);
         SRC_NEG1: read_uc_source = 32'hFFFF_FFFF;
         default: read_uc_source = 32'd0;
     endcase
@@ -3280,10 +3577,17 @@ endfunction
 
 // One-hot GPR mux: select register value from one-hot encoded selector
 function automatic [31:0] onehot_gpr_mux(input [7:0] sel);
-    onehot_gpr_mux = (sel[0] ? EAX : 32'h0) | (sel[1] ? ECX : 32'h0) |
-                     (sel[2] ? EDX : 32'h0) | (sel[3] ? EBX : 32'h0) |
-                     (sel[4] ? ESP : 32'h0) | (sel[5] ? EBP : 32'h0) |
-                     (sel[6] ? ESI : 32'h0) | (sel[7] ? EDI : 32'h0);
+    case (sel)
+        8'h01: onehot_gpr_mux = EAX;
+        8'h02: onehot_gpr_mux = ECX;
+        8'h04: onehot_gpr_mux = EDX;
+        8'h08: onehot_gpr_mux = EBX;
+        8'h10: onehot_gpr_mux = ESP;
+        8'h20: onehot_gpr_mux = EBP;
+        8'h40: onehot_gpr_mux = ESI;
+        8'h80: onehot_gpr_mux = EDI;
+        default: onehot_gpr_mux = 32'h0;
+    endcase
 endfunction
 
 // EA calculation using pre-decoded one-hot control signals

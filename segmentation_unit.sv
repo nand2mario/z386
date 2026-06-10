@@ -23,7 +23,8 @@ module segmentation_unit
     input      [15:0]  slctr,              // SLCTR register (null selector check for SDEL)
     input              copy_stack_dpl_s2,  // Write descriptor DPL into SS cache
     input      [1:0]   copy_dpl_s2,        // DPL value to write
-    input              conform_dpl_s2,     // Update CS.DPL to match CPL
+    input              conform_dpl_s2,     // Update CS.DPL to effective CPL
+    input      [1:0]   conform_dpl_value_s2, // Effective CPL to preserve for conforming code
 
     output seg_desc_t  seg_cache [0:10],   // Descriptor caches (SEG_ES=0..SEG_GDT=10)
     output     [31:0]  lar_result,         // LAR combinational readback (keyed by seg_target)
@@ -283,7 +284,7 @@ always_ff @(posedge clk) begin
             seg_cache[SEG_SS].DPL <= copy_dpl_s2;
 
         if (conform_dpl_s2)
-            seg_cache[SEG_CS].DPL <= cpl;
+            seg_cache[SEG_CS].DPL <= conform_dpl_value_s2;
     end
 end
 
