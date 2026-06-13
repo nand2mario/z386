@@ -104,7 +104,6 @@ reg [1:0]  srcreg_size_decode;      // Decoded srcreg_size (saved at i_pop, rest
 (* preserve *) reg [1:0] srcreg_size_src;
 (* preserve *) reg [1:0] srcreg_size_src_decode;
 wire       is_dword = (op_size == 2'd2); // Runtime dword flag
-wire       is_word = (op_size == 2'd1);  // Runtime word flag
 wire       is_dword_src = (op_size_src == 2'd2);
 
 // ALU signals (35-bit for MUL/DIV iteration support)
@@ -145,16 +144,7 @@ assign dbg_EIP = EIP;
 assign dbg_CS_base = CS_base;
 assign dbg_pe  = pe;
 assign dbg_vm  = vm;
-// CPL = CS.RPL in protected mode (the microcode maintains CS[1:0] via the
-// COPY_STACK_DPL/cpl_transition commits and DEST_CS preserves it).  The
-// descriptor-cache DPL is NOT the CPL: after an outer-level return into a
-// conforming DPL0 code segment (Ergo DPMI ring-3 kernel facet), cache DPL
-// stays 0 while CPL is 3 — z386 then treated ring-3 code as privileged
-// (LIDT at CPL3 silently zeroed IDTR; next fault was undeliverable).
 wire [1:0] cpl = vm ? 2'd3 : !pe ? 2'd0 : CS[1:0];
-wire       pg_enable = CR0[31];     // Paging enabled
-wire       wp_enable = CR0[16];     // Write protect
-wire [31:0] page_dir_base = CR3 & 32'hFFFFF000;  // Page directory base
 
 reg [2:0]  latched_pf_code;         // Latched page fault error code (for LPCR microcode access)
 reg [31:0] latched_pf_addr;         // Latched faulting linear address (for LPCR microcode access)
@@ -221,21 +211,14 @@ wire       interrupt_at_boundary = i_rni_delay && interrupt_pending && !single_s
 assign     i_pop = init_cycle && !stall && !page_fault && !interrupt_at_boundary && !q_flush;
 
 // Stall: hold the current memory uop until paging can accept it, then hold DLY
-// while the accepted request is owned by paging.  Use mem_req_current for the
-// ready interlock so same-cycle segment-fault detection does not feed back into
-// the global stall/protection-pipeline enable path.
-//
-// The cone is kept shallow on purpose: every leaf below is either a register
-// or a ROM-predecoded uc bit, with mem_servicing as the top-level select.
-// (mem_complete_now is hardwired 0 — completion is registered in paging.)
+// while the accepted request is owned by paging.
 //
 // Optimistic read release: during mem_dly_grace (the dcache lookup cycle of a
 // non-crossing demand read) a pure-DLY uop may execute one cycle early — on a
 // hit the data is written to OPR_R at the end of that same cycle, and no
 // microcode word both carries DLY and sources OPR_R.  If the read turns out to
 // be a miss, mem_opt_wait (registered in paging) stalls every following uop
-// until the fill completes, so the cache hit/miss result never feeds the
-// sequencer combinationally.
+// until the fill completes.
 wire       core_live = !halted && uc_active && !fault_suppress_delay_slot && !interrupt_entry;
 wire       dly_grace_now = mem_dly_grace && uc_p_pure_dly;
 wire       mem_block_busy = (uc_bus_or_dly && !dly_grace_now) || mem_opt_wait; // demand op in flight
@@ -847,15 +830,7 @@ wire pg_is_write     = uc_is_write;
 wire pg_is_check_write = uc_is_check_write;
 wire pg_is_word_op   = uc_is_word_op;
 wire pg_is_dword_op  = uc_is_dword_op;
-// WR W / RD W access width = |IND_DELTA| (the stack/TSS slot stride), not the
-// live BITS mode.  One microcode routine serves both formats by latching the
-// stride: task save/load and gate frames write 4-byte zero-extended slots
-// with a 386 TSS / 32-bit gate (delta ±4, test386 dword-compares pushed
-// CS/errcode) but 2-byte slots with a 286 TSS / 16-bit gate (delta ±2; the
-// errcode push 62A runs after 627's BITS32 yet must not clobber the 16-bit
-// frame above it — Ergo DPMI read IP=0 from its #GP frame).  EA-addressed
-// word stores (MOV m,Sreg, SGDT limit) use the i_pop default delta of 2,
-// keeping them architecturally 16-bit (previously per-instruction patches).
+// WR W / RD W access width = |IND_DELTA| (the stack/TSS slot stride)
 wire ind_delta_dword = (IND_DELTA == 32'd4) || (IND_DELTA == -32'd4);
 wire [1:0] mem_eff_size = pg_is_word_op ? (ind_delta_dword ? 2'd2 : 2'd1) :
                           pg_is_dword_op ? 2'd2 : op_size;
@@ -872,11 +847,6 @@ wire [2:0]  pg_fault_code;        // Page fault error code
 wire [31:0] pg_cr2_out;           // Faulting address for CR2
 
 // CR3 write detection for TLB flush
-// CR3 commit is SPCR with dest=PDBR (36F MOV CR3, 794 task switch, 93B LOADALL,
-// 97B STOREALL, 9AA bootup); the value was loaded into IND by a preceding
-// "IND= DESABS" uop.  Decoding on IND=+DESABS itself is wrong: the MOV DR/TR
-// routines (38F/395/3B4) end with that pattern to access the DR/TR register
-// file and would clobber CR3 (EMM386+TC3 hang: MOV rd,DRn zeroed CR3).
 wire cr3_write = uc_exec && uc_buscode == BUSOP_SPCR && uc_dest == DEST_PDBR;
 
 // IO request detection
@@ -887,9 +857,7 @@ wire io_busop_wr = uc_p_io_wr && mem_is_io;
 // IACK bus operation (interrupt acknowledge)
 wire iack_busop = uc_p_iack;
 
-// Interrupt pending: NMI has priority over INTR. Include a same-cycle NMI
-// edge so an NMI arriving on an instruction-completion boundary is accepted at
-// that boundary instead of waiting for the next instruction.
+// Interrupt pending: NMI has priority over INTR
 wire nmi_edge = nmi && !nmi_prev && !nmi_blocked;
 wire nmi_request_active = nmi_pending || nmi_edge;
 wire interrupt_pending = nmi_request_active || (intr_pending && EFLAGS[9]);
@@ -910,12 +878,7 @@ wire uc_busreq = (pg_mem_busop && !mem_is_io) ||
                  iack_busop;
 wire mem_req_current = mem_op_eligible && uc_busreq;
 
-// Delay prefetch on upcoming demand memory.  Must not fire when the core is
-// starved (uc_active=0 with an empty decode queue): the ROM keeps emitting
-// the stale next word, and an unqualified bit39 held the prefetch off
-// forever — deadlock (prefetch starves the core, the dead uop's predecode
-// starves the prefetch).  With instructions still queued the holdoff stays
-// (the next entry's demand op is imminent).
+// Delay prefetch on upcoming demand memory
 wire mem_req_upcoming = uc_next[39] && !halted && (uc_active || !decq_empty);
 
 // Implicit supervisor access: descriptor table and TSS reads, cross-privilege
@@ -1022,12 +985,12 @@ always_ff @(posedge clk) begin
 end
 
 // synthesis translate_off
-// Debug: log every protected-mode (non-V86) fault delivery (FAULT entry 890)
+// Debug: log every protected-mode (non-V86) fault delivery
 always @(posedge clk) begin
     if (reset_n && uc_addr == 12'h890 && !EFLAGS[17])
         $display("%0t: PM FAULT CS:EIP=%0x:%0x SIGMA=%08x TMPF=%08x EFL=%08x", $time, CS, EIP, SIGMA, TMPF, EFLAGS);
 end
-// Debug: log IDT base changes (TC bug #5: IDTR went to 0 mid-session)
+// Debug: log IDT base changes
 reg [31:0] dbg_idt_base_q;
 always @(posedge clk) begin
     dbg_idt_base_q <= seg_cache[SEG_IDT].base;
@@ -1231,36 +1194,15 @@ reg        prot_redirect_prev;      // Protection redirect fired last cycle (sup
 reg [31:0] OPR_W;                   // Bus operation data registers
 reg [31:0] IND;                     // Internal address register
 
-wire [31:0] ea_comb        = calc_ea(ea_base_sel, ea_index_sel, ea_scale, ea_disp,
-                                    ea_has_base, ea_has_index, ea_has_disp, ea_is_16bit, ea_scale_to_base);
 reg [31:0] ea_r;                    // Registered EA for ALU path
 
-// Early EA (386 early-start): the modrm EA, computed at i_pop with delay-slot
-// GPR forwarding and registered, so microcode execution / segment fault use a
-// register instead of the combinational ea_comb (which dominated the WNS cone
-// via ea_comb -> seg limit -> i_rni_delay/init_cycle).  Validated against
-// ea_comb by a differential assertion before ind_effective switches to it.
-reg [31:0] ea_reg;
+reg [31:0] ea_reg;                  // Early EA: the modrm EA, computed at i_pop with delay-slot GPR forwarding
 
 assign ind_effective = (i_first && instr_ind_is_ea) ? ea_reg : IND;
 
 reg [2:0]  seg_reg_sel;             // Segment register index (0=ES,1=CS,2=SS,3=DS,4=FS,5=GS)
 
-// EA Two-Stage Calculation: pre-decoded EA components (latched at i_pop)
-reg [7:0]  ea_base_sel;             // One-hot: which base register (EAX=0,ECX=1,...,EDI=7)
-reg [7:0]  ea_index_sel;            // One-hot: which index register (0=none)
-reg [1:0]  ea_scale;                // Scale factor: 00=*1, 01=*2, 10=*4, 11=*8
-reg [31:0] ea_disp;                 // Displacement value
-reg        ea_has_base;             // Include base register
-reg        ea_has_index;            // Include index register
-reg        ea_has_disp;             // Include i.displacement
-reg        ea_is_16bit;             // 16-bit addressing mode
-reg        ea_scale_to_base;        // Special case: scale applies to base (SIB with no index)
-
-// Combinational EA-operand decode (from i_bus, valid at i_pop).  Registered
-// into the ea_* regs at i_pop; also consumed directly for the early EA at
-// i_pop (so the EA register is available at i_first without a combinational
-// ea_comb in the execution/fault cone).
+// Combinational EA-operand decode (from i_bus, valid at i_pop)
 logic [7:0]  ea_dec_base_sel, ea_dec_index_sel;
 logic [1:0]  ea_dec_scale;
 logic [31:0] ea_dec_disp;
@@ -1299,10 +1241,7 @@ wire delay_slot_writes_esp = i_rni_delay && (uc_dest == DEST_eSP || uc_dest == D
                                               (uc_dest == DEST_SRCREG && i.src_reg_sel == 4 && op_size != 2'd0));
 wire [31:0] forwarded_esp = delay_slot_writes_esp ? dest_value : ESP;
 
-// Delay-slot GPR write descriptor for early-EA forwarding.  Mirrors the
-// GPR-writing DEST cases (incl. x86 byte-register AH/BH/CH/DH high-byte
-// encoding) to produce which GPR the in-flight delay slot updates and at
-// what width, so fwd_onehot_gpr can reproduce the post-write value.
+// Delay-slot GPR write descriptor for early-EA forwarding
 localparam [1:0] FWD_BLO = 2'd0, FWD_BHI = 2'd1, FWD_W = 2'd2, FWD_D = 2'd3;
 reg       dly_gpr_we;
 reg [2:0] dly_gpr_sel;
@@ -1364,17 +1303,6 @@ always_ff @(posedge clk) begin
     if (i_pop)
         ea_reg <= ea_early;
 end
-// synthesis translate_off
-// Differential check: the registered early EA must match the combinational
-// ea_comb at i_first for every modrm-EA instruction.  Any miss in the
-// delay-slot forwarding decode shows up here (loudly) before ind_effective
-// switches to ea_reg.
-always_ff @(posedge clk) begin
-    if (reset_n && i_first && instr_ind_is_ea && (ea_reg !== ea_comb))
-        $display("%0t: EA MISMATCH ea_reg=%08x ea_comb=%08x uc_dest_dly? CS:EIP=%0x:%0x",
-                 $time, ea_reg, ea_comb, CS, EIP);
-end
-// synthesis translate_on
 
 // RNI variants (opcode field):
 //   000 = RNI  : Run Next Instruction (normal termination)
@@ -1442,27 +1370,18 @@ function automatic logic is_reljump_taken(input [6:0] aluop);
         ALUJMP_JMP:     is_reljump_taken = 1'b1;                // Unconditional jump
         ALUJMP_JNOINT:  is_reljump_taken = !interrupt_pending;  // Jump if NO interrupt
         ALUJMP_JNBUSY:  is_reljump_taken = 1'b1;                // FPU busy — always taken (no FPU)
-        // J16BIT: the current TSS (TR) is 286-format (system type 1/3, bit 3
-        // clear).  Selects the 16-bit TSS layout for ring-change stack
-        // switches (MORE_PRIV16: SP0@+2/SS0@+4 instead of ESP0@+4/SS0@+8),
-        // the 286 task save/load paths, and the no-IO-bitmap PORTIO path.
-        // Was unimplemented (never taken): a CPL3->CPL0 interrupt under a 286
-        // TSS (Borland/Ergo DPMI) read SS0 from the wrong offset and #GP-looped.
         ALUJMP_J16BIT:  is_reljump_taken = !seg_cache[SEG_TR].seg_type[3];
         default:        is_reljump_taken = 1'b0;
     endcase
 endfunction
 
+// TODO: fix special casing
 // Suppress JMP in LD_DESCRIPTOR at 5D3 when Accessed bit needs GDT write-back.
 // When A=0 in the descriptor, fall through to 5D5-5D7 which writes A=1 back to GDT.
 // When A=1, take JMP to skip write-back (A already set).
 wire desc_accessed_writeback = pe && (uc_aluop == ALUJMP_JMP) &&
                                (uc_addr == 12'h5D3) && !desc_raw_hi[8];
 
-// !repeat_active: a jump combined with RPT (only 5FE: J16BIT+RPT, the 286-TSS
-// stack-switch select) must take effect exactly once, on the cycle the repeat
-// completes.  Without the gate the relative offset is re-applied every repeat
-// cycle (5FE -> 5EC -> 5DA), derailing into the LD_DESCRIPTOR completion path.
 wire uc_reljump_taken = uc_exec && !repeat_active && is_reljump_taken(uc_aluop) &&
                         !desc_accessed_writeback && !prot_redirect_prev;
 
@@ -1738,7 +1657,7 @@ always_ff @(posedge clk) begin
         end
 
         // Keep first-cycle decode context live while the first uop is stalled.
-        // First-uop memory requests use ind_effective/ea_comb directly; if
+        // First-uop memory requests use ind_effective/ea_reg directly; if
         // paging cannot accept the request immediately, the retry must still
         // see the same first-uop EA instead of falling back to registered IND.
         if (!stall) begin
@@ -1843,10 +1762,7 @@ always_ff @(posedge clk) begin
                           i_bus.has_0f && (i_bus.opcode == 8'hA4 || i_bus.opcode == 8'hA5 || i_bus.opcode == 8'hAC || i_bus.opcode == 8'hAD);
         instr_is_shxd <= i_bus.has_0f && ((i_bus.opcode == 8'hA4) || (i_bus.opcode == 8'hA5) ||
                                           (i_bus.opcode == 8'hAC) || (i_bus.opcode == 8'hAD));
-        // RCL/RCR carry-in: forward the committing CF (eflags_fwd) so
-        // consecutive rotate-through-carry chains (RCR DX,1; RCR BX,1) read
-        // the right carry-in across the two-cycle flag commit.
-        instr_cf <= eflags_fwd[0];
+        instr_cf <= eflags_fwd[0];      // RCL/RCR carry-in: forward the committing CF (eflags_fwd)
         instr_is_cmp <= i_bus.opcode[7:2] == 6'b100000 || i_bus.opcode[7:3] == 5'b00111;
         instr_ind_is_ea <= i_bus.has_modrm && !i_bus.stack_op && !i_bus.has_moffs;
         // Pre-decode ALU group op: eliminates i.opcode/i.modrm muxes from ALU critical path
@@ -1939,9 +1855,7 @@ always_comb begin
             end
             ea_dec_disp = disp_val;
         end
-        // Zero ea_disp when not used (last-assignment-wins) so calc_ea
-        // can use an unconditional 3-operand add without has_disp mux.
-        // mod=00 without special rm, and mod=11 (register): no displacement.
+        // Zero ea_disp when not used
         if (i_bus.modrm[7:6] == 2'b00 || i_bus.modrm[7:6] == 2'b11) begin
             if (i_bus.addr32) begin
                 // 32-bit: special rm is rm=101 (non-SIB) or sib_base=101 (SIB)
@@ -1958,21 +1872,6 @@ always_comb begin
                     ea_dec_disp = 32'h0;
             end
         end
-    end
-end
-
-// Register the EA decode at i_pop (consumed at i_first by calc_ea / ALU path)
-always_ff @(posedge clk) begin
-    if (i_pop) begin
-        ea_base_sel      <= ea_dec_base_sel;
-        ea_index_sel     <= ea_dec_index_sel;
-        ea_scale         <= ea_dec_scale;
-        ea_scale_to_base <= ea_dec_scale_to_base;
-        ea_is_16bit      <= ea_dec_is_16bit;
-        ea_has_base      <= ea_dec_has_base;
-        ea_has_index     <= ea_dec_has_index;
-        ea_has_disp      <= ea_dec_has_disp;
-        ea_disp          <= ea_dec_disp;
     end
 end
 
@@ -2103,9 +2002,7 @@ always_ff @(posedge clk) begin
     end else begin
         if (i_pop)
             uc_flags <= EFLAGS;
-        // Two-cycle ALU flag commit.  Overrides the i_pop capture for the
-        // committed bits: when the producer is the previous instruction's
-        // last uop, the capture above reads the not-yet-committed EFLAGS.
+        // Two-cycle ALU flag commit
         if (flag2_ucflags_p) begin
             uc_flags[0]  <= flag2_cf_r;
             uc_flags[4]  <= flag2_af_r;
@@ -2116,10 +2013,7 @@ always_ff @(posedge clk) begin
                 uc_flags[7] <= flag2_sf;
             end
         end
-        // Two-cycle shifter flag commit (same role as flag2 for ALU ops): make
-        // the architectural shift flags visible to the next instruction's
-        // micro-jumps.  Placed before the single-cycle BSR/BITTST writes so the
-        // loop's own CF (this cycle's shift) wins in loop cycles.
+        // Two-cycle shifter flag commit
         if (sh2_commit_p) begin
             uc_flags[0] <= sh2_cf;
             if (sh2_we_zsp) begin
@@ -2130,9 +2024,7 @@ always_ff @(posedge clk) begin
             if (sh2_we_of)
                 uc_flags[11] <= sh2_of;
         end
-        // Shift/BITTST CF stays single-cycle: the BSR/BSF loop's JNC reads
-        // it the next uop (the only distance-1 flag consumer in the ROM).
-        // i_pop exclusion preserves the pre-existing capture priority.
+        // Shift/BITTST CF stays single-cycle
         if (!i_pop && uc_exec) begin
             case (uc_aluop)
                 ALUJMP_BITTST:
@@ -2174,10 +2066,7 @@ always_ff @(posedge clk) begin
             interrupt_hw <= 1'b0;
             // jcc_active moved to instruction signals block (single-driver)
         end
-        // Two-cycle ALU flag commit (producer ran last cycle).  Placed
-        // before the uc_exec case so a same-cycle explicit flag write
-        // (FLGOPS, CLZF/SEZF, DIV5, POPF/SAHF, ...) from the program-order
-        // later uop wins on conflicting bits.
+        // Two-cycle ALU flag commit (producer ran last cycle)
         if (flag2_eflags_p) begin
             EFLAGS[0]  <= flag2_cf_r;
             EFLAGS[1]  <= 1'b1;
@@ -2261,9 +2150,7 @@ always_ff @(posedge clk) begin
                     clear_if_pending <= 1'b0;  // Reset the pending flag
                 end
                 // SHIFT2 architectural flags retire one cycle later via the
-                // sh2_* commit (above), keeping the barrel shifter off the
-                // EFLAGS register cone.  uc_flags[0] for the BSR/BSF loop stays
-                // single-cycle (handled in the uc_flags block).
+                // sh2_* commit (above)
                 ALUJMP_SHIFT2: ;
                 ALUJMP_SHIFT: begin
                     // AAD: SHIFT precedes ADC, clear CF so ADC behaves like ADD.
@@ -2803,15 +2690,6 @@ function automatic logic check_condition(input [3:0] cond);
 endfunction
 
 // IND register (address register)
-// Segment selection (mem_seg_sel, addr_size, etc.) handled by segmentation_unit.
-// IND_DELTA: signed stride for IN+D, latched as the IN=+ alu2 operand (the
-// fields.txt semantic: "IN=+ ... IND_DELTA = alu2").  IN+D must add the
-// latched value, not a live ±wordsize: the microcode changes BITS mode and
-// strides between the latch and the use.  Two real cases: MORE_PRIV16 5EF
-// latches +2 (286 TSS stride) for the SP0->SS0 step at 603, and 60A latches
-// NEGWSZ(-2) through a 16-bit gate before 627's BITS32, so the error-code
-// IN+D at 629 stays -2 (Ergo DPMI HLT-gate frame was shifted by 2).
-// Initialized at instruction start to the hardware stack stride.
 reg [31:0] IND_DELTA;
 always_ff @(posedge clk) begin
     if (!reset_n) begin
@@ -2821,9 +2699,6 @@ always_ff @(posedge clk) begin
         // Instruction start - initialize IND based on addressing mode
         if ((~uc_active && ~halted && ~i_rni_delay && i_pop) ||
             (i_rni_delay && i_pop && !halted)) begin
-            // Stack ops: hardware stride (PUSH sreg writes a dword slot with
-            // 32-bit operand).  Non-stack default +2 keeps EA-addressed WR W
-            // stores (MOV m,Sreg, SGDT limit) 16-bit.
             IND_DELTA <= !i_bus.stack_op ? 32'd2 :
                          !i_bus.stack_dir ? (i_bus.data32 ? -32'd4 : -32'd2) :
                                             (i_bus.data32 ? 32'd4 : 32'd2);
@@ -2837,7 +2712,7 @@ always_ff @(posedge clk) begin
             end else if (i_bus.has_moffs) begin
                 IND <= i_bus.addr32 ? i_bus.immediate : {16'h0, i_bus.immediate[15:0]};
             end
-            // modrm-based: IND not set here — ind_effective returns ea_comb at i_first
+            // modrm-based: IND not set here — ind_effective returns ea_reg at i_first
         end
         // BUSOP-related IND updates (only when uc_exec is active)
         else if (uc_exec) begin
@@ -3142,15 +3017,8 @@ alu u_alu (
 //=============================================================================
 // Two-cycle ALU flag retirement
 //=============================================================================
-// The ZF/SF/PF extraction (32-bit zero-reduce + size muxes + flag select)
-// was the tail of the worst timing cone (operand mux -> ALU -> flag tree ->
-// EFLAGS).  Cycle 1 registers the raw result and the cheap carry-chain
-// flags (CF/AF/OF); cycle 2 derives ZF/SF/PF and commits to EFLAGS and
-// uc_flags.  Microcode audit (doc/0.3): no consumer reads ALU-class flags
-// the cycle after the producer — every instruction ends with RNI plus a
-// delay slot, and the micro-jumps JG/JNC/JNO sit >=2 uops after internal
-// ALU producers.  Shift/BITTST CF stays single-cycle (BSR loop consumes
-// shifter CF at +1); shift flag writes are unchanged.
+// Cycle 1: registers the raw result and the cheap carry-chain flags (CF/AF/OF)
+// Cycle 2: derives ZF/SF/PF and commits to EFLAGS and uc_flags
 reg        flag2_eflags_p;     // commit to EFLAGS this cycle (producer had uc[37])
 reg        flag2_ucflags_p;    // commit to uc_flags this cycle
 reg [31:0] flag2_result_r;     // raw ALU result of the producer
@@ -3190,13 +3058,8 @@ wire flag2_pf = ~^flag2_result_r[7:0];
 //=============================================================================
 // Two-cycle shifter flag retirement
 //=============================================================================
-// After the ALU two-cycle and the early EA, the barrel shifter -> CF/OF ->
-// EFLAGS path is the dominant WNS cone (shift_in -> ShiftRight0 -> EFLAGS).
-// Retire the architectural shift flags one cycle later: SHIFT2 registers the
-// final CF/OF/ZF/SF/PF values here, the EFLAGS/uc_flags commit applies them
-// next cycle.  The micro-jump path (BSR/BSF loop's JNC reads uc_flags[0] at
-// distance 1) keeps its single-cycle uc_flags[0] <= shift_cf write, which
-// wins over this commit in loop cycles (program-order, later in the block).
+// SHIFT2 registers the final CF/OF/ZF/SF/PF values here, the EFLAGS/uc_flags 
+// commit applies them next cycle.
 reg sh2_commit_p, sh2_we_zsp, sh2_we_of;
 reg sh2_cf, sh2_of, sh2_zf, sh2_sf, sh2_pf;
 always_ff @(posedge clk) begin
@@ -3245,10 +3108,6 @@ always_ff @(posedge clk) begin
 end
 
 // EFLAGS as it will be after this cycle's pending two-cycle flag commit
-// (sh2 shift / flag2 ALU).  Entry-point captures (FLAGSB, instr_cf) sample at
-// i_pop, which overlaps the producer instruction's RNI delay slot where the
-// commit lands — so they must use this forwarded view, not the raw EFLAGS,
-// or they latch the stale pre-commit flags.
 wire [31:0] eflags_fwd =
     sh2_commit_p ? { EFLAGS[31:12],
                      sh2_we_of  ? sh2_of : EFLAGS[11],
@@ -3348,12 +3207,7 @@ assign       shift_result = shift_overflow ? (is_sar ? sar_overflow_result : 32'
 wire         shift_pf = ~^shift_result[7:0];
 
 // ZF/SF taken from the raw barrel output (shifted), with the overflow special
-// cases resolved separately — this skips the shift_result overflow mux on the
-// flag path at zero added logic.  A fully parallel 64-bit window-mask
-// anticipation network was tried here and reverted: it caused routing
-// congestion (seed-level routing failures around the shifter LABs) without
-// improving WNS, since the SIGMA datapath through the same barrel bounds
-// timing at the same depth.
+// cases resolved separately
 wire         shift_lo_sign = (op_size == 2'd0) ? shift_lo[7] :
                              (op_size == 2'd1) ? shift_lo[15] : shift_lo[31];
 wire         shift_zf = shift_overflow ? (is_sar ? ~shift_lo_sign : 1'b1) :
@@ -3976,10 +3830,6 @@ function automatic [31:0] fwd_onehot_gpr(input [7:0] onehot);
         fwd_onehot_gpr = cur;
 endfunction
 
-// EA calculation using pre-decoded one-hot control signals
-// Address math given already-read base/index register values.  Shared by
-// calc_ea (GPRs read directly) and the early forwarded EA (GPRs read with
-// delay-slot bypass).
 function automatic [31:0] calc_ea_core(
     input [31:0] base_in, input [31:0] index_in,
     input [1:0] scale, input [31:0] disp, input is_16bit, input scale_to_base);
@@ -4014,14 +3864,6 @@ function automatic [31:0] calc_ea_core(
     calc_ea_core = base_val + scaled_val + disp;
     if (is_16bit)
         calc_ea_core = {16'h0, calc_ea_core[15:0]};
-endfunction
-
-function automatic [31:0] calc_ea(
-    input [7:0] base_sel, input [7:0] index_sel,
-    input [1:0] scale, input [31:0] disp,
-    input has_base, input has_index, input has_disp, input is_16bit, input scale_to_base);
-    calc_ea = calc_ea_core(onehot_gpr_mux(base_sel), onehot_gpr_mux(index_sel),
-                           scale, disp, is_16bit, scale_to_base);
 endfunction
 
 endmodule
