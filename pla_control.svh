@@ -169,6 +169,9 @@ function automatic logic [11:0] pla_control_opcode_lookup(
     /* verilator lint_on CASEOVERLAP */
 endfunction
 
+// CURRENTLY UNUSED by the RTL.  This is the full ROM1-shaped control PLA as
+// found in the original 386 silicon, kept for reference; the active frontend
+// uses the reduced pla_control_opcode_lookup above.
 function automatic logic [11:0] pla_control_lookup(
     input [6:0] state,
     input [7:0] instruction,

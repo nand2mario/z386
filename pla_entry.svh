@@ -557,3 +557,143 @@ function automatic logic [15:0] pla_entry_lookup(
         default: pla_entry_lookup = 16'b0;
     endcase
 endfunction
+
+// ---- begin generated: pla_group_lookup (scripts/gen_pla_group.py) ----
+// Opcode -> second-level entry PLA row, derived from
+// pla_entry_lookup above and pla_control.svh.  DO NOT EDIT BY HAND.
+//
+// Returns entry_first[5:0] for opcodes whose first-level entry lookup
+// yields a group row (entry[11:6]==0 with modrm).  Lets the decoder run
+// the second-level lookup in parallel with the first instead of chained
+// behind it.  Result is don't-care (0) for non-group opcodes; the
+// entry_group select still comes from the real first-level result.
+//
+// Input format: {data32, opcode[7:0], pe_enable, has_0f}
+function automatic logic [5:0] pla_group_lookup(
+    input [10:0] addr_in
+);
+    casez (addr_in)
+        11'b?_00000010_?_0: pla_group_lookup = 6'b000001;
+        11'b?_00000011_?_0: pla_group_lookup = 6'b000001;
+        11'b?_00001010_?_0: pla_group_lookup = 6'b000001;
+        11'b?_00001011_?_0: pla_group_lookup = 6'b000001;
+        11'b?_00010010_?_0: pla_group_lookup = 6'b000001;
+        11'b?_00010011_?_0: pla_group_lookup = 6'b000001;
+        11'b?_00011010_?_0: pla_group_lookup = 6'b000001;
+        11'b?_00011011_?_0: pla_group_lookup = 6'b000001;
+        11'b?_00100010_?_0: pla_group_lookup = 6'b000001;
+        11'b?_00100011_?_0: pla_group_lookup = 6'b000001;
+        11'b?_00101010_?_0: pla_group_lookup = 6'b000001;
+        11'b?_00101011_?_0: pla_group_lookup = 6'b000001;
+        11'b?_00110010_?_0: pla_group_lookup = 6'b000001;
+        11'b?_00110011_?_0: pla_group_lookup = 6'b000001;
+        11'b?_00111000_?_0: pla_group_lookup = 6'b000100;
+        11'b?_00111001_?_0: pla_group_lookup = 6'b000100;
+        11'b?_00111010_?_0: pla_group_lookup = 6'b000101;
+        11'b?_00111011_?_0: pla_group_lookup = 6'b000101;
+        11'b?_01100010_?_0: pla_group_lookup = 6'b111011;
+        11'b?_01100011_0_0: pla_group_lookup = 6'b011111;
+        11'b?_01100011_1_0: pla_group_lookup = 6'b010011;
+        11'b?_01101001_?_0: pla_group_lookup = 6'b001001;
+        11'b?_01101011_?_0: pla_group_lookup = 6'b001001;
+        11'b?_10000000_?_0: pla_group_lookup = 6'b000110;
+        11'b?_10000001_?_0: pla_group_lookup = 6'b000110;
+        11'b?_10000010_?_0: pla_group_lookup = 6'b000110;
+        11'b?_10000011_?_0: pla_group_lookup = 6'b000110;
+        11'b?_10000100_?_0: pla_group_lookup = 6'b000111;
+        11'b?_10000101_?_0: pla_group_lookup = 6'b000111;
+        11'b?_10000110_?_0: pla_group_lookup = 6'b001000;
+        11'b?_10000111_?_0: pla_group_lookup = 6'b001000;
+        11'b?_10001000_?_0: pla_group_lookup = 6'b001010;
+        11'b?_10001001_?_0: pla_group_lookup = 6'b001010;
+        11'b?_10001010_?_0: pla_group_lookup = 6'b001011;
+        11'b?_10001011_?_0: pla_group_lookup = 6'b001011;
+        11'b?_10001100_?_0: pla_group_lookup = 6'b001101;
+        11'b?_10001101_?_0: pla_group_lookup = 6'b111000;
+        11'b?_10001110_0_0: pla_group_lookup = 6'b001100;
+        11'b?_10001110_1_0: pla_group_lookup = 6'b001110;
+        11'b?_10001111_?_0: pla_group_lookup = 6'b010000;
+        11'b?_11000000_?_0: pla_group_lookup = 6'b011000;
+        11'b?_11000001_?_0: pla_group_lookup = 6'b011000;
+        11'b?_11000100_?_0: pla_group_lookup = 6'b111001;
+        11'b?_11000101_?_0: pla_group_lookup = 6'b111010;
+        11'b?_11000110_?_0: pla_group_lookup = 6'b010001;
+        11'b?_11000111_?_0: pla_group_lookup = 6'b010001;
+        11'b?_11010000_?_0: pla_group_lookup = 6'b011001;
+        11'b?_11010001_?_0: pla_group_lookup = 6'b011001;
+        11'b?_11010010_?_0: pla_group_lookup = 6'b011010;
+        11'b?_11010011_?_0: pla_group_lookup = 6'b011010;
+        11'b?_11011000_?_0: pla_group_lookup = 6'b101000;
+        11'b?_11011001_?_0: pla_group_lookup = 6'b101011;
+        11'b?_11011010_?_0: pla_group_lookup = 6'b101000;
+        11'b?_11011011_?_0: pla_group_lookup = 6'b110111;
+        11'b?_11011100_?_0: pla_group_lookup = 6'b110110;
+        11'b?_11011101_?_0: pla_group_lookup = 6'b101010;
+        11'b?_11011110_?_0: pla_group_lookup = 6'b101001;
+        11'b?_11011111_?_0: pla_group_lookup = 6'b101100;
+        11'b?_11110110_?_0: pla_group_lookup = 6'b010110;
+        11'b?_11110111_?_0: pla_group_lookup = 6'b010110;
+        11'b?_11111110_?_0: pla_group_lookup = 6'b010100;
+        11'b?_11111111_?_0: pla_group_lookup = 6'b010101;
+        11'b?_00000000_0_1: pla_group_lookup = 6'b011111;
+        11'b?_00000000_1_1: pla_group_lookup = 6'b100000;
+        11'b?_00000001_?_1: pla_group_lookup = 6'b100001;
+        11'b?_00000010_0_1: pla_group_lookup = 6'b011111;
+        11'b?_00000010_1_1: pla_group_lookup = 6'b100010;
+        11'b?_00000011_0_1: pla_group_lookup = 6'b011111;
+        11'b?_00000011_1_1: pla_group_lookup = 6'b100011;
+        11'b?_00010000_?_1: pla_group_lookup = 6'b001010;
+        11'b?_00010001_?_1: pla_group_lookup = 6'b001010;
+        11'b?_00010010_?_1: pla_group_lookup = 6'b001011;
+        11'b?_00010011_?_1: pla_group_lookup = 6'b001011;
+        11'b?_00100000_?_1: pla_group_lookup = 6'b110011;
+        11'b?_00100001_?_1: pla_group_lookup = 6'b110101;
+        11'b?_00100010_?_1: pla_group_lookup = 6'b110010;
+        11'b?_00100011_?_1: pla_group_lookup = 6'b110100;
+        11'b?_00100100_?_1: pla_group_lookup = 6'b010111;
+        11'b?_00100110_?_1: pla_group_lookup = 6'b010010;
+        11'b?_10010000_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10010001_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10010010_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10010011_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10010100_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10010101_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10010110_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10010111_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10011000_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10011001_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10011010_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10011011_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10011100_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10011101_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10011110_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10011111_?_1: pla_group_lookup = 6'b101101;
+        11'b?_10100011_?_1: pla_group_lookup = 6'b011011;
+        11'b?_10100100_?_1: pla_group_lookup = 6'b100110;
+        11'b?_10100101_?_1: pla_group_lookup = 6'b100111;
+        11'b?_10100110_?_1: pla_group_lookup = 6'b100101;
+        11'b?_10100111_?_1: pla_group_lookup = 6'b100100;
+        11'b?_10101011_?_1: pla_group_lookup = 6'b011101;
+        11'b?_10101100_?_1: pla_group_lookup = 6'b100110;
+        11'b?_10101101_?_1: pla_group_lookup = 6'b100111;
+        11'b?_10101111_?_1: pla_group_lookup = 6'b000011;
+        11'b?_10110010_?_1: pla_group_lookup = 6'b111100;
+        11'b?_10110011_?_1: pla_group_lookup = 6'b011101;
+        11'b?_10110100_?_1: pla_group_lookup = 6'b011110;
+        11'b?_10110101_?_1: pla_group_lookup = 6'b011110;
+        11'b0_10110110_?_1: pla_group_lookup = 6'b101110;
+        11'b1_10110110_?_1: pla_group_lookup = 6'b101111;
+        11'b0_10110111_?_1: pla_group_lookup = 6'b101110;
+        11'b1_10110111_?_1: pla_group_lookup = 6'b101111;
+        11'b?_10111010_?_1: pla_group_lookup = 6'b011100;
+        11'b?_10111011_?_1: pla_group_lookup = 6'b011101;
+        11'b?_10111100_?_1: pla_group_lookup = 6'b110000;
+        11'b?_10111101_?_1: pla_group_lookup = 6'b110001;
+        11'b0_10111110_?_1: pla_group_lookup = 6'b101110;
+        11'b1_10111110_?_1: pla_group_lookup = 6'b101111;
+        11'b0_10111111_?_1: pla_group_lookup = 6'b101110;
+        11'b1_10111111_?_1: pla_group_lookup = 6'b101111;
+        default: pla_group_lookup = 6'b000000;
+    endcase
+endfunction
+// ---- end generated: pla_group_lookup ----

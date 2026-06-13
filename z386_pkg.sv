@@ -349,6 +349,7 @@ localparam ALUJMP_SINTHW = 7'h32;  // SINTHW: Set interrupt_hw flag (HW IRQ/NMI/
 localparam ALUJMP_SMISC1 = 7'h33;  // Set MISC1 flag (INT handler sets this; JMISC1 tests it)
 localparam ALUJMP_SMISC2 = 7'h35;  // Set MISC2 flag (cross-privilege handler)
 localparam ALUJMP_SERRCF = 7'h36;  // Set error code flag (ERROR_CODE_FLAG = true)
+localparam ALUJMP_J16BIT = 7'h40;   // Jump if 286-format TSS in TR (16-bit stack switch / task save-load / IO map)
 localparam ALUJMP_JNBUSY = 7'h42;   // Jump if BUSY# inactive (always taken: no FPU)
 localparam ALUJMP_JTSSAF  = 7'h50;   // JTSSAF: Jump if TSS access flag is set (never taken: no task switching)
 localparam ALUJMP_JG = 7'h51;        // JG: Jump if Greater (ZF=0 AND SF=OF)

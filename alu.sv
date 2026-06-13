@@ -283,6 +283,19 @@ wire is_adjust = (op == ALU_DAA) || (op == ALU_DAS) || (op == ALU_AAA) || (op ==
 wire [31:0] R = slice_result;
 wire flag_byte_mode = is_byte || is_adjust;
 
+// Zero-flag anticipation for adder-based ops, independent of the carry chain:
+//   x + y + cin == 0 (mod 2^w)  ⟺  (x ^ y)[w-1:0] == ({(x|y), cin} << ...)[w-1:0]
+// i.e. the XOR of the two sides is all-zero over the operand width.  This
+// removes the carry-chain + 32-bit reduce from the ZF path (the dominant
+// EFLAGS setup violations).  Logic/pass ops keep the shallow |R reduce.
+wire [31:0] za_neq = (arg1_bus ^ arg2_bus) ^
+                     {arg1_bus[30:0] | arg2_bus[30:0], carry_in0};
+wire zfa_byte  = ~|za_neq[7:0];
+wire zfa_word  = ~|za_neq[15:0];
+wire zfa_dword = ~|za_neq;
+wire use_adder_zf = is_add_family || is_sub_family ||
+                    (op == ALU_DAA) || (op == ALU_DAS);
+
 // Per-size flag signals — fixed indices instead of dynamic R[msb_idx] (avoids 32:1 mux)
 wire r_msb = flag_byte_mode ? R[7] : (is_word ? R[15] : R[31]);
 wire cout_3 = slice_carry[3];
@@ -313,8 +326,10 @@ always @* begin
         // SF, ZF, PF - standard flag updates (not for AAA/AAS)
         if (!(op == ALU_AAA || op == ALU_AAS)) begin
             f2[7] = r_msb;
-            // Use hierarchical zero flag computation
-            if (is_dword)
+            // ZF: carry-free anticipated form for adder ops, |R for the rest
+            if (use_adder_zf)
+                f2[6] = is_dword ? zfa_dword : is_word ? zfa_word : zfa_byte;
+            else if (is_dword)
                 f2[6] = |R == 0;
             else if (is_word)
                 f2[6] = |R[15:0] == 0;

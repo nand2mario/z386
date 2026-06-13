@@ -18,6 +18,11 @@ module l1_cache #(
 
     // CPU side — physical address request/response.
     input  [31:0] cpu_addr,
+    // Array index bits cpu_addr[11:2].  These are page-offset bits (identical
+    // between linear and physical address), so the caller can source them from
+    // registers without waiting for the TLB result.  Must equal cpu_addr[11:2]
+    // whenever cpu_valid is high.  Width = SET_BITS + 2 word-offset bits.
+    input  [SET_BITS+1:0] cpu_idx,
     input  [31:0] cpu_din,
     output [31:0] cpu_dout,
     input   [3:0] cpu_be,
@@ -66,8 +71,16 @@ localparam [SET_BITS-1:0] LAST_SET = SET_BITS'(NUM_SETS - 1);
 
 // Address decomposition.  The cache covers the low 32MB physical window.
 wire [TAG_BITS-1:0] cpu_tag = cpu_addr[TAG_MSB:TAG_LSB];
-wire [SET_BITS-1:0] cpu_set = cpu_addr[SET_MSB:SET_LSB];
-wire [WORD_OFFSET_BITS-1:0] cpu_word = cpu_addr[LINE_OFFSET_BITS-1:BYTE_OFFSET_BITS];
+// Set/word array index comes from cpu_idx (register-sourced by the caller),
+// not from the TLB-muxed cpu_addr.  Both carry the same page-offset bits.
+wire [SET_BITS-1:0] cpu_set = cpu_idx[SET_BITS+1:WORD_OFFSET_BITS];
+wire [WORD_OFFSET_BITS-1:0] cpu_word = cpu_idx[WORD_OFFSET_BITS-1:0];
+// synthesis translate_off
+always @(posedge clk) begin
+    if (!reset && cpu_valid && cpu_idx != cpu_addr[SET_MSB:BYTE_OFFSET_BITS])
+        $display("L1 ERROR: cpu_idx %x != cpu_addr[11:2] %x", cpu_idx, cpu_addr[SET_MSB:BYTE_OFFSET_BITS]);
+end
+// synthesis translate_on
 wire [BRAM_ADDR_BITS-1:0] cpu_bram_addr = {cpu_set, cpu_word};
 wire [SET_BITS-1:0] snoop_set = snoop_addr[SET_MSB:SET_LSB];
 wire cpu_write_enabled = cpu_write;
@@ -198,6 +211,12 @@ begin
 end
 endfunction
 
+function automatic [STOREQ_IDX_BITS-1:0] storeq_prev_idx(input [STOREQ_IDX_BITS-1:0] idx);
+begin
+    storeq_prev_idx = (idx == {STOREQ_IDX_BITS{1'b0}}) ? STOREQ_LAST_IDX : (idx - 1'b1);
+end
+endfunction
+
 function automatic [1:0] way_encode(input [3:0] hit_vec);
 begin
     way_encode = hit_vec[0] ? 2'd0 :
@@ -256,7 +275,6 @@ wire [BRAM_ADDR_BITS-1:0] req_bram_addr = {req_set_r, req_word_r};
 wire can_accept_cpu = (state == S_IDLE) && !reset && (!cpu_write_enabled || cpu_protect_write || storeq_can_accept);
 wire ready_when_idle = !reset && storeq_can_accept;
 wire accept_cpu = cpu_valid && ready_r && can_accept_cpu;
-wire accepted_store_enqueue = accept_cpu && cpu_write_enabled && !cpu_protect_write;
 wire [29:0] req_addr_dw = req_addr_r[31:2];
 wire [29:0] fill_addr_dw = {req_addr_r[31:4], fill_count};
 logic [31:0] lookup_forward_data;
@@ -267,6 +285,36 @@ wire lookup_read_hit_now = (state == S_LOOKUP) && req_valid_r &&
 
 assign cpu_dout = lookup_read_hit_now ? lookup_forward_data : dout_r;
 assign cpu_resp_valid = lookup_read_hit_now || resp_valid_r;
+
+// Store-queue drain issue, decoupled from the FSM: drains may launch while the
+// FSM is accepting or patching, so back-to-back writes are not serialized
+// behind accept/S_LOOKUP cycles.  Blocked in states that own the memory side
+// (fill/bypass) and in the S_LOOKUP cycle of a read miss or uncacheable read,
+// so demand-read memory launches are never delayed by a newly issued drain.
+wire drain_block_state = (state == S_RESET_INIT) || (state == S_FILL) ||
+                         (state == S_BYPASS_WAIT) ||
+                         ((state == S_LOOKUP) && !req_protect_write_r && !req_write_r &&
+                          (req_uncacheable_r || !lookup_hit));
+wire drain_issue_now = !storeq_empty && !storeq_draining && !mem_valid_r &&
+                       !mem_busy && !drain_block_state;
+
+// Coalesce a store (enqueued during its S_LOOKUP cycle, from registered
+// request state) into the most recent queue entry when it targets the same
+// DWORD.  Excluded: uncacheable writes (MMIO transaction boundaries must be
+// preserved) and entries that are draining (their data is already on the
+// memory command registers this cycle).
+wire [STOREQ_IDX_BITS-1:0] storeq_prev = storeq_prev_idx(storeq_head);
+wire storeq_merge_lookup = !storeq_empty && storeq_valid[storeq_prev] &&
+                           (storeq_addr[storeq_prev] == req_addr_r[31:2]) &&
+                           !req_uncacheable_r &&
+                           !(storeq_prev == storeq_tail && (storeq_draining || drain_issue_now));
+// Store-queue count after this cycle's enqueue, including a simultaneously
+// completing drain.  Drives the post-write ready_r so a full queue is seen
+// immediately despite the one-cycle-late enqueue.
+wire storeq_dequeuing = storeq_draining && mem_ready;
+wire [STOREQ_CNT_BITS-1:0] storeq_count_wr_next =
+     storeq_merge_lookup ? (storeq_dequeuing ? storeq_count - 1'b1 : storeq_count)
+                         : (storeq_dequeuing ? storeq_count : storeq_count + 1'b1);
 
 always_comb begin
     lookup_forward_data = lookup_way_data;
@@ -350,8 +398,14 @@ begin
 end
 endtask
 
+// Preread runs on every ready idle cycle, with no cpu_valid/TLB gating: when
+// no request is accepted the preread results are garbage that S_LOOKUP never
+// sees (it is only entered on accept_cpu).  This keeps the TLB-hit cone off
+// the wide rd_*_r register enables.
+wire idle_preread = (state == S_IDLE) && ready_r;
+
 always_ff @(posedge clk) begin
-    if (accept_cpu) begin
+    if (idle_preread) begin
         rd_tag0_r <= tag_way0[cpu_set][TAG_BITS-1:0];
         rd_tag1_r <= tag_way1[cpu_set][TAG_BITS-1:0];
         rd_tag2_r <= tag_way2[cpu_set][TAG_BITS-1:0];
@@ -418,6 +472,17 @@ always_ff @(posedge clk) begin
             valid_way3[snoop_set_r] <= 1'b0;
         end
 
+        // FSM-independent store-queue drain launch (see drain_issue_now).
+        if (drain_issue_now) begin
+            mem_valid_r <= 1'b1;
+            mem_write_r <= 1'b1;
+            mem_addr_r <= {storeq_addr[storeq_tail], 2'b00};
+            mem_din_r <= storeq_data[storeq_tail];
+            mem_be_r <= storeq_be[storeq_tail];
+            mem_burstcount_r <= 8'd1;
+            storeq_draining <= 1'b1;
+        end
+
         case (state)
             S_RESET_INIT: begin
                 valid_way0[init_set] <= 1'b0;
@@ -434,9 +499,11 @@ always_ff @(posedge clk) begin
             end
 
             S_IDLE: begin
-                if (accept_cpu) begin
-                    ready_r <= 1'b0;
-                    req_valid_r <= 1'b1;
+                // Wide request captures run on every ready cycle, with no
+                // cpu_valid/TLB gating: garbage is captured when nothing is
+                // accepted, but S_LOOKUP (the only consumer) is entered on
+                // accept_cpu alone.  Keeps the TLB cone off these enables.
+                if (ready_r) begin
                     req_addr_r <= cpu_addr;
                     req_din_r <= cpu_din;
                     req_be_r <= cpu_be;
@@ -446,24 +513,11 @@ always_ff @(posedge clk) begin
                     req_tag_r <= cpu_tag;
                     req_set_r <= cpu_set;
                     req_word_r <= cpu_word;
-                    if (accepted_store_enqueue) begin
-                        storeq_addr[storeq_head] <= cpu_addr[31:2];
-                        storeq_data[storeq_head] <= cpu_din;
-                        storeq_be[storeq_head] <= cpu_be;
-                        storeq_valid[storeq_head] <= 1'b1;
-                        storeq_head <= storeq_next_idx(storeq_head);
-                        storeq_count <= (storeq_draining && mem_ready) ?
-                                        storeq_count : storeq_count + 1'b1;
-                    end
+                end
+                if (accept_cpu) begin
+                    ready_r <= 1'b0;
+                    req_valid_r <= 1'b1;
                     state <= S_LOOKUP;
-                end else if (!storeq_empty && !storeq_draining && !mem_valid_r && !mem_busy) begin
-                    mem_valid_r <= 1'b1;
-                    mem_write_r <= 1'b1;
-                    mem_addr_r <= {storeq_addr[storeq_tail], 2'b00};
-                    mem_din_r <= storeq_data[storeq_tail];
-                    mem_be_r <= storeq_be[storeq_tail];
-                    mem_burstcount_r <= 8'd1;
-                    storeq_draining <= 1'b1;
                 end
             end
 
@@ -474,13 +528,28 @@ always_ff @(posedge clk) begin
                     state <= S_IDLE;
                     ready_r <= ready_when_idle;
                 end else if (req_write_r) begin
+                    // Store-queue enqueue, moved here from the accept cycle so
+                    // its enables come from registered request state instead of
+                    // the TLB-gated accept.  All inputs are req_*_r registers.
+                    if (storeq_merge_lookup) begin
+                        // Same-DWORD coalescing: fold into the newest entry.
+                        storeq_data[storeq_prev] <= merge32(storeq_data[storeq_prev], req_din_r, req_be_r);
+                        storeq_be[storeq_prev] <= storeq_be[storeq_prev] | req_be_r;
+                    end else begin
+                        storeq_addr[storeq_head] <= req_addr_r[31:2];
+                        storeq_data[storeq_head] <= req_din_r;
+                        storeq_be[storeq_head] <= req_be_r;
+                        storeq_valid[storeq_head] <= 1'b1;
+                        storeq_head <= storeq_next_idx(storeq_head);
+                    end
+                    storeq_count <= storeq_count_wr_next;
                     if (lookup_hit && !req_uncacheable_r) begin
                         patched = merge32(lookup_way_data, req_din_r, req_be_r);
                         write_cache_word(lookup_way, req_bram_addr, patched);
                         plru_set[req_set_r] <= plru_update(rd_plru_r, lookup_way);
                     end
                     state <= S_IDLE;
-                    ready_r <= ready_when_idle;
+                    ready_r <= (storeq_count_wr_next != STOREQ_DEPTH_VALUE);
                 end else if (req_uncacheable_r) begin
                     if (!mem_valid_r && !mem_busy) begin
                         mem_valid_r <= 1'b1;

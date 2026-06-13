@@ -330,6 +330,7 @@ task automatic build_struct_work(
     logic [15:0] entry_first;
     logic [15:0] entry_final;
     logic        entry_group;
+    logic [5:0]  group_code;
     logic        has_modrm;
     logic        has_sib;
     logic [2:0]  disp_size;
@@ -365,6 +366,9 @@ task automatic build_struct_work(
         entry_first = pla_entry_lookup({data32, opcode, prefix_rep, pe_enable,
                                         1'b1, prefix_0f});
         entry_group = ~(|entry_first[11:6]) && has_modrm;
+        // Parallel copy of entry_first[5:0] for group rows, so the
+        // second-level lookup below does not chain behind the first.
+        group_code = pla_group_lookup({data32, opcode, pe_enable, prefix_0f});
 
         if (has_modrm) begin
             has_sib = addr32 && (modrm[7:6] != 2'b11) && (modrm[2:0] == 3'b100);
@@ -385,8 +389,8 @@ task automatic build_struct_work(
                 imm_total_size = 3'd0;
 
             entry_final = entry_group ?
-                pla_entry_lookup({data32, entry_first[5:4], modrm[5:3],
-                                  entry_first[3:0], (modrm[7:6] != 2'b11),
+                pla_entry_lookup({data32, group_code[5:4], modrm[5:3],
+                                  group_code[3:0], (modrm[7:6] != 2'b11),
                                   1'b0, prefix_0f}) :
                 entry_first;
 

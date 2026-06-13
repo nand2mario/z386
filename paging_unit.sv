@@ -34,6 +34,10 @@ module paging_unit
     output logic        mem_accepted,      // Ready: demand request may be handed off this cycle
     output reg          mem_servicing,     // High while accepted request is in flight
     output              mem_complete_now,  // Completion shortcut (disabled: use registered mem_servicing clear)
+    output reg          mem_dly_grace,     // Pulse: dcache lookup cycle of an optimistic demand read;
+                                           // a pure-DLY uop may execute this cycle (data lands end of cycle)
+    output reg          mem_opt_wait,      // Optimistic read past its grace cycle and still in flight:
+                                           // sequencer must stall any uop until completion
     // Parameters needs to be valid on the cycle mem_req is high only and will be registered
     input        [31:0] linear_addr,       // Linear address for this request
     input        [1:0]  mem_op_size,       // 0=byte, 1=word, 2=dword
@@ -63,6 +67,8 @@ module paging_unit
     output logic        dcache_req_valid,     // Demand/page-walk/IO request valid
     (* syn_replicate = 1 *)
     output logic [31:0] dcache_req_phys_addr, // Physical address (full 32-bit)
+    output logic [9:0]  dcache_req_idx,       // addr[11:2] for cache array indexing
+                                              // (page-offset bits, register-sourced, no TLB)
     output logic        dcache_req_write,     // 1=write
     output logic [3:0]  dcache_req_be,        // Byte enables (pre-computed)
     output logic [31:0] dcache_req_wdata,     // Write data (pre-positioned on bus)
@@ -297,6 +303,7 @@ assign mem_complete_now = 1'b0;
 assign pf_ack_bypass = (state == PG_PF_BIU_WAIT) && icache_req_complete;
 
 wire idle_mem_crossing = access_crosses_dword(mem_op_size, linear_addr[1:0]);
+wire idle_io_crossing = mem_is_io && idle_mem_crossing;
 wire cache_lookup_granted = 1'b1;
 wire idle_mem_ready = s_idle && !mem_servicing;
 wire idle_mem_accept = idle_mem_req;
@@ -323,18 +330,29 @@ wire [31:0] fast_pf_phys = pg_enable ? {tlb_physical_addr[31:12], pf_linear_addr
 
 assign mem_accepted = mem_accepted_r || idle_mem_ready;
 assign dcache_req_valid = dcache_req_valid_r || req_mem_dcache_candidate;
-assign dcache_req_phys_addr = req_mem_dcache_candidate ? req_mem_phys : dcache_req_phys_addr_r;
-assign dcache_req_write = req_mem_dcache_candidate ? req_is_write : dcache_req_write_r;
-assign dcache_req_be = req_mem_dcache_candidate ?
+// Demand request data muxes select on the registered state only, not on the
+// full candidate (which contains TLB hit/permission/dirty).  When the
+// PG_MEM_TLB request cannot be accepted, dcache_req_valid is low and the
+// presented data is unused garbage.  Only dcache_req_valid (1 bit, gates the
+// accept) and the translated bits of dcache_req_phys_addr genuinely depend on
+// the TLB result.
+wire req_mem_present = (state == PG_MEM_TLB);
+assign dcache_req_phys_addr = req_mem_present ? req_mem_phys : dcache_req_phys_addr_r;
+// Cache array index: page-offset bits [11:2] are identical between linear and
+// physical addresses, so the dcache set/word index never depends on the TLB
+// result.
+assign dcache_req_idx = req_mem_present ? req_linear[11:2] : dcache_req_phys_addr_r[11:2];
+assign dcache_req_write = req_mem_present ? req_is_write : dcache_req_write_r;
+assign dcache_req_be = req_mem_present ?
                        (req_crossing ? calc_be_first(req_op_size, req_offset) :
                                        calc_be(req_op_size, req_offset)) :
                        dcache_req_be_r;
-assign dcache_req_wdata = req_mem_dcache_candidate ?
+assign dcache_req_wdata = req_mem_present ?
                           (req_crossing ? split_write_first(req_wdata, req_offset, req_op_size) :
                                           shift_write_data(req_wdata, req_op_size, req_offset)) :
                           dcache_req_wdata_r;
-assign dcache_req_is_io = req_mem_dcache_candidate ? 1'b0 : dcache_req_is_io_r;
-assign dcache_req_is_inta = req_mem_dcache_candidate ? 1'b0 : dcache_req_is_inta_r;
+assign dcache_req_is_io = req_mem_present ? 1'b0 : dcache_req_is_io_r;
+assign dcache_req_is_inta = req_mem_present ? 1'b0 : dcache_req_is_inta_r;
 assign icache_req_valid = icache_req_valid_r || fast_pf_candidate;
 // Address is only consumed when icache_req_valid is high.  Use the registered
 // slow-path address only when that request is live; otherwise present the fast
@@ -492,12 +510,22 @@ always_ff @(posedge clk or negedge reset_n) begin
         opr_phys_low_r <= 2'b0;
         opr_is_walk_r <= 1'b0;
         fast_path_pending <= 1'b0;
+        mem_dly_grace <= 1'b0;
+        mem_opt_wait <= 1'b0;
         dcache_req_phys_addr_r <= 32'h0;
         dcache_req_write_r <= 1'b0;
         dcache_req_be_r <= 4'h0;
         dcache_req_wdata_r <= 32'h0;
     end else begin
         // Default: clear one-shot signals
+        mem_dly_grace <= 1'b0;
+        // Optimistic read tracking: completion (this includes a hit during the
+        // grace cycle itself) clears the wait; an expired grace without
+        // completion turns into a hard wait until the miss/fill finishes.
+        if (dcache_req_complete && fast_path_pending)
+            mem_opt_wait <= 1'b0;
+        else if (mem_dly_grace)
+            mem_opt_wait <= 1'b1;
         if (dcache_req_accepted) begin
             dcache_req_valid_r <= 1'b0;
             dcache_req_is_io_r <= 1'b0;
@@ -545,20 +573,20 @@ always_ff @(posedge clk or negedge reset_n) begin
 
         case (state)
             PG_IDLE: begin
-                if (idle_mem_req) begin
+                // Wide request-data captures run on the pre-fault-gated request
+                // (idle_mem_lookup_req).  A segment-faulting uop captures garbage
+                // here, but the state registers in the idle_mem_req block below
+                // stay fault-gated, so the request never leaves PG_IDLE and the
+                // garbage is never consumed.  This keeps the EA -> limit-check
+                // fault cone off the wide capture enables.
+                if (idle_mem_lookup_req) begin
                     if (mem_is_io || mem_is_inta) begin
-                        automatic logic io_crossing = mem_is_io && access_crosses_dword(mem_op_size, linear_addr[1:0]);
-                        mem_accepted_r <= 1'b1;
-                        mem_servicing <= 1'b1;
-                        if (!io_crossing) begin
-                            // IO/INTA fast path: no translation, no crossing, no state change
-                            dcache_req_valid_r <= 1'b1;
+                        if (!idle_io_crossing) begin
+                            // IO/INTA fast path data (cannot segment-fault)
                             dcache_req_phys_addr_r <= linear_addr;
                             dcache_req_write_r <= mem_write;
                             dcache_req_be_r <= mem_be;
                             dcache_req_wdata_r <= shift_write_data(mem_wdata, mem_op_size, linear_addr[1:0]);
-                            dcache_req_is_io_r <= mem_is_io;
-                            dcache_req_is_inta_r <= mem_is_inta;
                             // First INTA cycle (addr=4) is dummy — suppress OPR_R update.
                             // Second INTA (addr=0) delivers the vector to OPR_R.
                             latch_biu_meta(2'd0, op_size_bytes_m1(mem_op_size), mem_write,
@@ -566,23 +594,18 @@ always_ff @(posedge clk or negedge reset_n) begin
                                            mem_is_inta && (linear_addr[2:0] == 3'd4),
                                            1'b0);
                             rd_ind_active <= 1'b0;
-                            fast_path_pending <= 1'b1;
                         end else begin
                             // IO crossing: split into two DWORD-aligned bus cycles
                             latch_mem_request(linear_addr, 1'b1);
                             req_is_io <= 1'b1;
                             rd_ind_active <= 1'b0;
-                            // Emit first half
-                            dcache_req_valid_r <= 1'b1;
+                            // First half data
                             dcache_req_phys_addr_r <= linear_addr;
                             dcache_req_write_r <= mem_write;
                             dcache_req_be_r <= calc_be_first(mem_op_size, linear_addr[1:0]);
                             dcache_req_wdata_r <= split_write_first(mem_wdata, linear_addr[1:0], mem_op_size);
-                            dcache_req_is_io_r <= 1'b1;
-                            dcache_req_is_inta_r <= 1'b0;
                             latch_biu_meta(2'd0, first_half_bytes(linear_addr[1:0]) - 2'd1,
                                            mem_write, linear_addr[1:0], 1'b0, 1'b0);
-                            state <= PG_CROSS_WAIT1;
                         end
                     end else begin
                         // Memory request: RD only captures the linear request.
@@ -590,20 +613,23 @@ always_ff @(posedge clk or negedge reset_n) begin
                         // dcache launch, keeping EA/segment and TLB in separate
                         // cycles.
                         // synthesis translate_off
-                        if (TRACE_PAGING_EN)
+                        if (TRACE_PAGING_EN && idle_mem_req)
                             $display("PG_UNIT CAPTURE: linear=%08x size=%0d wr=%0d crossing=%0d",
                                      linear_addr, mem_op_size, mem_write, idle_mem_crossing);
                         // synthesis translate_on
 
-                        mem_accepted_r <= 1'b1;
-                        mem_servicing <= 1'b1;
                         latch_mem_request(linear_addr, idle_mem_crossing);
                         rd_ind_active <= mem_rd_ind;
-                        state <= PG_MEM_TLB;
                     end
+                end
 
-                end else if (idle_pf_req) begin
-                    // Prefetch request (lower priority than mem/IO)
+                // Prefetch start, lower priority than any *presented* memory
+                // uop (idle_mem_lookup_req, the pre-fault-gated request).
+                // Guarding on the fault-gated idle_mem_req would put the
+                // EA -> limit-check fault cone on every prefetch-side enable
+                // (req_is_write/req_cpl/walk_request/state).  On a faulting-uop
+                // cycle the prefetch start is simply retried next cycle.
+                if (idle_pf_req && !idle_mem_lookup_req) begin
                     if (fast_pf_candidate) begin
                         if (icache_req_accepted)
                             state <= PG_PF_BIU_WAIT;
@@ -617,6 +643,26 @@ always_ff @(posedge clk or negedge reset_n) begin
                         req_cpl <= cpl;
                         walk_request <= 1'b1;
                         state <= PG_PF_WALKING;
+                    end
+                end
+
+                // Fault-gated control/state updates for the captured request.
+                if (idle_mem_req) begin
+                    mem_accepted_r <= 1'b1;
+                    mem_servicing <= 1'b1;
+                    if (mem_is_io || mem_is_inta) begin
+                        dcache_req_valid_r <= 1'b1;
+                        if (!idle_io_crossing) begin
+                            dcache_req_is_io_r <= mem_is_io;
+                            dcache_req_is_inta_r <= mem_is_inta;
+                            fast_path_pending <= 1'b1;
+                        end else begin
+                            dcache_req_is_io_r <= 1'b1;
+                            dcache_req_is_inta_r <= 1'b0;
+                            state <= PG_CROSS_WAIT1;
+                        end
+                    end else begin
+                        state <= PG_MEM_TLB;
                     end
                 end
             end
@@ -646,6 +692,11 @@ always_ff @(posedge clk or negedge reset_n) begin
                             end else begin
                                 fast_path_pending <= 1'b1;
                                 state <= PG_IDLE;
+                                // Optimistic read release: next cycle is the dcache
+                                // lookup cycle; on a hit OPR_R is written at its end,
+                                // so a pure-DLY uop may already execute then.  RD_IND
+                                // is excluded: a DLY uop may itself consume IND (PREF).
+                                mem_dly_grace <= !rd_ind_active;
                             end
                         end
                     end

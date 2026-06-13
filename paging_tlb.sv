@@ -172,8 +172,22 @@ end
 wire [2:0]  update_set = update_vpn[2:0];
 wire [2:0]  update_plru = plru[update_set];
 
-// PLRU victim selection for the update set
-wire [1:0] victim_way = update_plru[0] ? (update_plru[2] ? 2'd3 : 2'd2) :
+// If the VPN is already present in the set, update that way in place.
+// Blind PLRU allocation creates duplicate entries, and the hit priority
+// mux then keeps returning the stale duplicate — e.g. a dirty=0 entry
+// inserted by a code-fetch walk shadows the dirty=1 entry from a write
+// walk, forcing a page walk on every subsequent write to the page.
+wire match0 = tlb[update_set][0].valid && (tlb[update_set][0].vpn == update_vpn);
+wire match1 = tlb[update_set][1].valid && (tlb[update_set][1].vpn == update_vpn);
+wire match2 = tlb[update_set][2].valid && (tlb[update_set][2].vpn == update_vpn);
+wire match3 = tlb[update_set][3].valid && (tlb[update_set][3].vpn == update_vpn);
+
+// PLRU victim selection for the update set (existing entry wins)
+wire [1:0] victim_way = match0 ? 2'd0 :
+                        match1 ? 2'd1 :
+                        match2 ? 2'd2 :
+                        match3 ? 2'd3 :
+                        update_plru[0] ? (update_plru[2] ? 2'd3 : 2'd2) :
                                           (update_plru[1] ? 2'd1 : 2'd0);
 
 // TLB update and PLRU management

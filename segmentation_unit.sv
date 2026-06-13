@@ -15,6 +15,8 @@ module segmentation_unit
 
     // Command interface — descriptor cache manipulation
     input              seg_cmd_valid,       // 1 when command should actually execute
+    input              stssaf_pulse,        // STSSAF aluop: sideband so it coexists with a busop
+    input              ctssaf_pulse,        // CTSSAF aluop: 608 pairs CTSSAF with SDEL, 74B STSSAF with IN=+
     input      [3:0]   seg_cmd,            // SEG_CMD_* command (computed stall-independently)
     input      [3:0]   seg_target,         // Target segment (SEG_ES..SEG_GDT, SEG_NONE)
     input      [31:0]  seg_data,           // Command data (dest_value or alu_src_data)
@@ -33,6 +35,8 @@ module segmentation_unit
 
     // Segment state (set by commands, used by address translation and z386)
     output reg [3:0]   seg_sel,            // Active segment for memory ops
+    output reg         seg_is_io,          // seg_sel == SEG_IO, mirrored at every seg_sel write
+                                           // (keeps the 4-bit compare out of the stall/uc_exec cone)
     output reg         is_dtable,          // Accessing GDT/IDT
     output reg         descsw_mode,        // Cross-privilege stack switch active
     output reg         stack_push_mode,    // Stack push direction active
@@ -310,6 +314,7 @@ end
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         seg_sel <= SEG_DS;
+        seg_is_io <= 1'b0;
         is_dtable <= 1'b0;
         addr_size <= 1'b0;
         seg_base_r <= 32'h0;  // DS_base at reset
@@ -320,9 +325,25 @@ always_ff @(posedge clk) begin
         i_addr32_r <= 1'b0;
         i_stack_op_r <= 1'b0;
     end else if (seg_cmd_valid) begin
+        // STSSAF/CTSSAF arrive as aluop sidebands so the same uop's busop
+        // seg_cmd still executes (608: CTSSAF+SDEL dropped the new-stack
+        // limit, leaving a stale CS limit for the gate frame pushes).
+        // Applied before the case so a same-cycle command wins conflicts.
+        if (stssaf_pulse) begin
+            stack_push_mode <= 1'b0;
+            descsw_mode <= 1'b0;
+            tss_access_flag <= 1'b1;
+            if (seg_sel == SEG_SS) begin
+                seg_base_r <= SS_base;
+                seg_limit_r <= seg_effective_limit(seg_cache[SEG_SS]);
+            end
+        end
+        if (ctssaf_pulse)
+            tss_access_flag <= 1'b0;
         case (seg_cmd)
             SEG_CMD_INIT_SEG: begin
                 seg_sel <= seg_target;
+                seg_is_io <= (seg_target == SEG_IO);
                 is_dtable <= 1'b0;
                 seg_base_r <= seg_base_for(seg_target, 1'b0);
                 seg_limit_r <= seg_limit_for(seg_target, 1'b0);
@@ -335,6 +356,7 @@ always_ff @(posedge clk) begin
 
             SEG_CMD_UPDATE_SEG: begin
                 seg_sel <= seg_target;
+                seg_is_io <= (seg_target == SEG_IO);
                 is_dtable <= (seg_target == SEG_IDT || seg_target == SEG_GDT);
                 if (seg_data[0]) begin
                     descsw_mode <= 1'b0;
@@ -355,23 +377,10 @@ always_ff @(posedge clk) begin
                 stack_push_mode <= 1'b1;
             end
 
-            SEG_CMD_STSSAF: begin
-                stack_push_mode <= 1'b0;
-                descsw_mode <= 1'b0;
-                tss_access_flag <= 1'b1;
-                if (seg_sel == SEG_SS) begin
-                    seg_base_r <= SS_base;
-                    seg_limit_r <= seg_effective_limit(seg_cache[SEG_SS]);
-                end
-            end
-
-            SEG_CMD_CTSSAF: begin
-                tss_access_flag <= 1'b0;
-            end
-
             SEG_CMD_DESCSW: begin
                 stack_push_mode <= 1'b1;
                 seg_sel <= SEG_SS;
+                seg_is_io <= 1'b0;
                 is_dtable <= 1'b0;
                 addr_size <= pe ? seg_cache[SEG_CS].D_B : i_addr32_r;
                 descsw_mode <= 1'b1;

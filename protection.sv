@@ -215,7 +215,14 @@ always_comb begin
             // Note: p2 uses only DPL vs CPL, not selector_rpl. Per Intel manual,
             // "the RPL of the new code segment selector is not used in the privilege
             // check" for INT/CALL gates. SET_RPL_TO_CPL later forces RPL=CPL.
-            p1_comb = (selector_rpl > desc_dpl);
+            // CONFORMING code inverts the violation sense: DPL <= RPL is legal
+            // (RETF outer-level to a conforming DPL0 segment — Ergo DPMI's
+            // ring-3 kernel facet; JMP/CALL reduce to DPL <= CPL because
+            // WRITE_RPL forces RPL = CPL before this check).
+            if (desc_s && desc_x && desc_ce)
+                p1_comb = (desc_dpl > selector_rpl);
+            else
+                p1_comb = (selector_rpl > desc_dpl);
             p2_comb = ~(desc_dpl != cpl);
         end else begin
             // TSTGT, TSTGT2, TSTPM, TSTPRV, TSTINT, TSTJ, etc.

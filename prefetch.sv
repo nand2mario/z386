@@ -1,6 +1,13 @@
 //
 // Prefetch Unit - 32-byte circular buffer, filled one 16-byte cache line at a time
 //
+// The decoder-facing byte window is registered.  q_window_next is computed
+// from the queue's NEXT state (this cycle's pop, flush and fill included via
+// bypass), so the registered window always equals the byte rotate of the new
+// queue head: the decoder sees exactly the same value per cycle as the old
+// combinational window, but the 8:1 word mux + byte rotate is paid in the
+// cycle before decode instead of on the decode critical path.
+//
 
 module prefetch
     import z386_pkg::*;
@@ -43,6 +50,7 @@ reg [1:0]  pf_fetch_word_start;      // First word to keep from next fetched lin
 reg        pf_suspended;             // Prefetch suspended (page fault until flush)
 reg        pf_drop_inflight;         // Drop next prefetch result (flush during in-flight)
 reg [31:0] pf_fetch_addr;            // Next LINEAR cache-line address to prefetch
+reg [31:0] q_window_r;               // Registered head window seen by the decoder
 
 // synthesis translate_off
 bit TRACE_FLUSH_EN;
@@ -55,13 +63,7 @@ function automatic [2:0] ptr_idx(input [3:0] ptr);
     end
 endfunction
 
-wire [31:0] q_word_cur = prefetch_queue[ptr_idx(pf_rptr)];
-wire [31:0] q_word_next = prefetch_queue[ptr_idx(pf_rptr + 4'd1)];
-
-assign q_window = pf_byte_offset == 2'd0 ? q_word_cur :
-                  pf_byte_offset == 2'd1 ? {q_word_next[7:0], q_word_cur[31:8]} :
-                  pf_byte_offset == 2'd2 ? {q_word_next[15:0], q_word_cur[31:16]} :
-                                           {q_word_next[23:0], q_word_cur[31:24]};
+assign q_window = q_window_r;
 
 wire [3:0] pf_word_count = pf_wptr - pf_rptr; // 0..8 valid queue words
 wire [5:0] pf_byte_count = q_empty ? 6'd0 :
@@ -91,6 +93,74 @@ function automatic [31:0] line_word(input [127:0] line, input [1:0] word);
     end
 endfunction
 
+// Next-state of the queue head, mirroring the update priority of the
+// registered always_ff below: pop, then fill, then flush, then the
+// unaligned-seed case at fetch launch.
+wire fill_commit = good_ack && !q_flush;
+wire seed_now = pf_can_fetch && !good_ack && q_empty &&
+                (pf_fetch_addr[3:0] != 4'h0);
+wire [2:0] byte_advance = {1'b0, pf_byte_offset} + q_pop_bytes;
+
+logic [3:0]  rptr_next;
+logic [3:0]  wptr_next;
+logic [1:0]  byte_offset_next;
+logic [31:0] queue_next [7:0];
+
+always_comb begin
+    rptr_next = pf_rptr;
+    wptr_next = pf_wptr;
+    byte_offset_next = pf_byte_offset;
+    for (int k = 0; k < 8; k++)
+        queue_next[k] = prefetch_queue[k];
+
+    if ((q_pop_bytes != 3'd0) && !q_empty) begin
+        byte_offset_next = byte_advance[1:0];
+        rptr_next = pf_rptr + {3'd0, byte_advance[2]};
+    end
+
+    if (fill_commit) begin
+        unique case (pf_fetch_word_start)
+            2'd0: begin
+                queue_next[ptr_idx(pf_wptr)] = line_word(pf_rdata, 2'd0);
+                queue_next[ptr_idx(pf_wptr + 4'd1)] = line_word(pf_rdata, 2'd1);
+                queue_next[ptr_idx(pf_wptr + 4'd2)] = line_word(pf_rdata, 2'd2);
+                queue_next[ptr_idx(pf_wptr + 4'd3)] = line_word(pf_rdata, 2'd3);
+            end
+            2'd1: begin
+                queue_next[ptr_idx(pf_wptr)] = line_word(pf_rdata, 2'd1);
+                queue_next[ptr_idx(pf_wptr + 4'd1)] = line_word(pf_rdata, 2'd2);
+                queue_next[ptr_idx(pf_wptr + 4'd2)] = line_word(pf_rdata, 2'd3);
+            end
+            2'd2: begin
+                queue_next[ptr_idx(pf_wptr)] = line_word(pf_rdata, 2'd2);
+                queue_next[ptr_idx(pf_wptr + 4'd1)] = line_word(pf_rdata, 2'd3);
+            end
+            default: begin
+                queue_next[ptr_idx(pf_wptr)] = line_word(pf_rdata, 2'd3);
+            end
+        endcase
+        wptr_next = pf_wptr + {1'b0, fetch_write_words};
+    end
+
+    if (q_flush) begin
+        rptr_next = 4'h0;
+        wptr_next = 4'h0;
+        byte_offset_next = pf_flush_addr[1:0];
+    end
+
+    if (seed_now)
+        byte_offset_next = pf_fetch_addr[1:0];
+end
+
+wire [31:0] q_word_cur_next = queue_next[ptr_idx(rptr_next)];
+wire [31:0] q_word_nxt_next = queue_next[ptr_idx(rptr_next + 4'd1)];
+
+wire [31:0] q_window_next =
+    byte_offset_next == 2'd0 ? q_word_cur_next :
+    byte_offset_next == 2'd1 ? {q_word_nxt_next[7:0],  q_word_cur_next[31:8]} :
+    byte_offset_next == 2'd2 ? {q_word_nxt_next[15:0], q_word_cur_next[31:16]} :
+                               {q_word_nxt_next[23:0], q_word_cur_next[31:24]};
+
 always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
         pf_rptr <= 4'h0;
@@ -104,21 +174,20 @@ always_ff @(posedge clk or negedge reset_n) begin
         pf_linear_addr <= 32'h0;
         pf_redirect_queued <= 1'b0;
         pf_ack_prev <= 1'b0;
+        q_window_r <= 32'h0;
     end else begin
         pf_ack_prev <= pf_ack_toggle;
 
-        if ((q_pop_bytes != 3'd0) && !q_empty) begin
-            automatic logic [2:0] byte_advance = {1'b0, pf_byte_offset} + q_pop_bytes;
-            pf_byte_offset <= byte_advance[1:0];
-            pf_rptr <= pf_rptr + {3'd0, byte_advance[2]};
-        end
+        pf_rptr <= rptr_next;
+        pf_wptr <= wptr_next;
+        pf_byte_offset <= byte_offset_next;
+        q_window_r <= q_window_next;
+        for (int k = 0; k < 8; k++)
+            prefetch_queue[k] <= queue_next[k];
 
         if (q_flush) begin
-            pf_rptr <= 4'h0;
-            pf_wptr <= 4'h0;
             pf_fetch_addr <= {pf_flush_addr[31:4], 4'b0000};
             pf_fetch_word_start <= pf_flush_addr[3:2];
-            pf_byte_offset <= pf_flush_addr[1:0];
             pf_linear_addr <= {pf_flush_addr[31:4], 4'b0000};
             pf_suspended <= 1'b0;
             if (pf_inflight && !pf_ack_edge) begin
@@ -144,28 +213,6 @@ always_ff @(posedge clk or negedge reset_n) begin
                 if (pf_fault && !pf_drop_inflight)
                     pf_suspended <= 1'b1;
             end else begin
-                unique case (pf_fetch_word_start)
-                    2'd0: begin
-                        prefetch_queue[ptr_idx(pf_wptr)] <= line_word(pf_rdata, 2'd0);
-                        prefetch_queue[ptr_idx(pf_wptr + 4'd1)] <= line_word(pf_rdata, 2'd1);
-                        prefetch_queue[ptr_idx(pf_wptr + 4'd2)] <= line_word(pf_rdata, 2'd2);
-                        prefetch_queue[ptr_idx(pf_wptr + 4'd3)] <= line_word(pf_rdata, 2'd3);
-                    end
-                    2'd1: begin
-                        prefetch_queue[ptr_idx(pf_wptr)] <= line_word(pf_rdata, 2'd1);
-                        prefetch_queue[ptr_idx(pf_wptr + 4'd1)] <= line_word(pf_rdata, 2'd2);
-                        prefetch_queue[ptr_idx(pf_wptr + 4'd2)] <= line_word(pf_rdata, 2'd3);
-                    end
-                    2'd2: begin
-                        prefetch_queue[ptr_idx(pf_wptr)] <= line_word(pf_rdata, 2'd2);
-                        prefetch_queue[ptr_idx(pf_wptr + 4'd1)] <= line_word(pf_rdata, 2'd3);
-                    end
-                    default: begin
-                        prefetch_queue[ptr_idx(pf_wptr)] <= line_word(pf_rdata, 2'd3);
-                    end
-                endcase
-
-                pf_wptr <= pf_wptr + {1'b0, fetch_write_words};
                 pf_fetch_addr <= pf_fetch_addr + 32'd16;
                 pf_fetch_word_start <= 2'd0;
             end
@@ -186,7 +233,6 @@ always_ff @(posedge clk or negedge reset_n) begin
                 pf_linear_addr <= {pf_fetch_addr[31:4], 4'b0000};
                 if (q_empty && pf_fetch_addr[3:0] != 4'h0) begin
                     pf_fetch_word_start <= pf_fetch_addr[3:2];
-                    pf_byte_offset <= pf_fetch_addr[1:0];
                     pf_fetch_addr <= {pf_fetch_addr[31:4], 4'b0000};
                 end
             end
