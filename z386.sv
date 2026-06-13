@@ -1843,7 +1843,10 @@ always_ff @(posedge clk) begin
                           i_bus.has_0f && (i_bus.opcode == 8'hA4 || i_bus.opcode == 8'hA5 || i_bus.opcode == 8'hAC || i_bus.opcode == 8'hAD);
         instr_is_shxd <= i_bus.has_0f && ((i_bus.opcode == 8'hA4) || (i_bus.opcode == 8'hA5) ||
                                           (i_bus.opcode == 8'hAC) || (i_bus.opcode == 8'hAD));
-        instr_cf <= EFLAGS[0];
+        // RCL/RCR carry-in: forward the committing CF (eflags_fwd) so
+        // consecutive rotate-through-carry chains (RCR DX,1; RCR BX,1) read
+        // the right carry-in across the two-cycle flag commit.
+        instr_cf <= eflags_fwd[0];
         instr_is_cmp <= i_bus.opcode[7:2] == 6'b100000 || i_bus.opcode[7:3] == 5'b00111;
         instr_ind_is_ea <= i_bus.has_modrm && !i_bus.stack_op && !i_bus.has_moffs;
         // Pre-decode ALU group op: eliminates i.opcode/i.modrm muxes from ALU critical path
@@ -2469,9 +2472,13 @@ always_ff @(posedge clk) begin
     end else if (interrupt_entry) begin
         flags_backup_active <= 1'b0;
     end else if (i_pop && !halted) begin
-        // Backup FLAGS at instruction start - always valid for faults
+        // Backup FLAGS at instruction start - always valid for faults.
+        // eflags_fwd: the prior instruction's shift/ALU flags may retire on
+        // this same i_pop edge (two-cycle commit overlapping its RNI delay
+        // slot); raw EFLAGS would back up the stale pre-commit value, so a
+        // fault here would restore wrong flags.
         flags_backup_active <= 1'b1;
-        FLAGSB <= EFLAGS;
+        FLAGSB <= eflags_fwd;
     end else if (uc_exec && uc_aluop == ALUJMP_FLGSBA) begin
         if (!flags_backup_active) begin
             flags_backup_active <= 1'b1;
@@ -3236,6 +3243,34 @@ always_ff @(posedge clk) begin
         end
     end
 end
+
+// EFLAGS as it will be after this cycle's pending two-cycle flag commit
+// (sh2 shift / flag2 ALU).  Entry-point captures (FLAGSB, instr_cf) sample at
+// i_pop, which overlaps the producer instruction's RNI delay slot where the
+// commit lands — so they must use this forwarded view, not the raw EFLAGS,
+// or they latch the stale pre-commit flags.
+wire [31:0] eflags_fwd =
+    sh2_commit_p ? { EFLAGS[31:12],
+                     sh2_we_of  ? sh2_of : EFLAGS[11],
+                     EFLAGS[10:8],
+                     sh2_we_zsp ? sh2_sf : EFLAGS[7],
+                     sh2_we_zsp ? sh2_zf : EFLAGS[6],
+                     EFLAGS[5:3],
+                     sh2_we_zsp ? sh2_pf : EFLAGS[2],
+                     EFLAGS[1],
+                     sh2_cf } :
+    flag2_eflags_p ? { EFLAGS[31:12],
+                       flag2_of_r,
+                       EFLAGS[10:8],
+                       flag2_zsp_r ? flag2_sf : EFLAGS[7],
+                       flag2_zsp_r ? flag2_zf : EFLAGS[6],
+                       EFLAGS[5],
+                       flag2_af_r,
+                       EFLAGS[3],
+                       flag2_zsp_r ? flag2_pf : EFLAGS[2],
+                       EFLAGS[1],
+                       flag2_cf_r } :
+    EFLAGS;
 
 //=============================================================================
 // Barrel Shifter Unit
