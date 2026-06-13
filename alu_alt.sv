@@ -12,7 +12,9 @@ module alu_alt
     input         update_carry, // gate CF updates
 
     output [31:0] result,
-    output [31:0] flags_out
+    output [31:0] flags_out,
+    // 1 when this op updates ZF/SF/PF (see alu.sv)
+    output        zsp_update
 );
 
 wire is_byte  = (op_size == 2'd0);
@@ -22,6 +24,7 @@ wire is_dword = (op_size == 2'd2);
 wire is_logic  = (op == ALU_AND) || (op == ALU_OR) || (op == ALU_XOR) || (op == ALU_ANDN);
 wire is_extend = (op == ALU_ZEXT) || (op == ALU_SEXT);
 wire is_not    = (op == ALU_NOT);
+assign zsp_update = !(is_extend || is_not || op == ALU_AAA || op == ALU_AAS);
 wire is_addfam = (op == ALU_ADD) || (op == ALU_ADC) || (op == ALU_INC) || (op == ALU_INC2);
 wire is_subfam = (op == ALU_SUBT) || (op == ALU_SBB) || (op == ALU_CMP) ||
                  (op == ALU_DEC) || (op == ALU_DEC2) || (op == ALU_NEG);

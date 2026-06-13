@@ -12,7 +12,11 @@ module alu
     input         update_carry,  // gate CF updates
 
     output [31:0] result,
-    output [31:0] flags_out
+    output [31:0] flags_out,
+    // 1 when this op updates ZF/SF/PF.  The two-cycle flag retirement
+    // derives them from the registered result; NOT/MOVZX/MOVSX preserve
+    // all flags and AAA/AAS preserve ZF/SF/PF.
+    output        zsp_update
 );
 
 // -----------------------------------------------------------------------------
@@ -273,6 +277,7 @@ assign result = alu_post;  // CMP computes dst-src; microcode controls dest writ
 wire is_logic  = (op == ALU_AND) || (op == ALU_OR) || (op == ALU_XOR) || (op == ALU_ANDN);
 wire is_extend = (op == ALU_ZEXT) || (op == ALU_SEXT);  // MOVZX/MOVSX don't modify flags
 wire is_not    = (op == ALU_NOT);  // NOT doesn't modify any flags
+assign zsp_update = !(is_extend || is_not || op == ALU_AAA || op == ALU_AAS);
 // NOTE: Shifts are handled by the dedicated shifter module, not the ALU
 wire is_inc    = (op == ALU_INC);
 wire is_dec    = (op == ALU_DEC);

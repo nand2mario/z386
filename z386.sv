@@ -1235,7 +1235,14 @@ wire [31:0] ea_comb        = calc_ea(ea_base_sel, ea_index_sel, ea_scale, ea_dis
                                     ea_has_base, ea_has_index, ea_has_disp, ea_is_16bit, ea_scale_to_base);
 reg [31:0] ea_r;                    // Registered EA for ALU path
 
-assign ind_effective = (i_first && instr_ind_is_ea) ? ea_comb : IND;
+// Early EA (386 early-start): the modrm EA, computed at i_pop with delay-slot
+// GPR forwarding and registered, so microcode execution / segment fault use a
+// register instead of the combinational ea_comb (which dominated the WNS cone
+// via ea_comb -> seg limit -> i_rni_delay/init_cycle).  Validated against
+// ea_comb by a differential assertion before ind_effective switches to it.
+reg [31:0] ea_reg;
+
+assign ind_effective = (i_first && instr_ind_is_ea) ? ea_reg : IND;
 
 reg [2:0]  seg_reg_sel;             // Segment register index (0=ES,1=CS,2=SS,3=DS,4=FS,5=GS)
 
@@ -1249,6 +1256,16 @@ reg        ea_has_index;            // Include index register
 reg        ea_has_disp;             // Include i.displacement
 reg        ea_is_16bit;             // 16-bit addressing mode
 reg        ea_scale_to_base;        // Special case: scale applies to base (SIB with no index)
+
+// Combinational EA-operand decode (from i_bus, valid at i_pop).  Registered
+// into the ea_* regs at i_pop; also consumed directly for the early EA at
+// i_pop (so the EA register is available at i_first without a combinational
+// ea_comb in the execution/fault cone).
+logic [7:0]  ea_dec_base_sel, ea_dec_index_sel;
+logic [1:0]  ea_dec_scale;
+logic [31:0] ea_dec_disp;
+logic        ea_dec_has_base, ea_dec_has_index, ea_dec_has_disp;
+logic        ea_dec_is_16bit, ea_dec_scale_to_base;
 
 reg [31:0] COUNTR;                  // Counter register
 wire [4:0] CNT = COUNTR[4:0];
@@ -1281,6 +1298,83 @@ wire delay_slot_writes_esp = i_rni_delay && (uc_dest == DEST_eSP || uc_dest == D
                                               (uc_dest == DEST_DSTREG && i.dst_reg_sel == 4 && op_size != 2'd0) ||
                                               (uc_dest == DEST_SRCREG && i.src_reg_sel == 4 && op_size != 2'd0));
 wire [31:0] forwarded_esp = delay_slot_writes_esp ? dest_value : ESP;
+
+// Delay-slot GPR write descriptor for early-EA forwarding.  Mirrors the
+// GPR-writing DEST cases (incl. x86 byte-register AH/BH/CH/DH high-byte
+// encoding) to produce which GPR the in-flight delay slot updates and at
+// what width, so fwd_onehot_gpr can reproduce the post-write value.
+localparam [1:0] FWD_BLO = 2'd0, FWD_BHI = 2'd1, FWD_W = 2'd2, FWD_D = 2'd3;
+reg       dly_gpr_we;
+reg [2:0] dly_gpr_sel;
+reg [1:0] dly_gpr_mode;
+always_comb begin
+    dly_gpr_we   = 1'b0;
+    dly_gpr_sel  = 3'd0;
+    dly_gpr_mode = FWD_D;
+    if (i_rni_delay) begin
+        case (uc_dest)
+            DEST_DSTREG, DEST_SRCREG: begin
+                automatic logic [2:0] rs = (uc_dest == DEST_DSTREG) ? i.dst_reg_sel : i.src_reg_sel;
+                dly_gpr_we = 1'b1;
+                if (op_size == 2'd0) begin               // byte: rs[2]=high-byte, rs[1:0]=GPR
+                    dly_gpr_sel  = {1'b0, rs[1:0]};
+                    dly_gpr_mode = rs[2] ? FWD_BHI : FWD_BLO;
+                end else begin
+                    dly_gpr_sel  = rs;
+                    dly_gpr_mode = (op_size == 2'd1) ? FWD_W : FWD_D;
+                end
+            end
+            DEST_EAX, DEST_ECX, DEST_EDX, DEST_EBX,
+            DEST_ESP, DEST_EBP, DEST_ESI, DEST_EDI:
+                begin dly_gpr_we = 1'b1; dly_gpr_sel = uc_dest[2:0]; dly_gpr_mode = FWD_D; end
+            DEST_eSP:
+                begin dly_gpr_we = 1'b1; dly_gpr_sel = 3'd4;
+                      dly_gpr_mode = (pe && seg_cache[SEG_SS].D_B) ? FWD_D : FWD_W; end
+            DEST_AX, DEST_CX, DEST_DX, DEST_BX, DEST_SP, DEST_BP, DEST_SI, DEST_DI:
+                begin dly_gpr_we = 1'b1; dly_gpr_sel = uc_dest[2:0]; dly_gpr_mode = FWD_W; end
+            DEST_AL, DEST_CL, DEST_DL, DEST_BL:
+                begin dly_gpr_we = 1'b1; dly_gpr_sel = {1'b0, uc_dest[1:0]}; dly_gpr_mode = FWD_BLO; end
+            DEST_AH, DEST_CH, DEST_DH, DEST_BH:
+                begin dly_gpr_we = 1'b1; dly_gpr_sel = {1'b0, uc_dest[1:0]}; dly_gpr_mode = FWD_BHI; end
+            DEST_eAX_AL:
+                begin dly_gpr_we = 1'b1; dly_gpr_sel = 3'd0;
+                      dly_gpr_mode = (op_size == 2'd0) ? FWD_BLO : (op_size == 2'd1) ? FWD_W : FWD_D; end
+            DEST_eDX_AH: begin
+                dly_gpr_we = 1'b1;
+                if (op_size == 2'd0) begin dly_gpr_sel = 3'd0; dly_gpr_mode = FWD_BHI; end  // AH
+                else begin dly_gpr_sel = 3'd2; dly_gpr_mode = (op_size == 2'd1) ? FWD_W : FWD_D; end
+            end
+            DEST_eCX: begin dly_gpr_we = 1'b1; dly_gpr_sel = 3'd1; dly_gpr_mode = i.addr32 ? FWD_D : FWD_W; end
+            DEST_eSI: begin dly_gpr_we = 1'b1; dly_gpr_sel = 3'd6; dly_gpr_mode = i.addr32 ? FWD_D : FWD_W; end
+            DEST_eDI: begin dly_gpr_we = 1'b1; dly_gpr_sel = 3'd7; dly_gpr_mode = i.addr32 ? FWD_D : FWD_W; end
+            DEST_IRF: if (COUNTR[5:3] != 3'b100)
+                begin dly_gpr_we = 1'b1; dly_gpr_sel = COUNTR[2:0]; dly_gpr_mode = is_dword ? FWD_D : FWD_W; end
+            default: ;
+        endcase
+    end
+end
+
+// Early forwarded EA, computed at i_pop from the combinational decode and
+// delay-slot-bypassed GPRs, registered for use at i_first onward.
+wire [31:0] ea_early = calc_ea_core(fwd_onehot_gpr(ea_dec_base_sel),
+                                    fwd_onehot_gpr(ea_dec_index_sel),
+                                    ea_dec_scale, ea_dec_disp,
+                                    ea_dec_is_16bit, ea_dec_scale_to_base);
+always_ff @(posedge clk) begin
+    if (i_pop)
+        ea_reg <= ea_early;
+end
+// synthesis translate_off
+// Differential check: the registered early EA must match the combinational
+// ea_comb at i_first for every modrm-EA instruction.  Any miss in the
+// delay-slot forwarding decode shows up here (loudly) before ind_effective
+// switches to ea_reg.
+always_ff @(posedge clk) begin
+    if (reset_n && i_first && instr_ind_is_ea && (ea_reg !== ea_comb))
+        $display("%0t: EA MISMATCH ea_reg=%08x ea_comb=%08x uc_dest_dly? CS:EIP=%0x:%0x",
+                 $time, ea_reg, ea_comb, CS, EIP);
+end
+// synthesis translate_on
 
 // RNI variants (opcode field):
 //   000 = RNI  : Run Next Instruction (normal termination)
@@ -1771,98 +1865,111 @@ always_ff @(posedge clk) begin
         jcc_active <= 1'b0;  // Clear on interrupt — prevent is_jcc from using stale displacement
 end
 
-// EA Pre-Decode (latched at i_pop, consumed at i_first by calc_ea)
-always_ff @(posedge clk) begin
-    if (i_pop) begin
-        if (i_bus.has_modrm && !i_bus.has_moffs) begin
-            if (i_bus.addr32) begin
-                // 32-bit addressing mode
-                ea_base_sel  <= decode_base_register_32(i_bus.modrm, i_bus.sib, i_bus.has_sib);
-                ea_index_sel <= decode_index_register_32(i_bus.sib, i_bus.has_sib);
-                ea_scale     <= i_bus.has_sib ? i_bus.sib[7:6] : 2'b00;
-                ea_scale_to_base <= i_bus.has_sib && (i_bus.sib[5:3] == 3'b100);  // No index, scale to base
-                ea_is_16bit  <= 1'b0;
+// EA Pre-Decode: combinational decode from i_bus (valid at i_pop), registered
+// into ea_* below and also fed to the early EA computation at i_pop.
+always_comb begin
+    // Defaults (also the "no modrm / has moffs" case)
+    ea_dec_base_sel  = 8'h00;
+    ea_dec_index_sel = 8'h00;
+    ea_dec_scale     = 2'b00;
+    ea_dec_has_base  = 1'b0;
+    ea_dec_has_index = 1'b0;
+    ea_dec_has_disp  = 1'b0;
+    ea_dec_is_16bit  = 1'b0;
+    ea_dec_scale_to_base = 1'b0;
+    ea_dec_disp      = 32'h0;
+    if (i_bus.has_modrm && !i_bus.has_moffs) begin
+        if (i_bus.addr32) begin
+            // 32-bit addressing mode
+            ea_dec_base_sel  = decode_base_register_32(i_bus.modrm, i_bus.sib, i_bus.has_sib);
+            ea_dec_index_sel = decode_index_register_32(i_bus.sib, i_bus.has_sib);
+            ea_dec_scale     = i_bus.has_sib ? i_bus.sib[7:6] : 2'b00;
+            ea_dec_scale_to_base = i_bus.has_sib && (i_bus.sib[5:3] == 3'b100);  // No index, scale to base
+            ea_dec_is_16bit  = 1'b0;
 
-                // Determine what components to include
-                if (i_bus.has_sib && i_bus.modrm[2:0] == 3'b100) begin
-                    // SIB addressing
-                    ea_has_base  <= !((i_bus.sib[2:0] == 3'b101) && (i_bus.modrm[7:6] == 2'b00));
-                    ea_has_index <= (i_bus.sib[5:3] != 3'b100);
-                    ea_has_disp  <= (i_bus.modrm[7:6] == 2'b01) || (i_bus.modrm[7:6] == 2'b10) ||
-                                   ((i_bus.sib[2:0] == 3'b101) && (i_bus.modrm[7:6] == 2'b00));
-                end else begin
-                    // Non-SIB addressing
-                    ea_has_base  <= !((i_bus.modrm[2:0] == 3'b101) && (i_bus.modrm[7:6] == 2'b00));
-                    ea_has_index <= 1'b0;
-                    ea_has_disp  <= (i_bus.modrm[7:6] == 2'b01) || (i_bus.modrm[7:6] == 2'b10) ||
-                                   ((i_bus.modrm[2:0] == 3'b101) && (i_bus.modrm[7:6] == 2'b00));
-                end
+            // Determine what components to include
+            if (i_bus.has_sib && i_bus.modrm[2:0] == 3'b100) begin
+                // SIB addressing
+                ea_dec_has_base  = !((i_bus.sib[2:0] == 3'b101) && (i_bus.modrm[7:6] == 2'b00));
+                ea_dec_has_index = (i_bus.sib[5:3] != 3'b100);
+                ea_dec_has_disp  = (i_bus.modrm[7:6] == 2'b01) || (i_bus.modrm[7:6] == 2'b10) ||
+                               ((i_bus.sib[2:0] == 3'b101) && (i_bus.modrm[7:6] == 2'b00));
             end else begin
-                // 16-bit addressing mode
-                ea_base_sel  <= ea_regs_16[7:0];   // First register
-                ea_index_sel <= ea_regs_16[15:8];  // Second register
-                ea_scale     <= 2'b00;  // No scaling in 16-bit mode
-                ea_scale_to_base <= 1'b0;
-                ea_is_16bit  <= 1'b1;
-
-                // In 16-bit mode, both base_sel and index_sel represent combined registers
-                ea_has_base  <= (ea_regs_16[7:0] != 8'h00);
-                ea_has_index <= (ea_regs_16[15:8] != 8'h00);
-                ea_has_disp  <= (i_bus.modrm[7:6] == 2'b01) || (i_bus.modrm[7:6] == 2'b10) ||
-                               ((i_bus.modrm[2:0] == 3'b110) && (i_bus.modrm[7:6] == 2'b00));
-            end
-
-            // Displacement value (sign-extend disp8, use full disp16/disp32)
-            begin
-                automatic logic [31:0] disp_val;
-                if (i_bus.modrm[7:6] == 2'b01)
-                    // disp8 - sign extend
-                    disp_val = {{24{i_bus.displacement[7]}}, i_bus.displacement[7:0]};
-                else if (i_bus.modrm[7:6] == 2'b10)
-                    // disp16 or disp32
-                    disp_val = i_bus.addr32 ? i_bus.displacement : {{16{i_bus.displacement[15]}}, i_bus.displacement[15:0]};
-                else
-                    // disp32 for [disp32] or [disp16] modes (mod=00, special rm)
-                    disp_val = i_bus.addr32 ? i_bus.displacement : {16'h0, i_bus.displacement[15:0]};
-
-                // POP r/m (8F) with ESP base: Intel 386 says EA uses post-increment ESP.
-                if (i_bus.opcode == 8'h8F && i_bus.addr32 && i_bus.has_sib && i_bus.sib[2:0] == 3'b100) begin
-                    disp_val = disp_val + (i_bus.data32 ? 32'd4 : 32'd2);
-                    ea_has_disp <= 1'b1;  // Force displacement inclusion (mod=00 ESP base has no disp)
-                end
-                ea_disp <= disp_val;
-            end
-            // Zero ea_disp when not used (last-assignment-wins) so calc_ea
-            // can use an unconditional 3-operand add without has_disp mux.
-            // mod=00 without special rm, and mod=11 (register): no displacement.
-            if (i_bus.modrm[7:6] == 2'b00 || i_bus.modrm[7:6] == 2'b11) begin
-                if (i_bus.addr32) begin
-                    // 32-bit: special rm is rm=101 (non-SIB) or sib_base=101 (SIB)
-                    if (i_bus.has_sib && i_bus.modrm[2:0] == 3'b100) begin
-                        if (i_bus.sib[2:0] != 3'b101)
-                            ea_disp <= 32'h0;  // SIB, no disp32
-                    end else begin
-                        if (i_bus.modrm[2:0] != 3'b101)
-                            ea_disp <= 32'h0;  // Non-SIB, no disp32
-                    end
-                end else begin
-                    // 16-bit: special rm is rm=110
-                    if (i_bus.modrm[2:0] != 3'b110)
-                        ea_disp <= 32'h0;
-                end
+                // Non-SIB addressing
+                ea_dec_has_base  = !((i_bus.modrm[2:0] == 3'b101) && (i_bus.modrm[7:6] == 2'b00));
+                ea_dec_has_index = 1'b0;
+                ea_dec_has_disp  = (i_bus.modrm[7:6] == 2'b01) || (i_bus.modrm[7:6] == 2'b10) ||
+                               ((i_bus.modrm[2:0] == 3'b101) && (i_bus.modrm[7:6] == 2'b00));
             end
         end else begin
-            // No modrm or has moffs - clear EA decode
-            ea_base_sel  <= 8'h00;
-            ea_index_sel <= 8'h00;
-            ea_scale     <= 2'b00;
-            ea_has_base  <= 1'b0;
-            ea_has_index <= 1'b0;
-            ea_has_disp  <= 1'b0;
-            ea_is_16bit  <= 1'b0;
-            ea_scale_to_base <= 1'b0;
-            ea_disp      <= 32'h0;
+            // 16-bit addressing mode
+            ea_dec_base_sel  = ea_regs_16[7:0];   // First register
+            ea_dec_index_sel = ea_regs_16[15:8];  // Second register
+            ea_dec_scale     = 2'b00;  // No scaling in 16-bit mode
+            ea_dec_scale_to_base = 1'b0;
+            ea_dec_is_16bit  = 1'b1;
+
+            // In 16-bit mode, both base_sel and index_sel represent combined registers
+            ea_dec_has_base  = (ea_regs_16[7:0] != 8'h00);
+            ea_dec_has_index = (ea_regs_16[15:8] != 8'h00);
+            ea_dec_has_disp  = (i_bus.modrm[7:6] == 2'b01) || (i_bus.modrm[7:6] == 2'b10) ||
+                           ((i_bus.modrm[2:0] == 3'b110) && (i_bus.modrm[7:6] == 2'b00));
         end
+
+        // Displacement value (sign-extend disp8, use full disp16/disp32)
+        begin
+            automatic logic [31:0] disp_val;
+            if (i_bus.modrm[7:6] == 2'b01)
+                // disp8 - sign extend
+                disp_val = {{24{i_bus.displacement[7]}}, i_bus.displacement[7:0]};
+            else if (i_bus.modrm[7:6] == 2'b10)
+                // disp16 or disp32
+                disp_val = i_bus.addr32 ? i_bus.displacement : {{16{i_bus.displacement[15]}}, i_bus.displacement[15:0]};
+            else
+                // disp32 for [disp32] or [disp16] modes (mod=00, special rm)
+                disp_val = i_bus.addr32 ? i_bus.displacement : {16'h0, i_bus.displacement[15:0]};
+
+            // POP r/m (8F) with ESP base: Intel 386 says EA uses post-increment ESP.
+            if (i_bus.opcode == 8'h8F && i_bus.addr32 && i_bus.has_sib && i_bus.sib[2:0] == 3'b100) begin
+                disp_val = disp_val + (i_bus.data32 ? 32'd4 : 32'd2);
+                ea_dec_has_disp = 1'b1;  // Force displacement inclusion (mod=00 ESP base has no disp)
+            end
+            ea_dec_disp = disp_val;
+        end
+        // Zero ea_disp when not used (last-assignment-wins) so calc_ea
+        // can use an unconditional 3-operand add without has_disp mux.
+        // mod=00 without special rm, and mod=11 (register): no displacement.
+        if (i_bus.modrm[7:6] == 2'b00 || i_bus.modrm[7:6] == 2'b11) begin
+            if (i_bus.addr32) begin
+                // 32-bit: special rm is rm=101 (non-SIB) or sib_base=101 (SIB)
+                if (i_bus.has_sib && i_bus.modrm[2:0] == 3'b100) begin
+                    if (i_bus.sib[2:0] != 3'b101)
+                        ea_dec_disp = 32'h0;  // SIB, no disp32
+                end else begin
+                    if (i_bus.modrm[2:0] != 3'b101)
+                        ea_dec_disp = 32'h0;  // Non-SIB, no disp32
+                end
+            end else begin
+                // 16-bit: special rm is rm=110
+                if (i_bus.modrm[2:0] != 3'b110)
+                    ea_dec_disp = 32'h0;
+            end
+        end
+    end
+end
+
+// Register the EA decode at i_pop (consumed at i_first by calc_ea / ALU path)
+always_ff @(posedge clk) begin
+    if (i_pop) begin
+        ea_base_sel      <= ea_dec_base_sel;
+        ea_index_sel     <= ea_dec_index_sel;
+        ea_scale         <= ea_dec_scale;
+        ea_scale_to_base <= ea_dec_scale_to_base;
+        ea_is_16bit      <= ea_dec_is_16bit;
+        ea_has_base      <= ea_dec_has_base;
+        ea_has_index     <= ea_dec_has_index;
+        ea_has_disp      <= ea_dec_has_disp;
+        ea_disp          <= ea_dec_disp;
     end
 end
 
@@ -1990,30 +2097,49 @@ end
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         uc_flags <= 32'h0000_0002;  // Bit 1 is always 1
-    end else if (i_pop) begin
-        uc_flags <= EFLAGS;
-    end else if (uc_exec) begin
-        case (uc_aluop)
-            ALUJMP_ALU,
-            ALUJMP_INCDEC,
-            ALUJMP_CMPTST,
-            ALUJMP_AND,
-            ALUJMP_OR,
-            ALUJMP_XOR,
-            ALUJMP_ADD,
-            ALUJMP_ADC,
-            ALUJMP_SUB,
-            ALUJMP_CMP,
-            ALUJMP_AAAAAS,
-            ALUJMP_DAADAS:
-                uc_flags <= alu_flags;
-            ALUJMP_BITTST:
-                uc_flags[0] <= shift_result[0];
-            ALUJMP_SHIFT2:
-                if (shift_size != 5'd0)
-                    uc_flags[0] <= shift_cf;
-            default: ;  // Other ops don't produce meaningful flags
-        endcase
+    end else begin
+        if (i_pop)
+            uc_flags <= EFLAGS;
+        // Two-cycle ALU flag commit.  Overrides the i_pop capture for the
+        // committed bits: when the producer is the previous instruction's
+        // last uop, the capture above reads the not-yet-committed EFLAGS.
+        if (flag2_ucflags_p) begin
+            uc_flags[0]  <= flag2_cf_r;
+            uc_flags[4]  <= flag2_af_r;
+            uc_flags[11] <= flag2_of_r;
+            if (flag2_zsp_r) begin
+                uc_flags[2] <= flag2_pf;
+                uc_flags[6] <= flag2_zf;
+                uc_flags[7] <= flag2_sf;
+            end
+        end
+        // Two-cycle shifter flag commit (same role as flag2 for ALU ops): make
+        // the architectural shift flags visible to the next instruction's
+        // micro-jumps.  Placed before the single-cycle BSR/BITTST writes so the
+        // loop's own CF (this cycle's shift) wins in loop cycles.
+        if (sh2_commit_p) begin
+            uc_flags[0] <= sh2_cf;
+            if (sh2_we_zsp) begin
+                uc_flags[2] <= sh2_pf;
+                uc_flags[6] <= sh2_zf;
+                uc_flags[7] <= sh2_sf;
+            end
+            if (sh2_we_of)
+                uc_flags[11] <= sh2_of;
+        end
+        // Shift/BITTST CF stays single-cycle: the BSR/BSF loop's JNC reads
+        // it the next uop (the only distance-1 flag consumer in the ROM).
+        // i_pop exclusion preserves the pre-existing capture priority.
+        if (!i_pop && uc_exec) begin
+            case (uc_aluop)
+                ALUJMP_BITTST:
+                    uc_flags[0] <= shift_result[0];
+                ALUJMP_SHIFT2:
+                    if (shift_size != 5'd0)
+                        uc_flags[0] <= shift_cf;
+                default: ;  // ALU-class retires via flag2_* above
+            endcase
+        end
     end
 end
 
@@ -2044,6 +2170,32 @@ always_ff @(posedge clk) begin
             error_code_flag <= 1'b0;
             interrupt_hw <= 1'b0;
             // jcc_active moved to instruction signals block (single-driver)
+        end
+        // Two-cycle ALU flag commit (producer ran last cycle).  Placed
+        // before the uc_exec case so a same-cycle explicit flag write
+        // (FLGOPS, CLZF/SEZF, DIV5, POPF/SAHF, ...) from the program-order
+        // later uop wins on conflicting bits.
+        if (flag2_eflags_p) begin
+            EFLAGS[0]  <= flag2_cf_r;
+            EFLAGS[1]  <= 1'b1;
+            EFLAGS[4]  <= flag2_af_r;
+            EFLAGS[11] <= flag2_of_r;
+            if (flag2_zsp_r) begin
+                EFLAGS[2] <= flag2_pf;
+                EFLAGS[6] <= flag2_zf;
+                EFLAGS[7] <= flag2_sf;
+            end
+        end
+        // Two-cycle shifter flag commit (SHIFT2 ran last cycle).
+        if (sh2_commit_p) begin
+            EFLAGS[0] <= sh2_cf;
+            if (sh2_we_zsp) begin
+                EFLAGS[2] <= sh2_pf;
+                EFLAGS[6] <= sh2_zf;
+                EFLAGS[7] <= sh2_sf;
+            end
+            if (sh2_we_of)
+                EFLAGS[11] <= sh2_of;
         end
         if (uc_exec) begin
             case (uc_aluop)
@@ -2105,44 +2257,11 @@ always_ff @(posedge clk) begin
                         EFLAGS[9] <= 1'b0;  // Clear IF only if primed
                     clear_if_pending <= 1'b0;  // Reset the pending flag
                 end
-                ALUJMP_SHIFT2: if (shift_size != 5'd0) begin
-                    if (shift_SET_Nzs) begin
-                        EFLAGS[2] <= shift_pf;
-                        EFLAGS[6] <= shift_zf;
-                        EFLAGS[7] <= shift_sf;
-                    end
-                    if (instr_is_shxd) begin
-                        // SHLD/SHRD: CF = last bit shifted out
-                        EFLAGS[0] <= i.opcode[3] ? shift_last_out_lsb : shift_last_out_msb;
-                        // OF: for count=1, SHLD like SHL, SHRD like SHR
-                        if (shift_size == 5'd1)
-                            EFLAGS[11] <= i.opcode[3] ? (shift_result[width-1] ^ shift_result[width-2]) :
-                                                (shift_result[width-1] ^ shift_last_out_msb);
-                    end else begin
-                        case (shift_op)
-                            SHL,SAL:      EFLAGS[0] <= shift_overflow ? (shift_eq_width ? shift_eq_cf : 1'b0) : shift_last_out_msb;
-                            RCL:          EFLAGS[0] <= shift_last_out_msb;
-                            SHR:          EFLAGS[0] <= shift_overflow ? (shift_eq_width ? shift_eq_cf : 1'b0) : shift_last_out_lsb;
-                            SAR:          EFLAGS[0] <= shift_overflow ? shift_result[width-1] : shift_last_out_lsb;
-                            RCR:          EFLAGS[0] <= shift_last_out_lsb;
-                            ROL:          EFLAGS[0] <= shift_result[0];
-                            ROR:          EFLAGS[0] <= shift_result[width-1];
-                        endcase
-                        if (shift_size == 5'd1) begin
-                            case (shift_op)
-                                SHL:         EFLAGS[11] <= shift_result[width-1] ^ shift_last_out_msb;
-                                SHR:         EFLAGS[11] <= shift_lo[width-1];  // Original MSB (from value being shifted)
-                                SAR:         EFLAGS[11] <= 0;
-                                ROR,RCR:     EFLAGS[11] <= shift_result[width-1] ^ shift_result[width-2];
-                                default: ;
-                            endcase
-                        end
-                        // ROL/RCL: OF computed for ALL counts (real 386 behavior)
-                        if (shift_op == ROL) EFLAGS[11] <= shift_result[width-1] ^ shift_result[0];
-                        if (shift_op == RCL) EFLAGS[11] <= shift_result[width-1] ^ shift_last_out_msb;
-                    end
-
-                end
+                // SHIFT2 architectural flags retire one cycle later via the
+                // sh2_* commit (above), keeping the barrel shifter off the
+                // EFLAGS register cone.  uc_flags[0] for the BSR/BSF loop stays
+                // single-cycle (handled in the uc_flags block).
+                ALUJMP_SHIFT2: ;
                 ALUJMP_SHIFT: begin
                     // AAD: SHIFT precedes ADC, clear CF so ADC behaves like ADD.
                     if (i.opcode == 8'hD5)
@@ -2183,18 +2302,9 @@ always_ff @(posedge clk) begin
                     EFLAGS[0] <= ovf;
                     EFLAGS[11] <= ovf;
                 end
-                default: begin
-                    if (alu_update_flags) begin
-                        // Update arithmetic flags from ALU or shifter
-                        EFLAGS[0] <= alu_flags[0];    // CF
-                        EFLAGS[1] <= 1'b1;                 // Bit 1 is always 1
-                        EFLAGS[2] <= alu_flags[2];    // PF
-                        EFLAGS[4] <= alu_flags[4];    // AF
-                        EFLAGS[6] <= alu_flags[6];    // ZF
-                        EFLAGS[7] <= alu_flags[7];    // SF
-                        EFLAGS[11] <= alu_flags[11];  // OF
-                    end
-                end
+                // ALU-class arithmetic flags retire one cycle later via the
+                // flag2_* commit above (two-cycle flag retirement).
+                default: ;
             endcase
 
             // SAHF and POPF - write destination to EFLAGS
@@ -2801,14 +2911,14 @@ always_ff @(posedge clk) begin
                 end
                 default: begin
                     if (i_first && i.has_modrm && !i.stack_op && !i.has_moffs) begin
-                        IND <= ea_comb;
+                        IND <= ea_reg;
                     end
                 end
             endcase
 
             // Register EA for ALU path (breaks EA → ALU critical path)
             if (i_first && i.has_modrm)
-                ea_r <= ea_comb;
+                ea_r <= ea_reg;
         end
     end
 end
@@ -2953,6 +3063,7 @@ end
 // ALU
 //=============================================================================
 wire [31:0] alu_flags;
+wire        alu_zsp_update;
 
 // Derive control signals from ALU opcode
 // INC=11000, DEC=11001, INC2=11100, DEC2=11101: all have op[4:3]==11 && op[1]==0
@@ -3017,8 +3128,114 @@ alu u_alu (
     .flags(EFLAGS),
     .update_carry(alu_update_carry),
     .result(alu_result),
-    .flags_out(alu_flags)
+    .flags_out(alu_flags),
+    .zsp_update(alu_zsp_update)
 );
+
+//=============================================================================
+// Two-cycle ALU flag retirement
+//=============================================================================
+// The ZF/SF/PF extraction (32-bit zero-reduce + size muxes + flag select)
+// was the tail of the worst timing cone (operand mux -> ALU -> flag tree ->
+// EFLAGS).  Cycle 1 registers the raw result and the cheap carry-chain
+// flags (CF/AF/OF); cycle 2 derives ZF/SF/PF and commits to EFLAGS and
+// uc_flags.  Microcode audit (doc/0.3): no consumer reads ALU-class flags
+// the cycle after the producer — every instruction ends with RNI plus a
+// delay slot, and the micro-jumps JG/JNC/JNO sit >=2 uops after internal
+// ALU producers.  Shift/BITTST CF stays single-cycle (BSR loop consumes
+// shifter CF at +1); shift flag writes are unchanged.
+reg        flag2_eflags_p;     // commit to EFLAGS this cycle (producer had uc[37])
+reg        flag2_ucflags_p;    // commit to uc_flags this cycle
+reg [31:0] flag2_result_r;     // raw ALU result of the producer
+reg        flag2_cf_r, flag2_af_r, flag2_of_r, flag2_zsp_r;
+reg [1:0]  flag2_size_r;
+wire flag2_class_uc = (uc_aluop == ALUJMP_ALU)    || (uc_aluop == ALUJMP_INCDEC) ||
+                      (uc_aluop == ALUJMP_CMPTST) || (uc_aluop == ALUJMP_AND)    ||
+                      (uc_aluop == ALUJMP_OR)     || (uc_aluop == ALUJMP_XOR)    ||
+                      (uc_aluop == ALUJMP_ADD)    || (uc_aluop == ALUJMP_ADC)    ||
+                      (uc_aluop == ALUJMP_SUB)    || (uc_aluop == ALUJMP_CMP)    ||
+                      (uc_aluop == ALUJMP_AAAAAS) || (uc_aluop == ALUJMP_DAADAS);
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        flag2_eflags_p  <= 1'b0;
+        flag2_ucflags_p <= 1'b0;
+    end else begin
+        flag2_eflags_p  <= uc_exec && alu_update_flags;
+        flag2_ucflags_p <= uc_exec && flag2_class_uc;
+        if (uc_exec && flag2_class_uc) begin
+            flag2_result_r <= alu_result;
+            flag2_cf_r     <= alu_flags[0];
+            flag2_af_r     <= alu_flags[4];
+            flag2_of_r     <= alu_flags[11];
+            flag2_zsp_r    <= alu_zsp_update;
+            flag2_size_r   <= op_size;
+        end
+    end
+end
+wire flag2_zf = (flag2_size_r == 2'd0) ? (flag2_result_r[7:0]  == 8'h0)  :
+                (flag2_size_r == 2'd1) ? (flag2_result_r[15:0] == 16'h0) :
+                                         (flag2_result_r       == 32'h0);
+wire flag2_sf = (flag2_size_r == 2'd0) ? flag2_result_r[7]  :
+                (flag2_size_r == 2'd1) ? flag2_result_r[15] :
+                                         flag2_result_r[31];
+wire flag2_pf = ~^flag2_result_r[7:0];
+
+//=============================================================================
+// Two-cycle shifter flag retirement
+//=============================================================================
+// After the ALU two-cycle and the early EA, the barrel shifter -> CF/OF ->
+// EFLAGS path is the dominant WNS cone (shift_in -> ShiftRight0 -> EFLAGS).
+// Retire the architectural shift flags one cycle later: SHIFT2 registers the
+// final CF/OF/ZF/SF/PF values here, the EFLAGS/uc_flags commit applies them
+// next cycle.  The micro-jump path (BSR/BSF loop's JNC reads uc_flags[0] at
+// distance 1) keeps its single-cycle uc_flags[0] <= shift_cf write, which
+// wins over this commit in loop cycles (program-order, later in the block).
+reg sh2_commit_p, sh2_we_zsp, sh2_we_of;
+reg sh2_cf, sh2_of, sh2_zf, sh2_sf, sh2_pf;
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        sh2_commit_p <= 1'b0;
+    else begin
+        sh2_commit_p <= uc_exec && (uc_aluop == ALUJMP_SHIFT2) && (shift_size != 5'd0);
+        if (uc_exec && (uc_aluop == ALUJMP_SHIFT2) && (shift_size != 5'd0)) begin
+            sh2_we_zsp <= shift_SET_Nzs;
+            sh2_pf <= shift_pf;
+            sh2_zf <= shift_zf;
+            sh2_sf <= shift_sf;
+            sh2_we_of <= 1'b0;
+            if (instr_is_shxd) begin
+                sh2_cf <= i.opcode[3] ? shift_last_out_lsb : shift_last_out_msb;
+                if (shift_size == 5'd1) begin
+                    sh2_we_of <= 1'b1;
+                    sh2_of <= i.opcode[3] ? (shift_result[width-1] ^ shift_result[width-2]) :
+                                            (shift_result[width-1] ^ shift_last_out_msb);
+                end
+            end else begin
+                case (shift_op)
+                    SHL,SAL: sh2_cf <= shift_overflow ? (shift_eq_width ? shift_eq_cf : 1'b0) : shift_last_out_msb;
+                    RCL:     sh2_cf <= shift_last_out_msb;
+                    SHR:     sh2_cf <= shift_overflow ? (shift_eq_width ? shift_eq_cf : 1'b0) : shift_last_out_lsb;
+                    SAR:     sh2_cf <= shift_overflow ? shift_result[width-1] : shift_last_out_lsb;
+                    RCR:     sh2_cf <= shift_last_out_lsb;
+                    ROL:     sh2_cf <= shift_result[0];
+                    ROR:     sh2_cf <= shift_result[width-1];
+                endcase
+                if (shift_size == 5'd1) begin
+                    case (shift_op)
+                        SHL:     begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_last_out_msb; end
+                        SHR:     begin sh2_we_of <= 1'b1; sh2_of <= shift_lo[width-1]; end
+                        SAR:     begin sh2_we_of <= 1'b1; sh2_of <= 1'b0; end
+                        ROR,RCR: begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_result[width-2]; end
+                        default: ;
+                    endcase
+                end
+                // ROL/RCL: OF computed for ALL counts (real 386 behavior)
+                if (shift_op == ROL) begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_result[0]; end
+                if (shift_op == RCL) begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_last_out_msb; end
+            end
+        end
+    end
+end
 
 //=============================================================================
 // Barrel Shifter Unit
@@ -3703,18 +3920,41 @@ function automatic [31:0] onehot_gpr_mux(input [7:0] sel);
     endcase
 endfunction
 
+// One-hot GPR read with delay-slot write bypass for the early EA.  When the
+// in-flight delay-slot uop writes the selected GPR, overlay dest_value per the
+// write width (dly_gpr_*), reproducing the value that lands at i_first.
+function automatic [31:0] fwd_onehot_gpr(input [7:0] onehot);
+    reg [31:0] cur;
+    reg [2:0]  idx;
+    cur = onehot_gpr_mux(onehot);
+    idx = onehot[1] ? 3'd1 : onehot[2] ? 3'd2 : onehot[3] ? 3'd3 :
+          onehot[4] ? 3'd4 : onehot[5] ? 3'd5 : onehot[6] ? 3'd6 :
+          onehot[7] ? 3'd7 : 3'd0;
+    if (dly_gpr_we && (onehot != 8'h00) && (dly_gpr_sel == idx))
+        case (dly_gpr_mode)
+            FWD_BLO: fwd_onehot_gpr = {cur[31:8],  dest_value[7:0]};
+            FWD_BHI: fwd_onehot_gpr = {cur[31:16], dest_value[7:0], cur[7:0]};
+            FWD_W:   fwd_onehot_gpr = {cur[31:16], dest_value[15:0]};
+            default: fwd_onehot_gpr = dest_value;  // FWD_D
+        endcase
+    else
+        fwd_onehot_gpr = cur;
+endfunction
+
 // EA calculation using pre-decoded one-hot control signals
-function automatic [31:0] calc_ea(
-    input [7:0] base_sel, input [7:0] index_sel,
-    input [1:0] scale, input [31:0] disp,
-    input has_base, input has_index, input has_disp, input is_16bit, input scale_to_base);
+// Address math given already-read base/index register values.  Shared by
+// calc_ea (GPRs read directly) and the early forwarded EA (GPRs read with
+// delay-slot bypass).
+function automatic [31:0] calc_ea_core(
+    input [31:0] base_in, input [31:0] index_in,
+    input [1:0] scale, input [31:0] disp, input is_16bit, input scale_to_base);
 
     reg [31:0] base_val;
     reg [31:0] index_val;
     reg [31:0] scaled_val;
 
-    base_val = onehot_gpr_mux(base_sel);
-    index_val = onehot_gpr_mux(index_sel);
+    base_val = base_in;
+    index_val = index_in;
 
     // Apply scale (to index normally, to base if scale_to_base)
     if (scale_to_base) begin
@@ -3736,9 +3976,17 @@ function automatic [31:0] calc_ea(
         endcase
     end
 
-    calc_ea = base_val + scaled_val + disp;
+    calc_ea_core = base_val + scaled_val + disp;
     if (is_16bit)
-        calc_ea = {16'h0, calc_ea[15:0]};
+        calc_ea_core = {16'h0, calc_ea_core[15:0]};
+endfunction
+
+function automatic [31:0] calc_ea(
+    input [7:0] base_sel, input [7:0] index_sel,
+    input [1:0] scale, input [31:0] disp,
+    input has_base, input has_index, input has_disp, input is_16bit, input scale_to_base);
+    calc_ea = calc_ea_core(onehot_gpr_mux(base_sel), onehot_gpr_mux(index_sel),
+                           scale, disp, is_16bit, scale_to_base);
 endfunction
 
 endmodule
