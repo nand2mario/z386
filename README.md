@@ -1,7 +1,7 @@
 
 # z386 - an 80386-class FPGA CPU built around original microcode
 
-z386 is a compact 80386-compatible CPU core written in SystemVerilog and built around the original Intel 386 microcode. Instead of implementing each x86 instruction as a separate RTL behavior, z386 implements the hardware structures the microcode expects to control: instruction prefetch, decode, the microcode sequencer, segmentation, paging, protection checks, ALU, shifter, and bus access.
+z386 is an 80386-compatible CPU core written in SystemVerilog and built around the original Intel 386 microcode. Instead of implementing each x86 instruction as a separate RTL behavior, z386 implements the hardware structures the microcode expects to control: instruction prefetch, decode, the microcode sequencer, segmentation, paging, protection checks, ALU, shifter, and bus access.
 
 The project is intended as an educational reconstruction, a usable MiSTer PC core, and a reusable embedded x86 CPU core.
 
@@ -11,12 +11,14 @@ Comparison with ao486 on a DE10-Nano:
 
 |     | z386 | ao486 |
 |-----|------|-------|
-|Lines of code by `cloc` | 8K | 17.6K |
-|ALUTs| 18K  | 21K   |
-|Registers| 5K | 6.5K |
-|BRAM| 116K | 131K |
+|Lines of code by `cloc` | 12.8K | 17.6K |
+|ALMs| 15.7K | 15.9K |
+|Registers| 9.1K | 9.4K |
+|BRAM| 398K | 131K |
 |Frequency| 85 MHz | 90 MHz |
-|DOOM FPS (max details)| 16.5 | 21.0 |
+|DOOM FPS (max details)| 19.2 | 21.0 |
+
+z386's BRAM is ~76% L1 cache (16 KB instruction + 16 KB data, twice ao486's caches) and ~24% the microcode ROM (37 bits × 2560 entries). The L1 cache size is tunable via the `SET_BITS` parameter.
 
 To learn more about the 80386 microcode, read [80386 microcode disassembled](https://www.reenigne.org/blog/80386-microcode-disassembled/).
 
