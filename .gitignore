@@ -1,0 +1,19 @@
+# build / sim artifacts
+obj_dir/
+*.vcd
+*.fst
+*.log
+# test outputs
+tests/*.lst
+tests/protected_mode_tests/*.lst
+tests/protected_mode_tests/traces/
+tests/result.txt
+tests/real.log
+tests/singlestep_real/
+tests/singlestep_protected/
+tests/test386.asm/
+tests/dhrystone/build/
+__pycache__/
+# microcode/rom copied into tests/ by prepare.sh
+tests/ucode*.hex
+tests/pla_entry_rom.hex
