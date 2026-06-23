@@ -39,7 +39,6 @@ module segmentation_unit
                                            // (keeps the 4-bit compare out of the stall/uc_exec cone)
     output reg         is_dtable,          // Accessing GDT/IDT
     output reg         descsw_mode,        // Cross-privilege stack switch active
-    output reg         stack_push_mode,    // Stack push direction active
     output reg         tss_access_flag,    // TSS access flag (for JTSSAF)
 
     // Address translation — offset → linear address + fault check
@@ -52,12 +51,15 @@ module segmentation_unit
     input              is_mem_op,          // Memory operation (needs limit check)
     input              is_write,           // Write operation (needs writable check)
 
-    output     [31:0]  linear_addr,        // Linear address = base + offset
+    output     [31:0]  seg_base_pending,   // Next seg_base_r (this cycle's pending base),
+                                           // so z386 can pre-register linear_address = base+IND
+    output             eff_mask_pending,   // Next (addr_size || is_dtable): 0 => mask offset to 16b
     output             seg_fault,          // Segment limit/protection fault
     output             is_stack_fault      // Fault is on SS (→ #SS not #GP)
 );
 
 reg [3:0]   desc_write_seg;     // Tracks target segment for SDES/SDEL
+reg         stack_push_mode;    // Stack push direction active (internal; demoted from output)
 reg         dt_target_idt;      // Tracks GDTR vs IDTR for SBAS/SLIM_TABLE
 reg         addr_size;          // 1=32-bit, 0=16-bit effective address
 reg [31:0]  seg_base_r;         // Registered segment base
@@ -73,18 +75,55 @@ wire [31:0] SS_base = seg_cache[SEG_SS].base;
 wire [31:0] DS_base = seg_cache[SEG_DS].base;
 wire [31:0] FS_base = seg_cache[SEG_FS].base;
 wire [31:0] GS_base = seg_cache[SEG_GS].base;
-
-wire [31:0] seg_base = (seg_sel == SEG_ES) ? ES_base :
-                       (seg_sel == SEG_CS) ? CS_base :
-                       (seg_sel == SEG_SS) ? (descsw_mode ? CS_base : SS_base) :
-                       (seg_sel == SEG_DS) ? DS_base :
-                       (seg_sel == SEG_FS) ? FS_base :
-                       (seg_sel == SEG_GS) ? GS_base :
-                       (seg_sel == SEG_TR) ? seg_cache[SEG_TR].base :
-                       32'h0;  // IO/IDT/GDT: no base offset
+// (the old seg_sel-keyed `seg_base` combinational mux was dead -- seg_base_r is
+//  driven from seg_base_for(seg_target); removed to recover the 6-way mux.)
 
 wire [31:0] eff_offset = (addr_size || is_dtable) ? offset : {16'h0, offset[15:0]};
-assign linear_addr = seg_base_r + eff_offset;
+
+// Pending base: the value seg_base_r will hold next cycle.  Mirrors exactly the
+// seg_base_r next-state in the always_ff below (same precedence: stssaf override,
+// then the case wins for INIT/UPDATE/DESCSW).  Lets z386 pre-register
+// linear_address = seg_base_pending + ind_next at the IND-setting busop, taking
+// the seg-adder off the live-TLB cone.
+reg [31:0] seg_base_pending_c;
+reg        addr_size_pending_c;
+reg        is_dtable_pending_c;
+always_comb begin
+    seg_base_pending_c  = seg_base_r;         // hold when no command
+    addr_size_pending_c = addr_size;
+    is_dtable_pending_c = is_dtable;
+    if (seg_cmd_valid) begin
+        if (stssaf_pulse && seg_sel == SEG_SS)
+            seg_base_pending_c = SS_base;      // (does not change addr_size/is_dtable)
+        case (seg_cmd)
+            SEG_CMD_INIT_SEG: begin
+                seg_base_pending_c  = seg_base_for(seg_target, 1'b0);
+                addr_size_pending_c = (seg_data[1] && pe) ? seg_cache[SEG_SS].D_B : seg_data[0];
+                is_dtable_pending_c = 1'b0;
+            end
+            SEG_CMD_UPDATE_SEG: begin
+                is_dtable_pending_c = (seg_target == SEG_IDT || seg_target == SEG_GDT);
+                if (seg_data[0]) begin
+                    seg_base_pending_c  = seg_base_for(seg_target, 1'b0);
+                    addr_size_pending_c = pe ? seg_cache[SEG_SS].D_B : i_addr32_r;
+                end else begin
+                    seg_base_pending_c  = seg_base_for(seg_target, descsw_mode);
+                    addr_size_pending_c = ((i_stack_op_r || stack_push_mode) && pe && seg_target == SEG_SS)
+                                          ? (descsw_mode ? seg_cache[SEG_CS].D_B : seg_cache[SEG_SS].D_B)
+                                          : i_addr32_r;
+                end
+            end
+            SEG_CMD_DESCSW: begin
+                seg_base_pending_c  = CS_base;
+                addr_size_pending_c = pe ? seg_cache[SEG_CS].D_B : i_addr32_r;
+                is_dtable_pending_c = 1'b0;
+            end
+            default: ;                         // SPCR/others: keep stssaf-or-hold
+        endcase
+    end
+end
+assign seg_base_pending = seg_base_pending_c;
+assign eff_mask_pending = addr_size_pending_c || is_dtable_pending_c;
 
 assign is_stack_fault = (seg_sel == SEG_SS);
 
@@ -124,6 +163,13 @@ function automatic [31:0] seg_base_for(input [3:0] sel, input dsw);
         SEG_FS: seg_base_for = FS_base;
         SEG_GS: seg_base_for = GS_base;
         SEG_TR: seg_base_for = seg_cache[SEG_TR].base;
+        // Descriptor-table pseudo-segments: the table base is the relocation
+        // base (offset = selector index*8 / IDT offset lives in IND).  GDT vs LDT
+        // is chosen by the selector's TI bit (slctr[2]); all DESSDT accesses
+        // route the selector through SLCTR.
+        SEG_GDT: seg_base_for = slctr[2] ? seg_cache[SEG_LDT].base
+                                         : seg_cache[SEG_GDT].base;
+        SEG_IDT: seg_base_for = seg_cache[SEG_IDT].base;
         default: seg_base_for = 32'h0;
     endcase
 endfunction
@@ -325,6 +371,14 @@ always_ff @(posedge clk) begin
         i_addr32_r <= 1'b0;
         i_stack_op_r <= 1'b0;
     end else if (seg_cmd_valid) begin
+        // seg_base_r / addr_size / is_dtable next-state is computed ONCE in the
+        // always_comb above (seg_base_pending_c / addr_size_pending_c /
+        // is_dtable_pending_c, also exposed as seg_base_pending/eff_mask_pending).
+        // Register it here instead of re-deriving seg_base_for() a 2nd time per
+        // case below -- the mirror already captures the stssaf-then-case precedence.
+        seg_base_r <= seg_base_pending_c;
+        addr_size  <= addr_size_pending_c;
+        is_dtable  <= is_dtable_pending_c;
         // STSSAF/CTSSAF arrive as aluop sidebands so the same uop's busop
         // seg_cmd still executes (608: CTSSAF+SDEL dropped the new-stack
         // limit, leaving a stale CS limit for the gate frame pushes).
@@ -333,10 +387,8 @@ always_ff @(posedge clk) begin
             stack_push_mode <= 1'b0;
             descsw_mode <= 1'b0;
             tss_access_flag <= 1'b1;
-            if (seg_sel == SEG_SS) begin
-                seg_base_r <= SS_base;
+            if (seg_sel == SEG_SS)
                 seg_limit_r <= seg_effective_limit(seg_cache[SEG_SS]);
-            end
         end
         if (ctssaf_pulse)
             tss_access_flag <= 1'b0;
@@ -344,10 +396,7 @@ always_ff @(posedge clk) begin
             SEG_CMD_INIT_SEG: begin
                 seg_sel <= seg_target;
                 seg_is_io <= (seg_target == SEG_IO);
-                is_dtable <= 1'b0;
-                seg_base_r <= seg_base_for(seg_target, 1'b0);
                 seg_limit_r <= seg_limit_for(seg_target, 1'b0);
-                addr_size <= (seg_data[1] && pe) ? seg_cache[SEG_SS].D_B : seg_data[0];
                 i_addr32_r <= seg_data[0];
                 i_stack_op_r <= seg_data[1];
                 stack_push_mode <= 1'b0;
@@ -357,18 +406,10 @@ always_ff @(posedge clk) begin
             SEG_CMD_UPDATE_SEG: begin
                 seg_sel <= seg_target;
                 seg_is_io <= (seg_target == SEG_IO);
-                is_dtable <= (seg_target == SEG_IDT || seg_target == SEG_GDT);
                 if (seg_data[0]) begin
                     descsw_mode <= 1'b0;
-                    addr_size <= pe ? seg_cache[SEG_SS].D_B : i_addr32_r;
-                    seg_base_r <= seg_base_for(seg_target, 1'b0);
                     seg_limit_r <= seg_limit_for(seg_target, 1'b0);
                 end else begin
-                    if ((i_stack_op_r || stack_push_mode) && pe && seg_target == SEG_SS)
-                        addr_size <= descsw_mode ? seg_cache[SEG_CS].D_B : seg_cache[SEG_SS].D_B;
-                    else
-                        addr_size <= i_addr32_r;
-                    seg_base_r <= seg_base_for(seg_target, descsw_mode);
                     seg_limit_r <= seg_limit_for(seg_target, descsw_mode);
                 end
             end
@@ -381,10 +422,7 @@ always_ff @(posedge clk) begin
                 stack_push_mode <= 1'b1;
                 seg_sel <= SEG_SS;
                 seg_is_io <= 1'b0;
-                is_dtable <= 1'b0;
-                addr_size <= pe ? seg_cache[SEG_CS].D_B : i_addr32_r;
                 descsw_mode <= 1'b1;
-                seg_base_r <= CS_base;
                 seg_limit_r <= seg_effective_limit(seg_cache[SEG_CS]);
             end
 
