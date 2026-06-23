@@ -14,7 +14,7 @@ module ucode_rom
     input       [11:0] addr,
     output      [50:0] q_early,
     output      [50:0] q,
-    output      [5:0]  q_shift_source,
+    output      [5:0]  q_shift_source,  // replicated from q[23:18] for shift unit
     output      [5:0]  q_shift_alu_src,
     output      [6:0]  q_shift_aluop
 );
