@@ -95,6 +95,12 @@ reg [31:0] TMPG, TMPH, PROTUN, CSOPCD, FSVeIP, OPROFF;
 reg [31:0] SIGMA;                   // ALU result
 reg [31:0] FLAGSB;                  // FLAGS backup for INT
 
+wire [31:0] OPR_R;                  // Read operand register, owned by the paging unit
+reg [31:0] OPR_W;                   // Bus operation data registers
+reg [31:0] IND;                     // Internal address register
+reg [31:0] ind_linear;              // linear address of IND
+reg        ind_linear_valid;
+
 reg [1:0]  op_size;                 // Runtime operand size: 0=byte, 1=word, 2=dword (modifiable by BITS8/16/32)
 reg [1:0]  op_size_decode;          // Decoded operand size (saved at i_pop, restored by BITSDE)
 reg [1:0]  srcreg_size;             // Same as op_size most of the time, different for MOVZX/MOVSX and etc
@@ -150,6 +156,7 @@ reg [2:0]  latched_pf_code;         // Latched page fault error code (for LPCR m
 reg [31:0] latched_pf_addr;         // Latched faulting linear address (for LPCR microcode access)
 
 wire [31:0] q_window;               // 4-byte aligned window at queue head
+wire [31:0] q_window_next;          // next-cycle window (feeds entry-PLA ROM addr one cycle early)
 wire       pf_full;
 wire       pf_empty;
 wire [5:0] pf_count;                // Prefetch bytes currently buffered
@@ -159,7 +166,8 @@ wire       pe_mode_toggle_now;      // CR0.PE changed this cycle: re-decode next
 reg        uc_ctl_pref;             // Previous-cycle predecode: current uop is BUSOP_PREF
 
 assign pe_mode_toggle_now = uc_exec && (uc_dest == DEST_CR0) && (dest_value[0] != CR0[0]);
-assign q_flush = (uc_exec && uc_ctl_pref && !uc_cond_jump_taken_prev) || pe_mode_toggle_now;
+assign q_flush = (uc_exec && uc_ctl_pref && !uc_cond_jump_taken_prev && !early_redirected)
+               || early_redirect || pe_mode_toggle_now;
 
 wire        page_fault;             // Page fault (declared fully at paging unit instantiation)
 wire [1:0]  prot_cpl;               // CPL for protection unit (declared fully near protection logic)
@@ -221,8 +229,9 @@ assign     i_pop = init_cycle && !stall && !page_fault && !interrupt_at_boundary
 // until the fill completes.
 wire       core_live = !halted && uc_active && !fault_suppress_delay_slot && !interrupt_entry;
 wire       dly_grace_now = mem_dly_grace && uc_p_pure_dly;
-wire       mem_block_busy = (uc_bus_or_dly && !dly_grace_now) || mem_opt_wait; // demand op in flight
-wire       mem_block_idle = uc_busreq && !mem_accepted;                        // uop wants the bus, paging not ready
+wire       posted_write_release = mem_write_dly_grace && !uc_busreq;    // release non-busop writes after one cycle
+wire       mem_block_busy = (uc_bus_or_dly && !dly_grace_now && !posted_write_release) || mem_opt_wait; // demand op in flight
+wire       mem_block_idle = (uc_busreq && !mem_accepted);  // uop wants the bus, paging not ready
 wire       stall_mem = mem_servicing ? mem_block_busy : (mem_req_current && !mem_accepted);
 wire       stall_wio = (uc_is_wio && !interrupt_pending && !single_step);
 wire       stall = stall_mem || stall_wio;
@@ -245,8 +254,8 @@ wire       uc_exec_shift = uc_exec;
 assign     seg_cmd_valid = i_pop || uc_exec;
 
 dec_entry_t i_bus;            // Decoded instruction from decoder module
+wire        decq_has_jmp_call; // decode queue holds a JMP/CALL rel (halt speculative prefetch)
 wire       decq_empty;        // Decoder instruction queue empty
-wire       decq_full;         // Decoder instruction queue full
 
 // The microcode ROM contains 2560 entries of 37-bit ucode + 14-bit predecode
 wire        microcode_rom_ce = !stall && !repeat_active;
@@ -316,7 +325,6 @@ wire [31:0] icache_req_phys_addr;
 wire        icache_req_accepted;
 wire        icache_req_complete;
 wire [127:0] icache_rdata;
-wire        pg_rd_ind_active;
 
 wire [31:0] dcache_cpu_dout;
 wire        dcache_cpu_ready;
@@ -513,13 +521,13 @@ always_ff @(posedge clk) begin
 end
 
 l1_cache #(
-    .PROTECT_UMA_ROM(PROTECT_UMA_ROM)
+    .PROTECT_UMA_ROM(PROTECT_UMA_ROM),
+    .SET_BITS(DCACHE_SET_BITS)
 ) dcache_inst (
     .clk(clk),
     .reset(!reset_n),
 
     .cpu_addr(dcache_req_phys_addr),
-    .cpu_idx(dcache_req_idx),
     .cpu_din(dcache_req_wdata),
     .cpu_dout(dcache_cpu_dout),
     .cpu_be(dcache_req_be),
@@ -544,12 +552,13 @@ l1_cache #(
     .cache_enable(1'b1)
 );
 
-l1_icache icache_inst (
+l1_icache #(
+    .SET_BITS(ICACHE_SET_BITS)
+) icache_inst (
     .clk(clk),
     .reset(!reset_n),
 
     .cpu_addr(icache_req_phys_addr),
-    .cpu_dout(icache_cpu_dout),
     .cpu_line(icache_cpu_line),
     .cpu_valid(icache_req_valid),
     .cpu_ready(icache_cpu_ready),
@@ -578,6 +587,7 @@ prefetch prefetch_inst (
     .reset_n(reset_n),
     // Queue output to decoder
     .q_window(q_window),
+    .q_window_next(q_window_next),
     .q_full(pf_full),
     .q_empty(pf_empty),
     .pf_count(pf_count),
@@ -593,7 +603,8 @@ prefetch prefetch_inst (
     .pf_rdata(pf_rdata),
     .pf_fault(pf_fault),
     // Control
-    .pf_suspend(page_fault)
+    .pf_suspend(page_fault),
+    .halt_speculative(decq_has_jmp_call)
 );
 
 //=============================================================================
@@ -605,25 +616,23 @@ decoder decoder_inst (
 
     // Prefetch queue interface
     .q_window   (q_window),
+    .q_window_next(q_window_next),
     .pf_count   (pf_count),
     .pf_empty   (pf_empty),
     .q_pop_bytes(q_pop_bytes),
 
     // Mode signals
     .D          (D),
-    .mode_32    (pe & ~vm),  // Unused by decoder, kept for port compatibility
     .pe_enable  (pe & ~vm),  // Native protected mode: PE=1 and VM=0 (V86 uses real-mode entry points)
 
     // Control signals
     .q_flush    (q_flush),
     .i_pop      (i_pop),
-    .halted     (halted),
-    .stall      (stall),
 
     // Decoded instruction output
     .i_bus      (i_bus),
     .decq_empty (decq_empty),
-    .decq_full  (decq_full)
+    .decq_has_jmp_call(decq_has_jmp_call)
 );
 
 //=============================================================================
@@ -633,9 +642,9 @@ wire [3:0]  mem_seg_sel;
 wire        mem_seg_is_io;
 wire        descsw_mode;
 wire        mem_is_dtable;
-wire        stack_push_mode;
 wire        tss_access_flag;
-wire [31:0] mem_linear_addr;
+wire [31:0] seg_base_pending;  // next seg_base_r from seg unit; for unified linear_address relocate
+wire        eff_mask_pending;  // next (addr_size||is_dtable) from seg unit; 0 => mask offset to 16b
 wire [31:0] seg_lar_result, seg_llim_result, seg_lbas_result;
 // Internalized: addr_size, mem_seg_base_r, pm_seg_limit_r, mem_seg_base, mem_ea
 
@@ -674,7 +683,6 @@ wire [3:0] init_final_seg = i_bus.stack_op ? init_default_seg :
 // Pre-computed access size for limit check (replaces op_size + is_dword in seg unit)
 wire [1:0] gp_access_adj = (op_size == 2'd0) ? 2'd0 : is_dword ? 2'd3 : 2'd1;
 
-wire [31:0] ind_effective;
 wire        mem_op_eligible, gp_fault_mem_op, gp_fault_wr_op, ss_segment_fault;
 reg         copy_stack_dpl_s2, conform_dpl_s2;
 reg  [1:0]  copy_dpl_s2;
@@ -706,18 +714,18 @@ segmentation_unit seg_unit (
     .seg_is_io        (mem_seg_is_io),
     .is_dtable        (mem_is_dtable),
     .descsw_mode      (descsw_mode),
-    .stack_push_mode  (stack_push_mode),
     .tss_access_flag  (tss_access_flag),
     // Address translation
     .pe               (pe),
     .vm               (vm),
     .cpl              (cpl),
-    .offset           (ind_effective),
+    .offset           (IND),
     .access_size      (gp_access_adj),
     .check_en         (mem_op_eligible),
     .is_mem_op        (gp_fault_mem_op),
     .is_write         (gp_fault_wr_op),
-    .linear_addr      (mem_linear_addr),
+    .seg_base_pending (seg_base_pending),
+    .eff_mask_pending (eff_mask_pending),
     .seg_fault        (gp_fault_trigger),
     .is_stack_fault   (ss_segment_fault)
 );
@@ -799,44 +807,13 @@ end  // always_comb
 // Paging Unit
 //=============================================================================
 
-// Entry-point predecode used one cycle before i_pop: suppress prefetch when the
-// next instruction's first uop is a demand read.  The table is generated from
-// pla_entry.svh outputs intersected with ucode predecode bit39=mem and bit40=not-write.
-function automatic logic entry_first_is_read_busop(input [11:0] entry);
-    case (entry)
-        12'h00B, 12'h00F, 12'h019, 12'h027,
-        12'h02C, 12'h031, 12'h035, 12'h039,
-        12'h04A, 12'h04E, 12'h06F, 12'h072,
-        12'h07C, 12'h081, 12'h091, 12'h097,
-        12'h09F, 12'h0A2, 12'h0A7, 12'h0AC,
-        12'h0B1, 12'h0BB, 12'h0C2, 12'h0C9,
-        12'h0D0, 12'h108, 12'h10C, 12'h11E,
-        12'h124, 12'h12A, 12'h12D, 12'h12F,
-        12'h142, 12'h160, 12'h177, 12'h184,
-        12'h1AF, 12'h1BD, 12'h1C1, 12'h1CF,
-        12'h1E1, 12'h1EB, 12'h1F3, 12'h2DA,
-        12'h2F5, 12'h2FC, 12'h6AA, 12'h6E4,
-        12'h6EA, 12'h700, 12'h706, 12'h803,
-        12'h818:
-            entry_first_is_read_busop = 1'b1;
-        default:
-            entry_first_is_read_busop = 1'b0;
-    endcase
-endfunction
-
-// Memory operation detection — pre-computed in ROM bits 39-43
-wire pg_mem_busop    = uc_is_mem_busop;
-wire pg_is_write     = uc_is_write;
-wire pg_is_check_write = uc_is_check_write;
-wire pg_is_word_op   = uc_is_word_op;
-wire pg_is_dword_op  = uc_is_dword_op;
 // WR W / RD W access width = |IND_DELTA| (the stack/TSS slot stride)
 wire ind_delta_dword = (IND_DELTA == 32'd4) || (IND_DELTA == -32'd4);
-wire [1:0] mem_eff_size = pg_is_word_op ? (ind_delta_dword ? 2'd2 : 2'd1) :
-                          pg_is_dword_op ? 2'd2 : op_size;
+wire [1:0] mem_eff_size = uc_is_word_op ? (ind_delta_dword ? 2'd2 : 2'd1) :
+                          uc_is_dword_op ? 2'd2 : op_size;
 
 wire [31:0] mem_wdata = (uc_buscode == BUSOP_WR_OPR) ? OPR_R :
-    pg_is_word_op ? read_uc_source(uc_source) :
+    uc_is_word_op ? read_uc_source(uc_source) :
     (uc_dest == DEST_OPR_W) ? (stack_init_pending ? read_uc_source(uc_source) : dest_value) :
     OPR_W;
 
@@ -892,20 +869,17 @@ reg         gp_fault_r;
 reg         ss_fault_r;
 
 wire        mem_req_to_paging = mem_req_current && !gp_fault_trigger;
-wire        mem_write_now = pg_is_write || (io_busop_wr && mem_is_io);
+wire        mem_write_now = uc_is_write || (io_busop_wr && mem_is_io);
 wire [3:0]  mem_be_now = iack_busop ? 4'b1111 :
-                          calc_be(mem_eff_size, mem_linear_addr[1:0]);
-wire [31:0] paging_linear_addr = iack_busop ? IND : mem_linear_addr;
-wire [1:0]  paging_mem_eff_size = mem_eff_size;
-wire        paging_mem_write = mem_write_now;
-wire [31:0] paging_mem_wdata = mem_wdata;
+                          calc_be(mem_eff_size, ind_linear[1:0]);
+// ind_linear already prefers linear_early for the demand read (see above),
+// so the cache/byte-enables/paging all get the seg-add-free linear from here.
+// One registered linear for both the demand path and the live TLB (iack uses IND).
+wire [31:0] paging_linear_addr = iack_busop ? IND : ind_linear;
+wire        paging_live_valid  = iack_busop ? 1'b1 : ind_linear_valid;
 wire        paging_mem_rd_ind = (uc_buscode == BUSOP_RD_IND);
-wire        paging_is_write_access = pg_is_write || pg_is_check_write;
-wire        paging_mem_check_only = pg_is_check_write;
-wire [1:0]  paging_cpl = pg_cpl;
-wire        paging_mem_is_io = mem_is_io;
-wire        paging_mem_is_inta = iack_busop;
-wire [3:0]  paging_mem_be = mem_be_now;
+wire        paging_is_write_access = uc_is_write || uc_is_check_write;
+wire        mem_ea_read = i_first && instr_ind_is_ea;
 
 // Paging unit instantiation
 paging_unit paging_inst (
@@ -917,24 +891,27 @@ paging_unit paging_inst (
 
     // Memory/IO request: current RD/WR/IACK uop is held by stall until accepted.
     .mem_req            (mem_req_to_paging),
-    .mem_lookup_valid   (mem_req_current),
+    .mem_ea_read        (mem_ea_read),       // modrm/stack/moffs reads SET-read (linear relocated at i_pop); microcode IND reads excluded
+    .mem_req_precheck   (mem_req_current),
     .mem_req_upcoming   (mem_req_upcoming),      // suppresses prefetch start to minimize contention
     .mem_accepted       (mem_accepted),     // ready: request accepted this cycle
     .mem_servicing      (mem_servicing),
     .mem_complete_now   (mem_complete_now), // combinational: bus op completing this cycle
     .mem_dly_grace      (mem_dly_grace),
+    .mem_write_dly_grace(mem_write_dly_grace),
     .mem_opt_wait       (mem_opt_wait),
     .linear_addr        (paging_linear_addr),
-    .mem_op_size        (paging_mem_eff_size),
-    .mem_write          (paging_mem_write),
-    .mem_wdata          (paging_mem_wdata),
+    .live_valid         (paging_live_valid),
+    .mem_op_size        (mem_eff_size),
+    .mem_write          (mem_write_now),
+    .mem_wdata          (mem_wdata),
     .mem_rd_ind         (paging_mem_rd_ind),
     .is_write_access    (paging_is_write_access),
-    .mem_check_only     (paging_mem_check_only),
-    .cpl                (paging_cpl),
-    .mem_is_io          (paging_mem_is_io),
-    .mem_is_inta        (paging_mem_is_inta),
-    .mem_be             (paging_mem_be),
+    .mem_check_only     (uc_is_check_write),
+    .cpl                (pg_cpl),
+    .mem_is_io          (mem_is_io),
+    .mem_is_inta        (iack_busop),
+    .mem_be             (mem_be_now),
 
     // Prefetch (toggle protocol)
     .pf_req_toggle      (pf_req_toggle),
@@ -947,7 +924,6 @@ paging_unit paging_inst (
     // Demand-side physical request interface
     .dcache_req_valid   (dcache_req_valid),
     .dcache_req_phys_addr(dcache_req_phys_addr),
-    .dcache_req_idx     (dcache_req_idx),
     .dcache_req_write   (dcache_req_write),
     .dcache_req_be      (dcache_req_be),
     .dcache_req_wdata   (dcache_req_wdata),
@@ -970,8 +946,7 @@ paging_unit paging_inst (
     // Status
     .page_fault         (page_fault),
     .fault_code         (pg_fault_code),
-    .cr2_out            (pg_cr2_out),
-    .rd_ind_active      (pg_rd_ind_active)
+    .cr2_out            (pg_cr2_out)
 );
 
 always_ff @(posedge clk) begin
@@ -1147,6 +1122,214 @@ always_ff @(posedge clk) begin
 end
 
 //=============================================================================
+// EARLY-START  --  EA decode, relocate, and required forwarding to start 
+//                  memory operations at i_pop
+//=============================================================================
+
+// Combinational EA-operand decode
+logic [7:0]  ea_dec_base_sel, ea_dec_index_sel;
+logic [1:0]  ea_dec_scale;
+logic [31:0] ea_dec_disp;
+logic        ea_dec_is_16bit, ea_dec_scale_to_base;
+
+// EA predecode for early EA computation at i_pop.
+always_comb begin
+    // Defaults (also the "no modrm / has moffs" case)
+    ea_dec_base_sel  = 8'h00;
+    ea_dec_index_sel = 8'h00;
+    ea_dec_scale     = 2'b00;
+    ea_dec_is_16bit  = 1'b0;
+    ea_dec_scale_to_base = 1'b0;
+    ea_dec_disp      = 32'h0;
+    if (i_bus.has_modrm && !i_bus.has_moffs) begin
+        if (i_bus.addr32) begin
+            // 32-bit addressing mode
+            ea_dec_base_sel  = decode_base_register_32(i_bus.modrm, i_bus.sib, i_bus.has_sib);
+            ea_dec_index_sel = decode_index_register_32(i_bus.sib, i_bus.has_sib);
+            ea_dec_scale     = i_bus.has_sib ? i_bus.sib[7:6] : 2'b00;
+            ea_dec_scale_to_base = i_bus.has_sib && (i_bus.sib[5:3] == 3'b100);  // No index, scale to base
+            ea_dec_is_16bit  = 1'b0;
+        end else begin
+            // 16-bit addressing mode
+            ea_dec_base_sel  = ea_regs_16[7:0];   // First register
+            ea_dec_index_sel = ea_regs_16[15:8];  // Second register
+            ea_dec_scale     = 2'b00;  // No scaling in 16-bit mode
+            ea_dec_scale_to_base = 1'b0;
+            ea_dec_is_16bit  = 1'b1;
+        end
+
+        // Displacement value (sign-extend disp8, use full disp16/disp32)
+        begin
+            automatic logic [31:0] disp_val;
+            if (i_bus.modrm[7:6] == 2'b01)
+                // disp8 - sign extend
+                disp_val = {{24{i_bus.displacement[7]}}, i_bus.displacement[7:0]};
+            else if (i_bus.modrm[7:6] == 2'b10)
+                // disp16 or disp32
+                disp_val = i_bus.addr32 ? i_bus.displacement : {{16{i_bus.displacement[15]}}, i_bus.displacement[15:0]};
+            else
+                // disp32 for [disp32] or [disp16] modes (mod=00, special rm)
+                disp_val = i_bus.addr32 ? i_bus.displacement : {16'h0, i_bus.displacement[15:0]};
+
+            // POP r/m (8F) with ESP base: Intel 386 says EA uses post-increment ESP.
+            if (i_bus.opcode == 8'h8F && i_bus.addr32 && i_bus.has_sib && i_bus.sib[2:0] == 3'b100) begin
+                disp_val = disp_val + (i_bus.data32 ? 32'd4 : 32'd2);
+            end
+            ea_dec_disp = disp_val;
+        end
+        // Zero ea_disp when not used
+        if (i_bus.modrm[7:6] == 2'b00 || i_bus.modrm[7:6] == 2'b11) begin
+            if (i_bus.addr32) begin
+                // 32-bit: special rm is rm=101 (non-SIB) or sib_base=101 (SIB)
+                if (i_bus.has_sib && i_bus.modrm[2:0] == 3'b100) begin
+                    if (i_bus.sib[2:0] != 3'b101)
+                        ea_dec_disp = 32'h0;  // SIB, no disp32
+                end else begin
+                    if (i_bus.modrm[2:0] != 3'b101)
+                        ea_dec_disp = 32'h0;  // Non-SIB, no disp32
+                end
+            end else begin
+                // 16-bit: special rm is rm=110
+                if (i_bus.modrm[2:0] != 3'b110)
+                    ea_dec_disp = 32'h0;
+            end
+        end
+    end
+end
+
+wire delay_slot_writes_esp = i_rni_delay && (uc_dest == DEST_eSP || uc_dest == DEST_ESP ||
+                                              (uc_dest == DEST_DSTREG && i.dst_reg_sel == 4 && op_size != 2'd0) ||
+                                              (uc_dest == DEST_SRCREG && i.src_reg_sel == 4 && op_size != 2'd0));
+wire [31:0] forwarded_esp = delay_slot_writes_esp ? dest_value : ESP;
+
+// Delay-slot GPR write descriptor for early-EA forwarding (which GPR the
+// delay-slot uop writes, and how)
+localparam [1:0] FWD_BLO = 2'd0, FWD_BHI = 2'd1, FWD_W = 2'd2, FWD_D = 2'd3;
+
+// {we, sel[2:0], mode[1:0]} for a delay-slot write to microcode dest `dest`.
+// IRF is included here for the reference; the functional path overrides IRF's
+// COUNTR-derived fields with the live COUNTR.
+function automatic [5:0] decode_dly_gpr(input [6:0] dest);
+    reg       we; reg [2:0] sel; reg [1:0] mode; reg [2:0] rs;
+    begin
+        we = 1'b0; sel = 3'd0; mode = FWD_D;
+        case (dest)
+            DEST_DSTREG, DEST_SRCREG: begin
+                rs = (dest == DEST_DSTREG) ? i.dst_reg_sel : i.src_reg_sel;
+                we = 1'b1;
+                if (op_size == 2'd0) begin               // byte: rs[2]=high-byte, rs[1:0]=GPR
+                    sel  = {1'b0, rs[1:0]};
+                    mode = rs[2] ? FWD_BHI : FWD_BLO;
+                end else begin
+                    sel  = rs;
+                    mode = (op_size == 2'd1) ? FWD_W : FWD_D;
+                end
+            end
+            DEST_EAX, DEST_ECX, DEST_EDX, DEST_EBX,
+            DEST_ESP, DEST_EBP, DEST_ESI, DEST_EDI:
+                begin we = 1'b1; sel = dest[2:0]; mode = FWD_D; end
+            DEST_eSP:
+                begin we = 1'b1; sel = 3'd4;
+                      mode = (pe && seg_cache[SEG_SS].D_B) ? FWD_D : FWD_W; end
+            DEST_AX, DEST_CX, DEST_DX, DEST_BX, DEST_SP, DEST_BP, DEST_SI, DEST_DI:
+                begin we = 1'b1; sel = dest[2:0]; mode = FWD_W; end
+            DEST_AL, DEST_CL, DEST_DL, DEST_BL:
+                begin we = 1'b1; sel = {1'b0, dest[1:0]}; mode = FWD_BLO; end
+            DEST_AH, DEST_CH, DEST_DH, DEST_BH:
+                begin we = 1'b1; sel = {1'b0, dest[1:0]}; mode = FWD_BHI; end
+            DEST_eAX_AL:
+                begin we = 1'b1; sel = 3'd0;
+                      mode = (op_size == 2'd0) ? FWD_BLO : (op_size == 2'd1) ? FWD_W : FWD_D; end
+            DEST_eDX_AH: begin
+                we = 1'b1;
+                if (op_size == 2'd0) begin sel = 3'd0; mode = FWD_BHI; end  // AH
+                else begin sel = 3'd2; mode = (op_size == 2'd1) ? FWD_W : FWD_D; end
+            end
+            DEST_eCX: begin we = 1'b1; sel = 3'd1; mode = i.addr32 ? FWD_D : FWD_W; end
+            DEST_eSI: begin we = 1'b1; sel = 3'd6; mode = i.addr32 ? FWD_D : FWD_W; end
+            DEST_eDI: begin we = 1'b1; sel = 3'd7; mode = i.addr32 ? FWD_D : FWD_W; end
+            DEST_IRF: if (COUNTR[5:3] != 3'b100)
+                begin we = 1'b1; sel = COUNTR[2:0]; mode = is_dword ? FWD_D : FWD_W; end
+            default: ;
+        endcase
+        decode_dly_gpr = {we, sel, mode};
+    end
+endfunction
+
+// Predecode from uc_next (the microword that becomes uc next cycle); register on
+// the same enable as uc so dly_gpr_*_pre_r tracks decode_dly_gpr(uc_dest).
+wire [5:0] dly_gpr_pre   = decode_dly_gpr(uc_next[30:24]);
+wire       dly_is_irf_pre = (uc_next[30:24] == DEST_IRF);
+reg        dly_gpr_we_pre_r;
+reg [2:0]  dly_gpr_sel_pre_r;
+reg [1:0]  dly_gpr_mode_pre_r;
+reg        dly_is_irf_pre_r;
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        dly_gpr_we_pre_r <= 1'b0; dly_gpr_sel_pre_r <= 3'd0;
+        dly_gpr_mode_pre_r <= FWD_D; dly_is_irf_pre_r <= 1'b0;
+    end else if (microcode_rom_ce) begin
+        dly_gpr_we_pre_r   <= dly_gpr_pre[5];
+        dly_gpr_sel_pre_r  <= dly_gpr_pre[4:2];
+        dly_gpr_mode_pre_r <= dly_gpr_pre[1:0];
+        dly_is_irf_pre_r   <= dly_is_irf_pre;
+    end
+end
+
+// Functional descriptor: registered predecode, IRF index taken live from COUNTR.
+wire       dly_gpr_we   = i_rni_delay &&
+                          (dly_is_irf_pre_r ? (COUNTR[5:3] != 3'b100) : dly_gpr_we_pre_r);
+wire [2:0] dly_gpr_sel  = dly_is_irf_pre_r ? COUNTR[2:0]              : dly_gpr_sel_pre_r;
+wire [1:0] dly_gpr_mode = dly_is_irf_pre_r ? (is_dword ? FWD_D : FWD_W) : dly_gpr_mode_pre_r;
+
+// EA decode registered at i_entry.  decq[0]/i_bus is stable from i_entry through
+// i_pop (i_entry requires !decq_empty and the queue isn't popped until i_pop), so
+// latching the EA decode one cycle early moves the modrm->ea_dec logic off the
+// i_pop EA path -- modrm->IND was the top clk_sys setup path.
+reg [7:0]  ea_dec_base_sel_r, ea_dec_index_sel_r;
+reg [1:0]  ea_dec_scale_r;
+reg [31:0] ea_dec_disp_r;
+reg        ea_dec_is_16bit_r, ea_dec_scale_to_base_r;
+always_ff @(posedge clk) begin
+    if (i_entry) begin
+        ea_dec_base_sel_r      <= ea_dec_base_sel;
+        ea_dec_index_sel_r     <= ea_dec_index_sel;
+        ea_dec_scale_r         <= ea_dec_scale;
+        ea_dec_disp_r          <= ea_dec_disp;
+        ea_dec_is_16bit_r      <= ea_dec_is_16bit;
+        ea_dec_scale_to_base_r <= ea_dec_scale_to_base;
+    end
+end
+
+// Early forwarded EA computed at i_pop, from the i_entry-registered EA decode.
+wire [31:0] ea_early = calc_ea_core(fwd_onehot_gpr(ea_dec_base_sel_r),
+                                    fwd_onehot_gpr(ea_dec_index_sel_r),
+                                    ea_dec_scale_r, ea_dec_disp_r,
+                                    ea_dec_is_16bit_r, ea_dec_scale_to_base_r);
+
+// Relocate an about-to-be-committed IND value to its linear address
+function automatic [31:0] reloc(input [31:0] off);
+    reloc = (eff_mask_pending ? off : {16'h0, off[15:0]}) + seg_base_pending;
+endfunction
+
+// Dedicated reloc for the uc_exec/busop ind_linear write.
+(* keep *) wire [31:0] seg_base_pending_uc = seg_base_pending;
+function automatic [31:0] reloc_uc(input [31:0] off);
+    reloc_uc = (eff_mask_pending ? off : {16'h0, off[15:0]}) + seg_base_pending_uc;
+endfunction
+
+// 3-term relocation using ALM's fused 3-input add
+function automatic [31:0] reloc_add2(input [31:0] a, input [31:0] b, input mask16);
+    reloc_add2 = mask16 ? ({16'h0, a[15:0] + b[15:0]} + seg_base_pending_uc)
+                        : (a + b + seg_base_pending_uc);
+endfunction
+
+always_ff @(posedge clk) begin
+    if (i_pop)
+        ea_reg <= ea_early;
+end
+
+//=============================================================================
 // Control Unit (Microcode Sequencer)
 //=============================================================================
 
@@ -1191,26 +1374,11 @@ reg        stack_init_pending;      // Cycle after i_pop for stack op - ALU comp
 reg        prot_test_inflight;      // Protection test is in pipeline (waiting for result)
 reg        prot_redirect_prev;      // Protection redirect fired last cycle (suppresses LJUMP + relative jumps in delay slot)
 
-reg [31:0] OPR_W;                   // Bus operation data registers
-reg [31:0] IND;                     // Internal address register
-
-reg [31:0] ea_r;                    // Registered EA for ALU path
-
-reg [31:0] ea_reg;                  // Early EA: the modrm EA, computed at i_pop with delay-slot GPR forwarding
-
-assign ind_effective = (i_first && instr_ind_is_ea) ? ea_reg : IND;
+reg [31:0] ea_reg;                  // Early EA registered at i_pop (ALU path / stack-dest EA, e.g. POP [mem]); read via SRC_EA, off the i_first seg/TLB cone
 
 reg [2:0]  seg_reg_sel;             // Segment register index (0=ES,1=CS,2=SS,3=DS,4=FS,5=GS)
 
-// Combinational EA-operand decode (from i_bus, valid at i_pop)
-logic [7:0]  ea_dec_base_sel, ea_dec_index_sel;
-logic [1:0]  ea_dec_scale;
-logic [31:0] ea_dec_disp;
-logic        ea_dec_has_base, ea_dec_has_index, ea_dec_has_disp;
-logic        ea_dec_is_16bit, ea_dec_scale_to_base;
-
 reg [31:0] COUNTR;                  // Counter register
-wire [4:0] CNT = COUNTR[4:0];
 wire [31:0] countr_masked = i.addr32 ? COUNTR : {16'h0, COUNTR[15:0]};
 reg [31:0] TMPeIP;                  // Saved EIP for RPTI (repeat instruction)
 reg [31:0] TMPeSP;                  // Saved ESP for fault handling
@@ -1230,78 +1398,42 @@ reg        jcc_active;              // Currently executing a Jcc instruction (fo
 reg        instr_eip_written;       // EIP was written during instruction (RPTI restart)
 reg        gate_in_progress;        // Prevent second LDTST (at 5C3) from re-triggering gate detection
 
-// Microcode PREF restarts from IND.  Any required IP width adjustment belongs
-// to the uop that prepared IND, not to the data operand size of the interrupted
-// instruction.
-wire [31:0] pf_flush_ip = ind_effective;
-assign pf_flush_addr = pe_mode_toggle_now ? (CS_base + EIP) : (CS_base + pf_flush_ip);
+// Microcode PREF restarts from IND
+wire [31:0] pf_flush_ip = IND;
+assign pf_flush_addr = early_redirect     ? (CS_base + br_target) :
+                       pe_mode_toggle_now ? (CS_base + EIP) :
+                                            (CS_base + pf_flush_ip);
 
-wire delay_slot_writes_esp = i_rni_delay && (uc_dest == DEST_eSP || uc_dest == DEST_ESP ||
-                                              (uc_dest == DEST_DSTREG && i.dst_reg_sel == 4 && op_size != 2'd0) ||
-                                              (uc_dest == DEST_SRCREG && i.src_reg_sel == 4 && op_size != 2'd0));
-wire [31:0] forwarded_esp = delay_slot_writes_esp ? dest_value : ESP;
-
-// Delay-slot GPR write descriptor for early-EA forwarding
-localparam [1:0] FWD_BLO = 2'd0, FWD_BHI = 2'd1, FWD_W = 2'd2, FWD_D = 2'd3;
-reg       dly_gpr_we;
-reg [2:0] dly_gpr_sel;
-reg [1:0] dly_gpr_mode;
-always_comb begin
-    dly_gpr_we   = 1'b0;
-    dly_gpr_sel  = 3'd0;
-    dly_gpr_mode = FWD_D;
-    if (i_rni_delay) begin
-        case (uc_dest)
-            DEST_DSTREG, DEST_SRCREG: begin
-                automatic logic [2:0] rs = (uc_dest == DEST_DSTREG) ? i.dst_reg_sel : i.src_reg_sel;
-                dly_gpr_we = 1'b1;
-                if (op_size == 2'd0) begin               // byte: rs[2]=high-byte, rs[1:0]=GPR
-                    dly_gpr_sel  = {1'b0, rs[1:0]};
-                    dly_gpr_mode = rs[2] ? FWD_BHI : FWD_BLO;
-                end else begin
-                    dly_gpr_sel  = rs;
-                    dly_gpr_mode = (op_size == 2'd1) ? FWD_W : FWD_D;
-                end
-            end
-            DEST_EAX, DEST_ECX, DEST_EDX, DEST_EBX,
-            DEST_ESP, DEST_EBP, DEST_ESI, DEST_EDI:
-                begin dly_gpr_we = 1'b1; dly_gpr_sel = uc_dest[2:0]; dly_gpr_mode = FWD_D; end
-            DEST_eSP:
-                begin dly_gpr_we = 1'b1; dly_gpr_sel = 3'd4;
-                      dly_gpr_mode = (pe && seg_cache[SEG_SS].D_B) ? FWD_D : FWD_W; end
-            DEST_AX, DEST_CX, DEST_DX, DEST_BX, DEST_SP, DEST_BP, DEST_SI, DEST_DI:
-                begin dly_gpr_we = 1'b1; dly_gpr_sel = uc_dest[2:0]; dly_gpr_mode = FWD_W; end
-            DEST_AL, DEST_CL, DEST_DL, DEST_BL:
-                begin dly_gpr_we = 1'b1; dly_gpr_sel = {1'b0, uc_dest[1:0]}; dly_gpr_mode = FWD_BLO; end
-            DEST_AH, DEST_CH, DEST_DH, DEST_BH:
-                begin dly_gpr_we = 1'b1; dly_gpr_sel = {1'b0, uc_dest[1:0]}; dly_gpr_mode = FWD_BHI; end
-            DEST_eAX_AL:
-                begin dly_gpr_we = 1'b1; dly_gpr_sel = 3'd0;
-                      dly_gpr_mode = (op_size == 2'd0) ? FWD_BLO : (op_size == 2'd1) ? FWD_W : FWD_D; end
-            DEST_eDX_AH: begin
-                dly_gpr_we = 1'b1;
-                if (op_size == 2'd0) begin dly_gpr_sel = 3'd0; dly_gpr_mode = FWD_BHI; end  // AH
-                else begin dly_gpr_sel = 3'd2; dly_gpr_mode = (op_size == 2'd1) ? FWD_W : FWD_D; end
-            end
-            DEST_eCX: begin dly_gpr_we = 1'b1; dly_gpr_sel = 3'd1; dly_gpr_mode = i.addr32 ? FWD_D : FWD_W; end
-            DEST_eSI: begin dly_gpr_we = 1'b1; dly_gpr_sel = 3'd6; dly_gpr_mode = i.addr32 ? FWD_D : FWD_W; end
-            DEST_eDI: begin dly_gpr_we = 1'b1; dly_gpr_sel = 3'd7; dly_gpr_mode = i.addr32 ? FWD_D : FWD_W; end
-            DEST_IRF: if (COUNTR[5:3] != 3'b100)
-                begin dly_gpr_we = 1'b1; dly_gpr_sel = COUNTR[2:0]; dly_gpr_mode = is_dword ? FWD_D : FWD_W; end
-            default: ;
-        endcase
-    end
+wire        br_is_jcc      = (i.opcode[7:4] == 4'b0111 && !i.has_0f) ||
+                             (i.opcode[7:4] == 4'b1000 && i.has_0f);
+wire        br_is_jmp_rel  = !i.has_0f && (i.opcode == 8'hEB || i.opcode == 8'hE9);
+wire        br_is_call_rel = !i.has_0f && (i.opcode == 8'hE8);
+wire        br_is_rel8     = !i.has_0f && (i.opcode[7:4] == 4'b0111 || i.opcode == 8'hEB);
+wire [31:0] br_disp        = br_is_rel8 ? {{24{i.displacement[7]}}, i.displacement[7:0]}
+                                        : i.displacement;
+wire [31:0] br_target      = EIP + br_disp;
+// synthesis translate_off
+always @(posedge clk) begin
+    // Only validate the microcode-PREF flush path: there pf_flush_addr uses IND
+    // (= pf_flush_ip), so IND must equal the branch target.  The early_redirect
+    // path uses br_target directly and leaves IND stale, so comparing against it
+    // there is a false positive.
+    if (reset_n && q_flush && !early_redirect && is_dword && (br_is_jcc || br_is_jmp_rel || br_is_call_rel) &&
+        (pf_flush_ip !== (CS_base + br_target)))   // compare LINEAR vs LINEAR (pf_flush_ip is IND = CS_base+EIP+disp)
+        $display("%0t: BR TARGET MISMATCH computed=%08x actual=%08x op=%02x CS:EIP=%0x:%0x",
+                 $time, CS_base + br_target, pf_flush_ip, i.opcode, CS, EIP);
 end
+// synthesis translate_on
 
-// Early forwarded EA, computed at i_pop from the combinational decode and
-// delay-slot-bypassed GPRs, registered for use at i_first onward.
-wire [31:0] ea_early = calc_ea_core(fwd_onehot_gpr(ea_dec_base_sel),
-                                    fwd_onehot_gpr(ea_dec_index_sel),
-                                    ea_dec_scale, ea_dec_disp,
-                                    ea_dec_is_16bit, ea_dec_scale_to_base);
-always_ff @(posedge clk) begin
-    if (i_pop)
-        ea_reg <= ea_early;
+// i_first PRECISE early branch redirect (NOT a prediction). 
+wire br_jcc_taken = br_is_jcc && check_condition(i.opcode[3:0]);    
+wire early_redirect = i_first && is_dword &&
+                      (br_is_jmp_rel || br_is_call_rel || br_jcc_taken);
+reg  early_redirected;
+always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n)                            early_redirected <= 1'b0;
+    else if (early_redirect)                 early_redirected <= 1'b1;
+    else if (i_entry || interrupt_entry)     early_redirected <= 1'b0;
 end
 
 // RNI variants (opcode field):
@@ -1656,10 +1788,6 @@ always_ff @(posedge clk) begin
             gate_in_progress <= 1'b0;
         end
 
-        // Keep first-cycle decode context live while the first uop is stalled.
-        // First-uop memory requests use ind_effective/ea_reg directly; if
-        // paging cannot accept the request immediately, the retry must still
-        // see the same first-uop EA instead of falling back to registered IND.
         if (!stall) begin
             if (stack_init_pending) stack_init_pending <= 1'b0;
             if (i_first) i_first <= 1'b0;
@@ -1757,14 +1885,17 @@ always_ff @(posedge clk) begin
         // LSS/LFS/LGS (0F B2/B4/B5): put opcode in i.immediate for microcode XOR trick
         if (i_bus.has_0f && (i_bus.opcode == 8'hB2 || i_bus.opcode == 8'hB4 || i_bus.opcode == 8'hB5))
             i.immediate <= {24'h0, i_bus.opcode};
-        instr_is_shift <= i_bus.opcode[7:2] == 6'b1101_00 ||    // D0-D3
-                          i_bus.opcode[7:1] == 7'b1100_000 ||    // C0-C1
-                          i_bus.has_0f && (i_bus.opcode == 8'hA4 || i_bus.opcode == 8'hA5 || i_bus.opcode == 8'hAC || i_bus.opcode == 8'hAD);
         instr_is_shxd <= i_bus.has_0f && ((i_bus.opcode == 8'hA4) || (i_bus.opcode == 8'hA5) ||
                                           (i_bus.opcode == 8'hAC) || (i_bus.opcode == 8'hAD));
         instr_cf <= eflags_fwd[0];      // RCL/RCR carry-in: forward the committing CF (eflags_fwd)
         instr_is_cmp <= i_bus.opcode[7:2] == 6'b100000 || i_bus.opcode[7:3] == 5'b00111;
-        instr_ind_is_ea <= i_bus.has_modrm && !i_bus.stack_op && !i_bus.has_moffs;
+        // Early-read eligible = the demand-read linear is registered at i_pop
+        // (ind_linear): modrm EA, stack (POP/RET), or moffs.  All feed the live
+        // TLB through the registered ind_linear, so issuing the dcache request at
+        // PG_IDLE (early read) adds no seg adder to the cone.  The early_rd path's
+        // !mem_write filter limits this to reads; microcode IND reads (set in
+        // uc_exec, not at i_pop) stay on the normal path via !mem_rd_ind.
+        instr_ind_is_ea <= i_bus.has_modrm || i_bus.stack_op || i_bus.has_moffs;
         // Pre-decode ALU group op: eliminates i.opcode/i.modrm muxes from ALU critical path
         alu_grp_op <= i_bus.opcode[7] ? i_bus.modrm[5:3] : i_bus.opcode[5:3];
         // Track Jcc instruction for alu_src_r substitution in BUSOP_IND_PLUS_ALU
@@ -1782,97 +1913,6 @@ always_ff @(posedge clk) begin
     end
     if (interrupt_entry)
         jcc_active <= 1'b0;  // Clear on interrupt — prevent is_jcc from using stale displacement
-end
-
-// EA Pre-Decode: combinational decode from i_bus (valid at i_pop), registered
-// into ea_* below and also fed to the early EA computation at i_pop.
-always_comb begin
-    // Defaults (also the "no modrm / has moffs" case)
-    ea_dec_base_sel  = 8'h00;
-    ea_dec_index_sel = 8'h00;
-    ea_dec_scale     = 2'b00;
-    ea_dec_has_base  = 1'b0;
-    ea_dec_has_index = 1'b0;
-    ea_dec_has_disp  = 1'b0;
-    ea_dec_is_16bit  = 1'b0;
-    ea_dec_scale_to_base = 1'b0;
-    ea_dec_disp      = 32'h0;
-    if (i_bus.has_modrm && !i_bus.has_moffs) begin
-        if (i_bus.addr32) begin
-            // 32-bit addressing mode
-            ea_dec_base_sel  = decode_base_register_32(i_bus.modrm, i_bus.sib, i_bus.has_sib);
-            ea_dec_index_sel = decode_index_register_32(i_bus.sib, i_bus.has_sib);
-            ea_dec_scale     = i_bus.has_sib ? i_bus.sib[7:6] : 2'b00;
-            ea_dec_scale_to_base = i_bus.has_sib && (i_bus.sib[5:3] == 3'b100);  // No index, scale to base
-            ea_dec_is_16bit  = 1'b0;
-
-            // Determine what components to include
-            if (i_bus.has_sib && i_bus.modrm[2:0] == 3'b100) begin
-                // SIB addressing
-                ea_dec_has_base  = !((i_bus.sib[2:0] == 3'b101) && (i_bus.modrm[7:6] == 2'b00));
-                ea_dec_has_index = (i_bus.sib[5:3] != 3'b100);
-                ea_dec_has_disp  = (i_bus.modrm[7:6] == 2'b01) || (i_bus.modrm[7:6] == 2'b10) ||
-                               ((i_bus.sib[2:0] == 3'b101) && (i_bus.modrm[7:6] == 2'b00));
-            end else begin
-                // Non-SIB addressing
-                ea_dec_has_base  = !((i_bus.modrm[2:0] == 3'b101) && (i_bus.modrm[7:6] == 2'b00));
-                ea_dec_has_index = 1'b0;
-                ea_dec_has_disp  = (i_bus.modrm[7:6] == 2'b01) || (i_bus.modrm[7:6] == 2'b10) ||
-                               ((i_bus.modrm[2:0] == 3'b101) && (i_bus.modrm[7:6] == 2'b00));
-            end
-        end else begin
-            // 16-bit addressing mode
-            ea_dec_base_sel  = ea_regs_16[7:0];   // First register
-            ea_dec_index_sel = ea_regs_16[15:8];  // Second register
-            ea_dec_scale     = 2'b00;  // No scaling in 16-bit mode
-            ea_dec_scale_to_base = 1'b0;
-            ea_dec_is_16bit  = 1'b1;
-
-            // In 16-bit mode, both base_sel and index_sel represent combined registers
-            ea_dec_has_base  = (ea_regs_16[7:0] != 8'h00);
-            ea_dec_has_index = (ea_regs_16[15:8] != 8'h00);
-            ea_dec_has_disp  = (i_bus.modrm[7:6] == 2'b01) || (i_bus.modrm[7:6] == 2'b10) ||
-                           ((i_bus.modrm[2:0] == 3'b110) && (i_bus.modrm[7:6] == 2'b00));
-        end
-
-        // Displacement value (sign-extend disp8, use full disp16/disp32)
-        begin
-            automatic logic [31:0] disp_val;
-            if (i_bus.modrm[7:6] == 2'b01)
-                // disp8 - sign extend
-                disp_val = {{24{i_bus.displacement[7]}}, i_bus.displacement[7:0]};
-            else if (i_bus.modrm[7:6] == 2'b10)
-                // disp16 or disp32
-                disp_val = i_bus.addr32 ? i_bus.displacement : {{16{i_bus.displacement[15]}}, i_bus.displacement[15:0]};
-            else
-                // disp32 for [disp32] or [disp16] modes (mod=00, special rm)
-                disp_val = i_bus.addr32 ? i_bus.displacement : {16'h0, i_bus.displacement[15:0]};
-
-            // POP r/m (8F) with ESP base: Intel 386 says EA uses post-increment ESP.
-            if (i_bus.opcode == 8'h8F && i_bus.addr32 && i_bus.has_sib && i_bus.sib[2:0] == 3'b100) begin
-                disp_val = disp_val + (i_bus.data32 ? 32'd4 : 32'd2);
-                ea_dec_has_disp = 1'b1;  // Force displacement inclusion (mod=00 ESP base has no disp)
-            end
-            ea_dec_disp = disp_val;
-        end
-        // Zero ea_disp when not used
-        if (i_bus.modrm[7:6] == 2'b00 || i_bus.modrm[7:6] == 2'b11) begin
-            if (i_bus.addr32) begin
-                // 32-bit: special rm is rm=101 (non-SIB) or sib_base=101 (SIB)
-                if (i_bus.has_sib && i_bus.modrm[2:0] == 3'b100) begin
-                    if (i_bus.sib[2:0] != 3'b101)
-                        ea_dec_disp = 32'h0;  // SIB, no disp32
-                end else begin
-                    if (i_bus.modrm[2:0] != 3'b101)
-                        ea_dec_disp = 32'h0;  // Non-SIB, no disp32
-                end
-            end else begin
-                // 16-bit: special rm is rm=110
-                if (i_bus.modrm[2:0] != 3'b110)
-                    ea_dec_disp = 32'h0;
-            end
-        end
-    end
 end
 
 //=============================================================================
@@ -2359,13 +2399,8 @@ always_ff @(posedge clk) begin
     end else if (interrupt_entry) begin
         flags_backup_active <= 1'b0;
     end else if (i_pop && !halted) begin
-        // Backup FLAGS at instruction start - always valid for faults.
-        // eflags_fwd: the prior instruction's shift/ALU flags may retire on
-        // this same i_pop edge (two-cycle commit overlapping its RNI delay
-        // slot); raw EFLAGS would back up the stale pre-commit value, so a
-        // fault here would restore wrong flags.
         flags_backup_active <= 1'b1;
-        FLAGSB <= eflags_fwd;
+        FLAGSB <= eflags_fwd;       // init FLAGSB at instruction start
     end else if (uc_exec && uc_aluop == ALUJMP_FLGSBA) begin
         if (!flags_backup_active) begin
             flags_backup_active <= 1'b1;
@@ -2419,7 +2454,7 @@ always_ff @(posedge clk) begin
         idiv_divisor_neg <= 1'b0;
         div_first_cycle <= 1'b0;
     end else if (uc_exec) begin
-        if (uc_source == SRC_IRF2) dest_value = ind_effective;  // use combinational IRF2
+        if (uc_source == SRC_IRF2) dest_value = IND;  // use combinational IRF2
 
         case (uc_dest)
             DEST_EAX: EAX <= dest_value;
@@ -2689,63 +2724,82 @@ function automatic logic check_condition(input [3:0] cond);
     endcase
 endfunction
 
-// IND register (address register)
+// IND register (address register) and ind_linear (relocated linear address of IND)
 reg [31:0] IND_DELTA;
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         IND <= 32'h0;
         IND_DELTA <= 32'd4;
+        ind_linear <= 32'h0;
+        ind_linear_valid <= 1'b0;
     end else begin
         // Instruction start - initialize IND based on addressing mode
-        if ((~uc_active && ~halted && ~i_rni_delay && i_pop) ||
-            (i_rni_delay && i_pop && !halted)) begin
+        if (i_pop) begin
+            ind_linear_valid <= 1'b0;
             IND_DELTA <= !i_bus.stack_op ? 32'd2 :
                          !i_bus.stack_dir ? (i_bus.data32 ? -32'd4 : -32'd2) :
                                             (i_bus.data32 ? 32'd4 : 32'd2);
             if (i_bus.stack_op && i_bus.stack_dir) begin
-                IND <= seg_cache[SEG_SS].D_B ? forwarded_esp : {16'h0, forwarded_esp[15:0]};
+                // Stack pop/ret: IND = ESP, relocate at i_pop
+                automatic logic [31:0] stk =
+                    seg_cache[SEG_SS].D_B ? forwarded_esp : {16'h0, forwarded_esp[15:0]};
+                IND <= stk;
+                ind_linear <= reloc(stk);
+                ind_linear_valid <= 1'b1;
             end else if (i_bus.stack_op && !i_bus.stack_dir) begin
-                if (seg_cache[SEG_SS].D_B)
-                    IND <= forwarded_esp - (i_bus.data32 ? 32'd4 : 32'd2);
-                else
-                    IND <= {16'h0, forwarded_esp[15:0] - (i_bus.data32 ? 16'd4 : 16'd2)};
+                // Stack push/call: IND = ESP-delta, relocate at i_pop.
+                automatic logic [31:0] stk = seg_cache[SEG_SS].D_B
+                    ? forwarded_esp - (i_bus.data32 ? 32'd4 : 32'd2)
+                    : {16'h0, forwarded_esp[15:0] - (i_bus.data32 ? 16'd4 : 16'd2)};
+                IND <= stk;
+                ind_linear <= reloc(stk);
+                ind_linear_valid <= 1'b1;
             end else if (i_bus.has_moffs) begin
                 IND <= i_bus.addr32 ? i_bus.immediate : {16'h0, i_bus.immediate[15:0]};
+                ind_linear <= reloc(i_bus.immediate);
+                ind_linear_valid <= 1'b1;
+            end else if (i_bus.has_modrm) begin
+                IND <= ea_early;
+                ind_linear <= reloc(ea_early);
+                ind_linear_valid <= 1'b1;
             end
-            // modrm-based: IND not set here — ind_effective returns ea_reg at i_first
         end
         // BUSOP-related IND updates (only when uc_exec is active)
         else if (uc_exec) begin
+            automatic logic [31:0] ind_reloc_src = IND;
+            automatic logic        ind_lin_use3 = 1'b0;
+            automatic logic [31:0] lin_a = IND;
+            automatic logic [31:0] lin_b = 32'h0;
+            automatic logic        ind_lin_mask16 = !eff_mask_pending;  // 16-bit mask
             case (uc_buscode)
                 BUSOP_IND_PLUS_ALU: begin  // IN=+ - IND = source + ALU operand, IND_DELTA = ALU operand
                     automatic logic [31:0] ind_next;
                     automatic logic [31:0] alu1, alu2;
                     automatic logic is_jcc = jcc_active;
-                    alu1 = uc_source == SRC_IRF2 ? ind_effective : alu_dst;
+                    alu1 = uc_source == SRC_IRF2 ? IND : alu_dst;
                     alu2 = is_jcc ? alu_src_r : alu_src;
-                    // Latch only with an explicit operand (0x3F = none): 8E5's
-                    // bare "IN+=" must not zero the delta before the 8E7 push.
                     if (uc_alu_src != ALUSRC_ZERO)
                         IND_DELTA <= alu2;
-                    if (uc_dest == DEST_DESSDT) begin
-                        automatic logic [12:0] sel_index = alu1[15:3];
-                        automatic logic [31:0] table_base = alu1[2] ? seg_cache[SEG_LDT].base : seg_cache[SEG_GDT].base;
-                        ind_next = table_base + ({19'h0, sel_index} << 3) + alu2;
-                    end else if (uc_dest == DEST_DESIDT) begin
-                        ind_next = seg_cache[SEG_IDT].base + alu1 + alu2;
-                    end else begin
-                        ind_next = alu1 + alu2;
-                    end
-                    if (uc_dest == DEST_DESSTK && (!pe || !seg_cache[SEG_SS].D_B))
+                    if (uc_dest == DEST_DESSTK)
+                        ind_lin_mask16 = !pe || !seg_cache[SEG_SS].D_B;
+                    else if (uc_dest == DEST_DESCOD)
+                        ind_lin_mask16 = !is_dword;
+                    else if (uc_dest == DEST_DES_ES || uc_dest == DEST_DES_OS || uc_dest == DEST_DES_SR)
+                        ind_lin_mask16 = !i.addr32;
+                    ind_next = alu1 + alu2;
+                    if (ind_lin_mask16 && (uc_dest == DEST_DESSTK || uc_dest == DEST_DESCOD ||
+                        uc_dest == DEST_DES_ES || uc_dest == DEST_DES_OS || uc_dest == DEST_DES_SR))
                         ind_next = {16'h0, ind_next[15:0]};
-                    else if (uc_dest == DEST_DESCOD && !is_dword)
-                        ind_next = {16'h0, ind_next[15:0]};
-                    else if ((uc_dest == DEST_DES_ES || uc_dest == DEST_DES_OS || uc_dest == DEST_DES_SR) && !i.addr32)
-                        ind_next = {16'h0, ind_next[15:0]};
+                    // common EA: fuse alu1 + alu2 + seg_base into one add
+                    ind_lin_use3 = 1'b1; lin_a = alu1; lin_b = alu2;
                     IND <= ind_next;
+                    ind_reloc_src = ind_next;
+                    ind_linear_valid <= 1'b1;
                 end
                 BUSOP_IND_ALU2: begin  // IN=2 - Set IND from ALU2 (alu_src)
                     IND <= alu_src;
+                    ind_reloc_src = alu_src;
+                    ind_linear_valid <= 1'b1;
                 end
                 BUSOP_IND_SRC: begin  // IND= - Set IND from source register
                     automatic logic [31:0] ind_val = alu_dst;
@@ -2753,9 +2807,10 @@ always_ff @(posedge clk) begin
                         ind_val = {16'h0, ind_val[15:0]};
                     else if (uc_dest == DEST_DESCOD && !is_dword)
                         ind_val = {16'h0, ind_val[15:0]};
-                    if (uc_dest == DEST_DESIDT)
-                        ind_val = seg_cache[SEG_IDT].base + ind_val;
+                    // DESIDT: IND = offset only; IDT base applied by the seg unit.
                     IND <= ind_val;
+                    ind_reloc_src = ind_val;
+                    ind_linear_valid <= 1'b1;
                 end
                 BUSOP_IND_PLUS: begin  // IN+= - IND = IND + alu_src, IND_DELTA = alu_src
                     // IN+= latches the delta like IN=+: PUSHA latches -1 at 089
@@ -2764,6 +2819,9 @@ always_ff @(posedge clk) begin
                     if (!pe && !i.addr32)
                         ind_next = {16'h0, ind_next[15:0]};
                     IND <= ind_next;
+                    ind_reloc_src = ind_next;
+                    ind_lin_use3 = 1'b1; lin_a = IND; lin_b = alu_src;
+                    ind_linear_valid <= 1'b1;
                     if (uc_alu_src != ALUSRC_ZERO)
                         IND_DELTA <= alu_src;
                 end
@@ -2773,15 +2831,21 @@ always_ff @(posedge clk) begin
                     if (!pe ? !i.addr32 : !(descsw_mode ? seg_cache[SEG_CS].D_B : seg_cache[SEG_SS].D_B))
                         ind_next = {16'h0, ind_next[15:0]};
                     IND <= ind_next;
+                    ind_reloc_src = ind_next;
+                    ind_lin_use3 = 1'b1; lin_a = IND; lin_b = IND_DELTA;
+                    ind_linear_valid <= 1'b1;
                 end
                 BUSOP_LAR: begin  // LAR result from segmentation unit
                     IND <= seg_lar_result;
+                    ind_linear_valid <= 1'b0;  // IND loaded with descriptor data, not an address
                 end
                 BUSOP_LLIM: begin  // LLIM result from segmentation unit
                     IND <= seg_llim_result;
+                    ind_linear_valid <= 1'b0;
                 end
                 BUSOP_LBAS: begin  // LBAS result from segmentation unit
                     IND <= seg_lbas_result;
+                    ind_linear_valid <= 1'b0;
                 end
                 BUSOP_LPCR: begin  // LPCR (0x34) - Load Page Cache Register into IRF2 (IND)
                     case (uc_dest)
@@ -2790,17 +2854,14 @@ always_ff @(posedge clk) begin
                         DEST_PDBR:   IND <= CR3;
                         default:     IND <= IND;
                     endcase
+                    ind_linear_valid <= 1'b0;
                 end
-                default: begin
-                    if (i_first && i.has_modrm && !i.stack_op && !i.has_moffs) begin
-                        IND <= ea_reg;
-                    end
-                end
+                default: ;  // IND already holds the early EA from instruction start
             endcase
-
-            // Register EA for ALU path (breaks EA → ALU critical path)
-            if (i_first && i.has_modrm)
-                ea_r <= ea_reg;
+            if (ind_lin_use3)
+                ind_linear <= reloc_add2(lin_a, lin_b, ind_lin_mask16); // Fused 3-input add
+            else
+                ind_linear <= reloc_uc(ind_reloc_src);
         end
     end
 end
@@ -3419,7 +3480,7 @@ function automatic [31:0] read_protun_source_fast(input [5:0] src_field);
         SRC_SIGMA:   read_protun_source_fast = SIGMA;
         SRC_CS:      read_protun_source_fast = {16'h0, CS};
         SRC_OPR_R:   read_protun_source_fast = OPR_R;
-        SRC_IRF2:    read_protun_source_fast = ind_effective;
+        SRC_IRF2:    read_protun_source_fast = IND;
         SRC_TMPE:    read_protun_source_fast = TMPE;
         SRC_DSTREG:  read_protun_source_fast = read_gpr(i_reg_dst_reg_sel, srcreg_size);
         SRC_SRCREG:  read_protun_source_fast = read_gpr(i_reg_src_reg_sel, op_size);
@@ -3553,7 +3614,12 @@ function automatic [31:0] read_uc_source(input [5:0] src_field);
         SRC_GS: read_uc_source = GS;
         SRC_LDTR: read_uc_source = {16'h0, LDTR};
         SRC_TR: read_uc_source = {16'h0, TR};
-        SRC_SLCTR: read_uc_source = SLCTR;
+        // SRC_SLCTR (0x35) is used ONLY by the DESSDT descriptor-address micro-ops,
+        // so it reads the selector as a table byte-offset: index*8 = SLCTR & 0xFFF8
+        // (TI bit [2] and RPL bits [1:0] cleared).  The TI bit is applied separately
+        // by the seg unit (seg_base_for(SEG_GDT) keyed on the raw SLCTR[2]).  Full
+        // selector reads use SLCTR2 (0x13) instead.  Do NOT reuse 0x35 for a raw read.
+        SRC_SLCTR: read_uc_source = {16'h0, SLCTR[15:3], 3'b000};
         SRC_eAX_AL: // Size-aware accumulator for string ops (STOS/LODS/SCAS)
             read_uc_source = op_size_src == 2'd0 ? {24'h0, EAX[7:0]} :   // AL
                              op_size_src == 2'd1 ? {16'h0, EAX[15:0]} :  // AX
@@ -3564,7 +3630,7 @@ function automatic [31:0] read_uc_source(input [5:0] src_field);
                                                        EDX;                // EDX
         SRC_OPR_R: read_uc_source = OPR_R;
         SRC_IRF2: read_uc_source = IND;          // IRF2 is IND
-        SRC_EA: read_uc_source = ea_r;         // use registered as EA is not used in i_first
+        SRC_EA: read_uc_source = ea_reg;         // i_pop EA; valid all instruction (next pop is in the RNI delay slot, after all SRC_EA reads)
 
         SRC_eCX: read_uc_source = ECX; // i.addr32 ? ECX : {16'h0, ECX[15:0]};  // Address-size-aware for LOOP/REP
         SRC_COUNTR2: read_uc_source = COUNTR;
@@ -3861,6 +3927,8 @@ function automatic [31:0] calc_ea_core(
         endcase
     end
 
+    // This is timing-safe. Cyclone V ALM can do 3-input adder with a single level of logic.
+    // So we can take advantage of this and don't need the 386-style 2-cycle "complex EA" design.
     calc_ea_core = base_val + scaled_val + disp;
     if (is_16bit)
         calc_ea_core = {16'h0, calc_ea_core[15:0]};
