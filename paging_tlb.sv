@@ -74,15 +74,27 @@ wire [1:0] hit_way = hit0 ? 2'd0 :
                      hit2 ? 2'd2 :
                      hit3 ? 2'd3 : 2'd0;
 
-// Live demand lookup address decomposition
-wire [19:0] live_lookup_vpn = linear_addr_live[31:12];
-wire [2:0]  live_lookup_set = live_lookup_vpn[2:0];
-wire [16:0] live_lookup_tag = live_lookup_vpn[19:3];
+// Live demand lookup address decomposition.
+// linear_addr_live (z386 paging_live_linear) is a very high-fanout net: its set
+// bits drive the 8:1 set-mux of the 4-way register-array CAM (valid/vpn/pfn/perm
+// for every way), ~329 loads on bit 14.  It was the top setup path
+// (-> live_hit -> dcache_req_valid -> dcache_req_wdata_r).  Replicate it once per
+// way -- kept distinct so the fitter cannot CSE-merge the copies -- so each way's
+// CAM compare and physical/permission select sees its own lower-fanout copy.
+(* keep *) wire [31:0] lal_w0 = linear_addr_live;
+(* keep *) wire [31:0] lal_w1 = linear_addr_live;
+(* keep *) wire [31:0] lal_w2 = linear_addr_live;
+(* keep *) wire [31:0] lal_w3 = linear_addr_live;
 
-wire live_hit0 = tlb[live_lookup_set][0].valid && (tlb[live_lookup_set][0].vpn[19:3] == live_lookup_tag);
-wire live_hit1 = tlb[live_lookup_set][1].valid && (tlb[live_lookup_set][1].vpn[19:3] == live_lookup_tag);
-wire live_hit2 = tlb[live_lookup_set][2].valid && (tlb[live_lookup_set][2].vpn[19:3] == live_lookup_tag);
-wire live_hit3 = tlb[live_lookup_set][3].valid && (tlb[live_lookup_set][3].vpn[19:3] == live_lookup_tag);
+wire [2:0] live_set0 = lal_w0[14:12];  wire [16:0] live_tag0 = lal_w0[31:15];
+wire [2:0] live_set1 = lal_w1[14:12];  wire [16:0] live_tag1 = lal_w1[31:15];
+wire [2:0] live_set2 = lal_w2[14:12];  wire [16:0] live_tag2 = lal_w2[31:15];
+wire [2:0] live_set3 = lal_w3[14:12];  wire [16:0] live_tag3 = lal_w3[31:15];
+
+wire live_hit0 = tlb[live_set0][0].valid && (tlb[live_set0][0].vpn[19:3] == live_tag0);
+wire live_hit1 = tlb[live_set1][1].valid && (tlb[live_set1][1].vpn[19:3] == live_tag1);
+wire live_hit2 = tlb[live_set2][2].valid && (tlb[live_set2][2].vpn[19:3] == live_tag2);
+wire live_hit3 = tlb[live_set3][3].valid && (tlb[live_set3][3].vpn[19:3] == live_tag3);
 
 wire [1:0] live_hit_way = live_hit0 ? 2'd0 :
                           live_hit1 ? 2'd1 :
@@ -135,28 +147,28 @@ always_comb begin
 
     case (live_hit_way)
         2'd0: begin
-            live_physical_addr = {tlb[live_lookup_set][0].pfn, linear_addr_live[11:0]};
-            live_writable = tlb[live_lookup_set][0].writable;
-            live_user = tlb[live_lookup_set][0].user;
-            live_dirty = tlb[live_lookup_set][0].dirty;
+            live_physical_addr = {tlb[live_set0][0].pfn, lal_w0[11:0]};
+            live_writable = tlb[live_set0][0].writable;
+            live_user = tlb[live_set0][0].user;
+            live_dirty = tlb[live_set0][0].dirty;
         end
         2'd1: begin
-            live_physical_addr = {tlb[live_lookup_set][1].pfn, linear_addr_live[11:0]};
-            live_writable = tlb[live_lookup_set][1].writable;
-            live_user = tlb[live_lookup_set][1].user;
-            live_dirty = tlb[live_lookup_set][1].dirty;
+            live_physical_addr = {tlb[live_set1][1].pfn, lal_w1[11:0]};
+            live_writable = tlb[live_set1][1].writable;
+            live_user = tlb[live_set1][1].user;
+            live_dirty = tlb[live_set1][1].dirty;
         end
         2'd2: begin
-            live_physical_addr = {tlb[live_lookup_set][2].pfn, linear_addr_live[11:0]};
-            live_writable = tlb[live_lookup_set][2].writable;
-            live_user = tlb[live_lookup_set][2].user;
-            live_dirty = tlb[live_lookup_set][2].dirty;
+            live_physical_addr = {tlb[live_set2][2].pfn, lal_w2[11:0]};
+            live_writable = tlb[live_set2][2].writable;
+            live_user = tlb[live_set2][2].user;
+            live_dirty = tlb[live_set2][2].dirty;
         end
         2'd3: begin
-            live_physical_addr = {tlb[live_lookup_set][3].pfn, linear_addr_live[11:0]};
-            live_writable = tlb[live_lookup_set][3].writable;
-            live_user = tlb[live_lookup_set][3].user;
-            live_dirty = tlb[live_lookup_set][3].dirty;
+            live_physical_addr = {tlb[live_set3][3].pfn, lal_w3[11:0]};
+            live_writable = tlb[live_set3][3].writable;
+            live_user = tlb[live_set3][3].user;
+            live_dirty = tlb[live_set3][3].dirty;
         end
     endcase
 
