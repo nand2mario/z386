@@ -184,6 +184,92 @@ TESTS = {
         'd_init': 0,
         'page_tables': [],
     },
+    'tss286_stack_switch': {
+        'asm': 'tss286_stack_switch.asm',
+        'start_mode': 'real',
+        'cr0': 0x00000000,
+        'cr3': 0x00000000,
+        'eip': 0x00000000,
+        'initial_selectors': {
+            'DS': 0x0000,
+            'SS': 0x0000,
+            'ES': 0x0000,
+            'FS': 0x0000,
+            'GS': 0x0000,
+        },
+        'd_init': 0,
+        'page_tables': [],
+    },
+    'sgdt_sidt_store': {
+        'asm': 'sgdt_sidt_store.asm',
+        'start_mode': 'real',
+        'cr0': 0x00000000,
+        'cr3': 0x00000000,
+        'eip': 0x00000000,
+        'initial_selectors': {
+            'DS': 0x0000,
+            'SS': 0x0000,
+            'ES': 0x0000,
+            'FS': 0x0000,
+            'GS': 0x0000,
+        },
+        'd_init': 0,
+        'page_tables': [],
+    },
+    'conforming_cpl': {
+        'asm': 'conforming_cpl.asm',
+        'start_mode': 'real',
+        'cr0': 0x00000000,
+        'cr3': 0x00000000,
+        'eip': 0x00000000,
+        'initial_selectors': {
+            'DS': 0x0000,
+            'SS': 0x0000,
+            'ES': 0x0000,
+            'FS': 0x0000,
+            'GS': 0x0000,
+        },
+        'd_init': 0,
+        'page_tables': [],
+    },
+    'intgate16_errcode_frame': {
+        'asm': 'intgate16_errcode_frame.asm',
+        'start_mode': 'real',
+        'cr0': 0x00000000,
+        'cr3': 0x00000000,
+        'eip': 0x00000000,
+        'initial_selectors': {
+            'DS': 0x0000,
+            'SS': 0x0000,
+            'ES': 0x0000,
+            'FS': 0x0000,
+            'GS': 0x0000,
+        },
+        'd_init': 0,
+        'page_tables': [],
+    },
+    'mov_dr_cr3_preserve': {
+        'asm': 'mov_dr_cr3_preserve.asm',
+        'start_mode': 'protected',
+        'cr0': 0x80000001,  # PE=1, PG=1
+        'cr3': 0x00005000,  # Page directory NOT at 0 so a CR3 zero-clobber is visible
+        'eip': 0x00000000,
+        'seg_cache': {
+            'CS': {'base': 0x00010000, 'limit': 0xFFFFF, 'flags': seg_flags(code=True)},
+            'DS': {'base': 0x20000000, 'limit': 0xFFFFF, 'flags': seg_flags(code=False)},
+            'SS': {'base': 0x30000000, 'limit': 0xFFFFF, 'flags': seg_flags(code=False)},
+            'ES': {'base': 0x00000000, 'limit': 0xFFFFF, 'flags': seg_flags(code=False)},
+            'FS': {'base': 0x00000000, 'limit': 0xFFFFF, 'flags': seg_flags(code=False)},
+            'GS': {'base': 0x00000000, 'limit': 0xFFFFF, 'flags': seg_flags(code=False)},
+        },
+        'page_tables': [
+            # (linear_start, physical_start, num_pages, flags)
+            (0x00010000, 0x00010000, 16, 'RW'),  # CS: identity mapped test code
+            (0x20000000, 0x00020000, 1, 'RW'),   # DS page 0: warm access
+            (0x20001000, 0x00040000, 1, 'RW'),   # DS page 1: cold-walk check
+            (0x30000000, 0x00060000, 1, 'RW'),   # SS page
+        ],
+    },
     'call_gate': {
         'asm': 'call_gate.asm',
         'start_mode': 'real',
@@ -620,13 +706,14 @@ TESTS = {
             'CS': {'base': 0x00010000, 'limit': 0xFFFFF, 'flags': seg_flags(code=True)},
             'DS': {'base': 0x20000000, 'limit': 0xFFFFF, 'flags': seg_flags(code=False)},
             'SS': {'base': 0x30000000, 'limit': 0xFFFFF, 'flags': seg_flags(code=False)},
-            'ES': {'base': 0x00000000, 'limit': 0xFFFFF, 'flags': seg_flags(code=False)},
+            # ES.base == DS.base so rep movs/stos (dest ES:EDI) hits the DS page.
+            'ES': {'base': 0x20000000, 'limit': 0xFFFFF, 'flags': seg_flags(code=False)},
             'FS': {'base': 0x00000000, 'limit': 0xFFFFF, 'flags': seg_flags(code=False)},
             'GS': {'base': 0x00000000, 'limit': 0xFFFFF, 'flags': seg_flags(code=False)},
         },
         'page_tables': [
             (0x00010000, 0x00010000, 16, 'RW'),  # CS: identity mapped test code
-            (0x20000000, 0x00020000, 1, 'RW'),   # DS page
+            (0x20000000, 0x00020000, 1, 'RW'),   # DS+ES page
             (0x30000000, 0x00060000, 1, 'RW'),   # SS page
         ],
     },
@@ -689,7 +776,8 @@ def build_memory_image(test_config, code_bin, output_hex, verbose=False):
     # Generate page tables
     pt_mappings = test_config.get('page_tables', [])
     if pt_mappings:
-        pt_mem = generate_page_tables(pt_mappings, page_dir_addr=0x0000)
+        pt_mem = generate_page_tables(pt_mappings,
+                                      page_dir_addr=test_config['cr3'] & 0xFFFFF000)
         for addr, data in pt_mem.items():
             for i, byte in enumerate(data):
                 memory[addr + i] = byte

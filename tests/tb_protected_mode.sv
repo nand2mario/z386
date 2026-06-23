@@ -637,7 +637,7 @@ module tb_protected_mode;
 
             // Trace paging
             if ($test$plusargs("trace_paging") && dut.mem_req_upcoming)
-                $display("PAGING: linear=%08X servicing=%0d", dut.mem_linear_addr, dut.mem_servicing);
+                $display("PAGING: linear=%08X servicing=%0d", dut.ind_linear, dut.mem_servicing);
         end
     end
 
