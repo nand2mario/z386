@@ -1700,7 +1700,8 @@ always_ff @(posedge clk) begin
         uaddr <= uaddr_now;
 
         // Clear interrupt_entry pulse each cycle (set by NMI/INTR handlers below)
-        interrupt_entry <= 1'b0;
+        if (!stall)
+            interrupt_entry <= 1'b0;
 
         // Delay slot completion handling:
         if (i_rni_delay && !stall && !page_fault) begin
