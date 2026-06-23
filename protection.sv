@@ -64,13 +64,9 @@ module protection_unit
     output       [11:0] jump_addr,        // Microcode jump address
     output              jump_valid,       // jump_addr is a redirect (vs 0x000 = CONTINUE)
 
-    output              stack_op,         // K flag: Stack operation / update CPL
-    output              limit_check,      // L flag: Perform limit/type validation
     output              validation_ok,    // M flag: Descriptor validated, safe to commit
-    output              set_accessed,     // N flag: Set Accessed bit in descriptor
 
-    output              result_valid,     // Pipelined result is valid (fires 2 cycles after test)
-    output              is_checking_test  // Result is from a "checking" test (not PTGEN action)
+    output              result_valid      // Pipelined result is valid (fires 2 cycles after test)
 );
 
 //==============================================================================
@@ -1288,12 +1284,8 @@ end
 // Registered outputs (from Stage 2)
 assign jump_addr      = s2_jump_addr;
 assign jump_valid     = s2_jump_valid;
-assign stack_op       = s2_flags[3];  // K flag (bit 17) — pla_test_flags[3]=K (MSB=output bit 17)
-assign limit_check    = s2_flags[2];  // L flag (bit 16)
 assign validation_ok  = s2_flags[1];  // M flag (bit 15)
-assign set_accessed   = s2_flags[0];  // N flag (bit 14) — pla_test_flags[0]=N (LSB=output bit 14)
 assign result_valid   = s2_valid;
-assign is_checking_test = s2_is_checking_test;
 
 //==============================================================================
 // Assertions and Debug
@@ -1358,8 +1350,6 @@ assign is_checking_test = s2_is_checking_test;
             end else begin
                 $display("PROT: %s (0x%02x) FAILED -> 0x%03x",
                          test_name(s2_test_const), s2_test_const, jump_addr);
-                $display("      Flags: N(Accessed)=%b M(Valid)=%b L(Limit)=%b K(Stack)=%b",
-                         set_accessed, validation_ok, limit_check, stack_op);
             end
         end
     end

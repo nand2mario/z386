@@ -15,7 +15,9 @@
 module z386
     import z386_pkg::*;
 #(
-    parameter PROTECT_UMA_ROM = 0
+    parameter PROTECT_UMA_ROM = 0,
+    parameter DCACHE_SET_BITS = 8,   // dcache size: 8 = 16KB, 7 = 8KB
+    parameter ICACHE_SET_BITS = 8    // icache size: 8 = 16KB, 7 = 8KB
 )
 (
     input              clk,
@@ -176,6 +178,7 @@ reg  [1:0]  arpl_rpl_latch;         // ARPL RPL latch (declared fully near ARPL 
 // Memory requests
 wire        mem_servicing;          // memory request in flight
 wire        mem_dly_grace;          // optimistic read: DLY may execute this (lookup) cycle
+wire        mem_write_dly_grace;    // posted write in PG_MEM_TLB: next non-bus uop may execute now
 wire        mem_opt_wait;           // optimistic read missed: stall all uops until fill done
 wire        mem_accepted;           // memory request accepted (ready pulse)
 wire        mem_complete_now;       // combinational, request completing THIS cycle
@@ -297,17 +300,12 @@ wire [5:0]  uc_source;              // Source field from microcode
 wire [31:0] dest_value;             // Destination value for writes
 wire        gp_fault_trigger;       // GP fault trigger
 wire        div_overflow;           // Division overflow
-wire [31:0] OPR_R;                  // Read operand register
-// stack_init_pending and OPR_W are regs, declared later
+// stack_init_pending is a reg, declared later
 
 wire [11:0] prot_jump_addr;         // Microcode jump address from protection unit
 wire        prot_jump_valid;        // jump_addr is a redirect (non-zero)
-wire        prot_set_accessed;      // N flag: Set accessed bit
 wire        prot_validation_ok;     // M flag: Descriptor validated
-wire        prot_limit_check;       // L flag: Perform limit check
-wire        prot_stack_op;          // K flag: Stack operation/CPL update
 wire        prot_result_valid;      // Pipelined result is valid (2 cycles after test)
-wire        prot_is_checking_test;  // Result is from a "checking" test (not PTGEN)
 
 wire        dcache_req_valid;
 wire [31:0] dcache_req_phys_addr;
@@ -316,7 +314,6 @@ wire [3:0]  dcache_req_be;
 wire [31:0] dcache_req_wdata;
 wire        dcache_req_is_io;
 wire        dcache_req_is_inta;
-wire [9:0]  dcache_req_idx;
 wire        dcache_req_accepted;
 wire        dcache_req_complete;
 wire [31:0] dcache_rdata;
@@ -338,7 +335,6 @@ wire        dcache_mem_write;
 wire        dcache_mem_ready;
 wire        dcache_mem_resp_valid;
 
-wire [31:0] icache_cpu_dout;
 wire [127:0] icache_cpu_line;
 wire        icache_cpu_ready;
 wire        icache_cpu_resp_valid;
@@ -831,8 +827,7 @@ wire mem_is_io = mem_seg_is_io;     // registered in segmentation_unit alongside
 wire io_busop_rd = uc_p_io_rd && mem_is_io;
 wire io_busop_wr = uc_p_io_wr && mem_is_io;
 
-// IACK bus operation (interrupt acknowledge)
-wire iack_busop = uc_p_iack;
+wire iack_busop = uc_p_iack;        // IACK bus operation (interrupt acknowledge)
 
 // Interrupt pending: NMI has priority over INTR
 wire nmi_edge = nmi && !nmi_prev && !nmi_blocked;
@@ -841,19 +836,13 @@ wire interrupt_pending = nmi_request_active || (intr_pending && EFLAGS[9]);
 wire nmi_accept_boundary = i_rni_delay && !stall && !page_fault &&
                            nmi_request_active && !single_step;
 
-// STI shadow: real 386 suppresses interrupt recognition for one instruction after STI.
-reg inhibit_interrupts;
+reg inhibit_interrupts;     // STI shadow: real 386 suppresses interrupt recognition for one instruction after STI
 
-// Current RD/WR/IACK uop request.  z386 does not keep a local pending copy:
-// the current micro-op drives paging.valid and stalls until paging.ready.
-assign mem_op_eligible = core_live && !mem_servicing;
-
-// This uop issues a bus request: one LUT from predecoded uc bits + seg_is_io
-// register (the IO/mem buscode-set distinction is preserved via predecode).
-wire uc_busreq = (pg_mem_busop && !mem_is_io) ||
+assign mem_op_eligible = core_live && !mem_servicing;   // current RD/WR/IACK uop request
+wire uc_busreq = (uc_is_mem_busop && !mem_is_io) ||
                  io_busop_rd || io_busop_wr ||
                  iack_busop;
-wire mem_req_current = mem_op_eligible && uc_busreq;
+wire mem_req_current = mem_op_eligible && uc_busreq;    // drives paging unit
 
 // Delay prefetch on upcoming demand memory
 wire mem_req_upcoming = uc_next[39] && !halted && (uc_active || !decq_empty);
@@ -966,13 +955,13 @@ always @(posedge clk) begin
         $display("%0t: PM FAULT CS:EIP=%0x:%0x SIGMA=%08x TMPF=%08x EFL=%08x", $time, CS, EIP, SIGMA, TMPF, EFLAGS);
 end
 // Debug: log IDT base changes
-reg [31:0] dbg_idt_base_q;
-always @(posedge clk) begin
-    dbg_idt_base_q <= seg_cache[SEG_IDT].base;
-    if (reset_n && dbg_idt_base_q != seg_cache[SEG_IDT].base)
-        $display("%0t: IDT base %08x -> %08x uc=%03x CS:EIP=%0x:%0x", $time,
-                 dbg_idt_base_q, seg_cache[SEG_IDT].base, uc_addr, CS, EIP);
-end
+// reg [31:0] dbg_idt_base_q;
+// always @(posedge clk) begin
+//     dbg_idt_base_q <= seg_cache[SEG_IDT].base;
+//     if (reset_n && dbg_idt_base_q != seg_cache[SEG_IDT].base)
+//         $display("%0t: IDT base %08x -> %08x uc=%03x CS:EIP=%0x:%0x", $time,
+//                  dbg_idt_base_q, seg_cache[SEG_IDT].base, uc_addr, CS, EIP);
+// end
 // synthesis translate_on
 
 // CR3 register update
@@ -1072,12 +1061,8 @@ protection_unit protection_unit_inst (
     // Outputs
     .jump_addr        (prot_jump_addr),
     .jump_valid       (prot_jump_valid),
-    .set_accessed     (prot_set_accessed),
     .validation_ok    (prot_validation_ok),
-    .limit_check      (prot_limit_check),
-    .stack_op         (prot_stack_op),
-    .result_valid     (prot_result_valid),
-    .is_checking_test (prot_is_checking_test)
+    .result_valid     (prot_result_valid)
 );
 
 
@@ -1361,7 +1346,6 @@ reg        uc_cond_jump_taken_prev; // Conditional jump taken last cycle (for PR
 assign i_rni = ((uc_is_rni || uc_is_rni_inhibit) && !uc_jump_taken_prev) ||
                            (uc_is_rni_lc && uc_jump_taken_prev);
 
-reg        instr_is_shift;          // Instruction is a shift operation
 reg        instr_is_shxd;           // Instruction is a SHxD operation
 reg        instr_cf;                // CF bit at start of instruction
 reg        instr_is_cmp;
@@ -1454,8 +1438,8 @@ wire loopne_condition = instr_is_loop ? (countr_will_be_nonzero && zf_check)
                                       : (!countr_will_be_nonzero || zf_check);
 
 // GP Fault Detection — handled by segmentation_unit
-assign gp_fault_mem_op = pg_mem_busop && (uc_buscode != BUSOP_RD_D);
-assign gp_fault_wr_op = pg_is_write || pg_is_check_write;
+assign gp_fault_mem_op = uc_is_mem_busop && (uc_buscode != BUSOP_RD_D);
+assign gp_fault_wr_op = uc_is_write || uc_is_check_write;
 
 // DIV/IDIV Overflow Detection
 wire [31:0] div_upper_dividend = div_mask_to_size(SIGMA, op_size);
@@ -1875,7 +1859,6 @@ end
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         i <= '0;
-        instr_is_shift <= 1'b0;
         instr_is_cmp <= 1'b0;
         instr_is_shxd <= 1'b0;
         instr_cf <= 1'b0;
@@ -3376,10 +3359,11 @@ always_ff @(posedge clk) begin
 
 end
 
-// Combined result: use shifter result when second pass or exec_new_val completes
-wire use_shifter_result = (uc_aluop == ALUJMP_SHIFT2) || (uc_aluop == ALUJMP_SHIFT);
 
 assign dest_value = alu_dst;
+
+// Debug tap (read by tb_z386 hierarchically; not used in the core).
+wire use_shifter_result = (uc_aluop == ALUJMP_SHIFT2) || (uc_aluop == ALUJMP_SHIFT);
 
 
 //=============================================================================
