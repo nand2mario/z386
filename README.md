@@ -7,7 +7,7 @@ The project is intended as an educational reconstruction, a usable MiSTer PC cor
 
 *For the MiSTer core based on z386, see [z386_MiSTer](https://github.com/nand2mario/z386_MiSTer).*
 
-Comparison with ao486 on a DE10-Nano:
+Comparison of z386 v0.4 with ao486 on a DE10-Nano:
 
 |     | z386 | ao486 |
 |-----|------|-------|
@@ -16,7 +16,7 @@ Comparison with ao486 on a DE10-Nano:
 |Registers| 9.1K | 9.4K |
 |BRAM| 398K | 131K |
 |Frequency| 85 MHz | 90 MHz |
-|DOOM FPS (max details)| 19.2 | 21.0 |
+|DOOM FPS (max details)| 23.0 | 21.0 |
 
 z386's BRAM is ~76% L1 cache (16 KB instruction + 16 KB data, twice ao486's caches) and ~24% the microcode ROM (37 bits × 2560 entries). The L1 cache size is tunable via the `SET_BITS` parameter.
 
