@@ -1,7 +1,7 @@
 //=============================================================================
 // Z386 Instruction Decoder Module
 //=============================================================================
-// Structural decoder for the z386 0.2 frontend.
+// Structural decoder for the z386 0.4 frontend.
 //
 // The public interface is intentionally unchanged: the decoder still pushes a
 // completed dec_entry_t into the existing decoded-instruction queue.  Internally
@@ -10,6 +10,13 @@
 // second structural cycle only for the rare opcode+ModR/M+SIB case, then
 // capture one or two literal fields.
 //
+// Frontend entry-point lookup: when defined, the opcode->microcode-entry PLA is
+// served from a 4096x16 M10K ROM addressed one cycle early (shortens the
+// q_window->decq.entry_point critical path); when undefined, the original
+// combinational pla_entry_lookup is used.  Toggle for Quartus timing A/B.
+
+//`define USE_ENTRY_ROM
+
 module decoder
     import z386_pkg::*;
 (
@@ -18,25 +25,23 @@ module decoder
 
     // Prefetch queue interface
     input        [31:0] q_window,       // 4-byte window at current queue head
+    input        [31:0] q_window_next,  // next-cycle window (== q_window one cycle early)
     input        [5:0]  pf_count,       // Buffered prefetch bytes available
     input               pf_empty,       // Prefetch queue empty
     output       [2:0]  q_pop_bytes,    // Pop 1/2/3/4 bytes from prefetch queue
 
     // Mode signals
     input               D,              // Default operand/address size (CS.D bit)
-    input               mode_32,        // 32-bit mode; kept for interface compatibility
     input               pe_enable,      // Protected mode enable (CR0.PE)
 
     // Control signals
     input               q_flush,        // Flush decoder on branch
     input               i_pop,          // Pop decoded instruction from queue
-    input               halted,         // CPU is halted; decoder may still fill queue
-    input               stall,          // Core stall; decoder may still fill queue
 
     // Decoded instruction output
     output dec_entry_t  i_bus,          // Decoded instruction
     output              decq_empty,     // Instruction queue empty
-    output              decq_full       // Instruction queue full
+    output              decq_has_jmp_call  // decode queue holds a JMP/CALL rel (halt speculative prefetch)
 );
 
 typedef enum logic [1:0] {
@@ -94,7 +99,7 @@ reg [2:0]            decq_count;
 
 assign i_bus = decq[decq_rptr];
 assign decq_empty = (decq_count == 3'd0);
-assign decq_full  = (decq_count == DECQ_DEPTH_COUNT);
+wire   decq_full  = (decq_count == DECQ_DEPTH_COUNT);   // internal (demoted from output: queue full)
 
 // Current byte window aliases.
 wire [7:0] opcode = q_window[7:0];
@@ -165,6 +170,108 @@ always_comb begin
     else
         push_entry = lit2_work.entry;
 end
+
+// 386-style advance warning: a JMP/CALL rel is unconditionally taken, so its
+// speculative fall-through prefetch is always wasted.  Assert while such an
+// entry is in (or being pushed into) the decode queue so the prefetch halts
+// fetching past it.  (Backward Jcc is excluded -- its fall-through is the loop
+// exit, which is needed often enough on short loops to lose net.)
+function automatic logic entry_jmp_call(input dec_entry_t e);
+    entry_jmp_call = !e.has_0f && (e.opcode == 8'hEB || e.opcode == 8'hE9 ||
+                                   e.opcode == 8'hE8);
+endfunction
+
+assign decq_has_jmp_call =
+    (decq_count >= 3'd1 && entry_jmp_call(decq[decq_rptr])) ||
+    (decq_count >= 3'd2 && entry_jmp_call(decq[decq_rptr ^ 1'b1])) ||
+    (i_push && entry_jmp_call(push_entry));
+
+//=============================================================================
+// Entry-PLA ROM (M10K) -- registered replacement for pla_entry_lookup
+//=============================================================================
+// pla_entry_lookup is the deep (~6-level) opcode->microcode-entry PLA and the
+// frontend critical path (q_window -> decq.entry_point).  A 1024x64 M10K ROM
+// (pla_entry_rom.hex, exhaustively proven == the function) replaces it.
+//
+// M10K reads are synchronous (1-cycle latency), so the read address must be
+// available one cycle EARLY.  The PLA input bits split by who can supply them:
+//   * opcode, prefix_rep, prefix_0f are prefetch/decoder NEXT-state, available
+//     a cycle early; q_window_r@(N+1)==q_window_next@N (prefetch, unconditional)
+//     and prefix_state@(N+1)==prefix_*_n@N (mirror below).  -> ROM ADDRESS.
+//   * data32 (=D^prefix_66) and pe_enable are external mode bits that change
+//     ASYNCHRONOUSLY on a mode switch (e.g. MOV Sreg differs real vs protected);
+//     early-latching them is wrong.  -> applied at the OUTPUT via a 4:1 select
+//     on the CURRENT {data32, pe} this cycle.
+// So each address holds the 4 {data32,pe} entries and entry_first picks the live
+// lane -- correct across mode switches, still one M10K read + a 4:1 mux.
+`ifdef USE_ENTRY_ROM
+// Next-state mirror of the two prefix bits in the ROM ADDRESS; MUST track the
+// prefix-register updates in the always_ff below exactly (prefix_66 is not here
+// -- it folds into data32, applied live at the output select).
+logic prefix_0f_n, prefix_rep_n;
+always_comb begin
+    prefix_0f_n  = prefix_0f;
+    prefix_rep_n = prefix_rep;
+    if (q_flush) begin
+        prefix_0f_n = 1'b0; prefix_rep_n = 1'b0;
+    end else begin
+        unique case (dec_state)
+            DEC_STRUCT:
+                if ((q_pop_bytes != 3'd0) && (consume_prefix || consume_0f)) begin
+                    if (consume_0f)            prefix_0f_n  = 1'b1;
+                    else if (opcode == 8'hf2 ||
+                             opcode == 8'hf3)  prefix_rep_n = 1'b1;
+                end else if (struct_complete) begin
+                    prefix_0f_n = 1'b0; prefix_rep_n = 1'b0;
+                end
+            DEC_SIB:
+                if (sib_ready && sib_work.lit1_kind == LIT_NONE) begin
+                    prefix_0f_n = 1'b0; prefix_rep_n = 1'b0;
+                end
+            DEC_LIT1:
+                if (lit1_ready && lit1_work.lit2_kind == LIT_NONE) begin
+                    prefix_0f_n = 1'b0; prefix_rep_n = 1'b0;
+                end
+            DEC_LIT2:
+                if (lit2_ready) begin
+                    prefix_0f_n = 1'b0; prefix_rep_n = 1'b0;
+                end
+            default: ;
+        endcase
+    end
+end
+
+// 10-bit early address {opcode, rep, 0f} (matches gen_pla_entry_rom.sv).
+wire [9:0] entry_rom_addr = {q_window_next[7:0], prefix_rep_n, prefix_0f_n};
+
+(* ramstyle = "M10K" *) reg [63:0] entry_rom [0:1023];
+initial $readmemh("pla_entry_rom.hex", entry_rom);
+reg [63:0] entry_rom_q;
+always_ff @(posedge clk) entry_rom_q <= entry_rom[entry_rom_addr];
+
+// Live 4:1 select on the current mode bits {data32, pe} (lane order matches
+// the generator's pack: {e(1,1),e(1,0),e(0,1),e(0,0)}).
+wire [15:0] entry_rom_sel = entry_rom_q[{data32, pe_enable}*16 +: 16];
+
+// synthesis translate_off
+// Hard-prove the ROM tracks the live PLA every valid decode cycle.  X-guarded
+// to skip the sim-only startup transient before the first ROM read resolves
+// (in hardware the ROM holds real init data; the transient is never pushed
+// because pf_empty=1 during refill).
+wire [15:0] pla_entry_now =
+    pla_entry_lookup({data32, opcode, prefix_rep, pe_enable, 1'b1, prefix_0f});
+always_ff @(posedge clk) begin
+    if (reset_n && !pf_empty && !q_flush &&
+        (^{entry_rom_sel, pla_entry_now} !== 1'bx) &&
+        (entry_rom_sel !== pla_entry_now)) begin
+        $display("[%0t] ENTRY_ROM MISMATCH op=%02x d32=%b rep=%b 0f=%b pe=%b  rom=%04x pla=%04x",
+                 $time, opcode, data32, prefix_rep, prefix_0f, pe_enable,
+                 entry_rom_sel, pla_entry_now);
+        $fatal(1, "entry_rom != pla_entry_lookup");
+    end
+end
+// synthesis translate_on
+`endif // USE_ENTRY_ROM
 
 always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
@@ -363,8 +470,12 @@ task automatic build_struct_work(
         imm_total_size = 3'd0;
         imm_first_size = 3'd0;
 
+`ifdef USE_ENTRY_ROM
+        entry_first = entry_rom_sel;        // M10K ROM (addr early) + live {data32,pe} select
+`else
         entry_first = pla_entry_lookup({data32, opcode, prefix_rep, pe_enable,
                                         1'b1, prefix_0f});
+`endif
         entry_group = ~(|entry_first[11:6]) && has_modrm;
         // Parallel copy of entry_first[5:0] for group rows, so the
         // second-level lookup below does not chain behind the first.
@@ -389,7 +500,7 @@ task automatic build_struct_work(
                 imm_total_size = 3'd0;
 
             entry_final = entry_group ?
-                pla_entry_lookup({data32, group_code[5:4], modrm[5:3],
+                pla_group_entry_lookup({data32, group_code[5:4], modrm[5:3],
                                   group_code[3:0], (modrm[7:6] != 2'b11),
                                   1'b0, prefix_0f}) :
                 entry_first;

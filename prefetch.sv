@@ -17,6 +17,7 @@ module prefetch
 
     // Queue output to decoder
     output     [31:0] q_window,      // 4-byte window at current queue head
+    output     [31:0] q_window_next, // next-cycle window (== q_window one cycle early)
     output            q_full,
     output            q_empty,
     output     [5:0]  pf_count,
@@ -35,7 +36,8 @@ module prefetch
     input             pf_fault,      // page fault on this fetch (silently drop)
 
     // Control
-    input             pf_suspend     // external suspend (e.g. page fault handler active)
+    input             pf_suspend,    // external suspend (e.g. page fault handler active)
+    input             halt_speculative // decode queue holds a taken JMP/CALL: stop fetching past it
 );
 
 // 32-byte prefetch queue (8 x 32-bit words).  Cache fills write up to four
@@ -55,6 +57,11 @@ reg [31:0] q_window_r;               // Registered head window seen by the decod
 // synthesis translate_off
 bit TRACE_FLUSH_EN;
 initial TRACE_FLUSH_EN = $test$plusargs("trace_flush");
+// Sim-only: the queue powers up X.  q_window_r is reset to 0, but q_window_next
+// (combinational over the queue) would be X until the first fill -- which the
+// entry-PLA ROM latches one cycle early.  Hardware defines the queue via
+// reset+fill before any decode; zero it here so sim matches.
+initial for (int k = 0; k < 8; k++) prefetch_queue[k] = 32'h0;
 // synthesis translate_on
 
 function automatic [2:0] ptr_idx(input [3:0] ptr);
@@ -84,7 +91,7 @@ wire [4:0] pf_words_after_ack =
 wire pf_has_line_space = (pf_words_after_ack <= 5'd4);
 
 wire pf_can_fetch = pf_has_line_space && !pf_suspended && !pf_suspend &&
-                    !q_flush && !pf_inflight;
+                    !q_flush && !pf_inflight && !halt_speculative;
 wire pf_can_fetch_after_flush = q_flush && !pf_suspend && !pf_inflight;
 
 function automatic [31:0] line_word(input [127:0] line, input [1:0] word);
@@ -155,7 +162,7 @@ end
 wire [31:0] q_word_cur_next = queue_next[ptr_idx(rptr_next)];
 wire [31:0] q_word_nxt_next = queue_next[ptr_idx(rptr_next + 4'd1)];
 
-wire [31:0] q_window_next =
+assign q_window_next =
     byte_offset_next == 2'd0 ? q_word_cur_next :
     byte_offset_next == 2'd1 ? {q_word_nxt_next[7:0],  q_word_cur_next[31:8]} :
     byte_offset_next == 2'd2 ? {q_word_nxt_next[15:0], q_word_cur_next[31:16]} :

@@ -136,6 +136,27 @@ def main():
     body.append("        default: pla_group_lookup = 6'b000000;")
     body.append("    endcase")
     body.append("endfunction")
+    # Dedicated group-entry second-level lookup: the group rows (bit[1]==0) of
+    # pla_entry_lookup as their own, shallower casez.  The group lookup is only
+    # ever queried with group addresses (bit[1]==0), so the omitted main-only
+    # rows (bit[1]==1) never matched -- equivalent, but a smaller table on the
+    # prefetch->decq modrm->entry critical path.
+    body.append("")
+    body.append("// Group-row subset of pla_entry_lookup (bit[1]==0), as a")
+    body.append("// dedicated shallower casez for the second-level group lookup.")
+    body.append("// Same 13-bit group address; main-only rows omitted.")
+    body.append("function automatic logic [15:0] pla_group_entry_lookup(")
+    body.append("    input [12:0] addr_in")
+    body.append(");")
+    body.append("    casez (addr_in)")
+    ge_count = 0
+    for pat, val in entry_pats:
+        if pat[11] in ("0", "?"):          # bit[1]: group rows (0) or shared (?)
+            body.append(f"        13'b{pat}: pla_group_entry_lookup = 16'b{val:016b};")
+            ge_count += 1
+    body.append("        default: pla_group_entry_lookup = 16'h0000;")
+    body.append("    endcase")
+    body.append("endfunction")
     body.append("// ---- end generated: pla_group_lookup ----")
 
     out = CORE / "pla_entry.svh"
