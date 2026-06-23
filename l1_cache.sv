@@ -9,7 +9,8 @@
 // This deliberately avoids the old VIPT preread/finalize split.  The paging
 // unit owns translation and only sends physical requests to this module.
 module l1_cache #(
-    // Four ways, 16 bytes per line. SET_BITS=8 gives a 16KB data cache.
+    // Four ways, 16 bytes per line. SET_BITS=8 gives a 16KB data cache
+    // (256 sets x 4 ways x 16 B); =7 was 8KB.
     parameter integer SET_BITS = 8,
     parameter PROTECT_UMA_ROM = 0
 ) (
@@ -17,12 +18,10 @@ module l1_cache #(
     input         reset,
 
     // CPU side — physical address request/response.
-    input  [31:0] cpu_addr,
-    // Array index bits cpu_addr[11:2].  These are page-offset bits (identical
-    // between linear and physical address), so the caller can source them from
-    // registers without waiting for the TLB result.  Must equal cpu_addr[11:2]
-    // whenever cpu_valid is high.  Width = SET_BITS + 2 word-offset bits.
-    input  [SET_BITS+1:0] cpu_idx,
+    input  [31:0] cpu_addr,    // physical byte address; the cache indexes off the
+                               // page-offset bits [11:2] (translation-invariant,
+                               // so available without the TLB result) and tags off
+                               // [31:12], exactly like l1_icache
     input  [31:0] cpu_din,
     output [31:0] cpu_dout,
     input   [3:0] cpu_be,
@@ -71,21 +70,14 @@ localparam [SET_BITS-1:0] LAST_SET = SET_BITS'(NUM_SETS - 1);
 
 // Address decomposition.  The cache covers the low 32MB physical window.
 wire [TAG_BITS-1:0] cpu_tag = cpu_addr[TAG_MSB:TAG_LSB];
-// Set/word array index comes from cpu_idx (register-sourced by the caller),
-// not from the TLB-muxed cpu_addr.  Both carry the same page-offset bits.
-wire [SET_BITS-1:0] cpu_set = cpu_idx[SET_BITS+1:WORD_OFFSET_BITS];
-wire [WORD_OFFSET_BITS-1:0] cpu_word = cpu_idx[WORD_OFFSET_BITS-1:0];
-// synthesis translate_off
-always @(posedge clk) begin
-    if (!reset && cpu_valid && cpu_idx != cpu_addr[SET_MSB:BYTE_OFFSET_BITS])
-        $display("L1 ERROR: cpu_idx %x != cpu_addr[11:2] %x", cpu_idx, cpu_addr[SET_MSB:BYTE_OFFSET_BITS]);
-end
-// synthesis translate_on
+// Set/word array index from the physical address page-offset bits
+// (cpu_addr[11:2], translation-invariant -- available without the TLB result).
+wire [SET_BITS-1:0] cpu_set = cpu_addr[SET_MSB:SET_LSB];
+wire [WORD_OFFSET_BITS-1:0] cpu_word = cpu_addr[LINE_OFFSET_BITS-1:BYTE_OFFSET_BITS];
 wire [BRAM_ADDR_BITS-1:0] cpu_bram_addr = {cpu_set, cpu_word};
 wire [SET_BITS-1:0] snoop_set = snoop_addr[SET_MSB:SET_LSB];
-wire cpu_write_enabled = cpu_write;
 wire cpu_uncacheable = !cache_enable || (cpu_addr[31:17] == 15'h5);
-wire cpu_protect_write = PROTECT_UMA_ROM && cpu_write_enabled && (cpu_addr[24:18] == 7'b000_0011);
+wire cpu_protect_write = PROTECT_UMA_ROM && cpu_write && (cpu_addr[24:18] == 7'b000_0011);
 
 // Tag/data storage.
 (* ram_style = "block" *) reg [TAG_RAM_BITS-1:0] tag_way0 [0:NUM_SETS-1] /* synthesis syn_ramstyle="block_ram" */;
@@ -272,7 +264,7 @@ wire lookup_hit = |lookup_hit_vec;
 wire [1:0] lookup_way = way_encode(lookup_hit_vec);
 wire [31:0] lookup_way_data = way_data_mux(lookup_way, rd_data0_r, rd_data1_r, rd_data2_r, rd_data3_r);
 wire [BRAM_ADDR_BITS-1:0] req_bram_addr = {req_set_r, req_word_r};
-wire can_accept_cpu = (state == S_IDLE) && !reset && (!cpu_write_enabled || cpu_protect_write || storeq_can_accept);
+wire can_accept_cpu = (state == S_IDLE) && !reset && (!cpu_write || cpu_protect_write || storeq_can_accept);
 wire ready_when_idle = !reset && storeq_can_accept;
 wire accept_cpu = cpu_valid && ready_r && can_accept_cpu;
 wire [29:0] req_addr_dw = req_addr_r[31:2];
@@ -507,7 +499,7 @@ always_ff @(posedge clk) begin
                     req_addr_r <= cpu_addr;
                     req_din_r <= cpu_din;
                     req_be_r <= cpu_be;
-                    req_write_r <= cpu_write_enabled;
+                    req_write_r <= cpu_write;
                     req_uncacheable_r <= cpu_uncacheable;
                     req_protect_write_r <= cpu_protect_write;
                     req_tag_r <= cpu_tag;

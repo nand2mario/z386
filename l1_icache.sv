@@ -8,14 +8,13 @@
 // This is the instruction-cache half of l1_cache.sv with the store buffer and
 // write datapath removed.
 module l1_icache #(
-    parameter integer SET_BITS = 8
+    parameter integer SET_BITS = 8   // 16KB icache (256 sets x 4 ways x 16 B); =7 was 8KB
 ) (
     input         clk,
     input         reset,
 
     // CPU side — physical read request/response.
     input  [31:0] cpu_addr,
-    output [31:0] cpu_dout,
     output [127:0] cpu_line,
     input         cpu_valid,
     output        cpu_ready,
@@ -63,7 +62,6 @@ localparam integer TAG_DW_MSB = TAG_MSB - BYTE_OFFSET_BITS;
 
 wire [TAG_BITS-1:0] cpu_tag = cpu_addr[TAG_MSB:TAG_LSB];
 wire [SET_BITS-1:0] cpu_set = cpu_addr[SET_MSB:SET_LSB];
-wire [WORD_OFFSET_BITS-1:0] cpu_word = cpu_addr[LINE_OFFSET_BITS-1:BYTE_OFFSET_BITS];
 wire [TAG_BITS-1:0] snoop_tag = snoop_addr[TAG_MSB:TAG_LSB];
 wire [SET_BITS-1:0] snoop_set = snoop_addr[SET_MSB:SET_LSB];
 wire [WORD_OFFSET_BITS-1:0] snoop_word = snoop_addr[LINE_OFFSET_BITS-1:BYTE_OFFSET_BITS];
@@ -97,7 +95,6 @@ reg [31:0] req_addr_r;
 reg        req_uncacheable_r;
 reg [TAG_BITS-1:0] req_tag_r;
 reg [SET_BITS-1:0] req_set_r;
-reg [WORD_OFFSET_BITS-1:0] req_word_r;
 
 reg        mem_valid_r;
 reg [31:0] mem_addr_r;
@@ -130,7 +127,6 @@ reg  [3:0] patchq_be   [0:PATCHQ_DEPTH-1];
 reg        patchq_valid[0:PATCHQ_DEPTH-1];
 reg [PATCHQ_IDX_BITS-1:0] patchq_head;
 reg [WORD_OFFSET_BITS-1:0] fill_count;
-reg [WORD_OFFSET_BITS-1:0] fill_target_word;
 reg [SET_BITS-1:0] fill_set;
 reg [TAG_BITS-1:0] fill_tag;
 reg [1:0] fill_way;
@@ -139,7 +135,6 @@ reg [2:0] fill_plru_r;
 reg fill_requested;
 reg fill_valid0_r, fill_valid1_r, fill_valid2_r, fill_valid3_r;
 
-reg [31:0] dout_r;
 reg [127:0] line_r;
 reg resp_valid_r;
 reg ready_r;
@@ -171,11 +166,8 @@ begin
 end
 endfunction
 
-function automatic [31:0] select_word(input [127:0] line, input [1:0] word);
-begin
-    select_word = line[{word, 5'b0} +: 32];
-end
-endfunction
+// select_word removed: the single-word read path is dead (superseded by the
+// 128-bit cpu_line output).
 
 function automatic [127:0] patch_line_word(input [127:0] line, input [1:0] word, input [31:0] data);
 begin
@@ -305,7 +297,6 @@ always_comb begin
     fill_line_next = patch_line_word(fill_line_base, fill_count, fill_word_next);
 end
 
-assign cpu_dout = lookup_read_hit_now ? select_word(lookup_way_line, req_word_r) : dout_r;
 assign cpu_line = lookup_read_hit_now ? lookup_way_line : line_r;
 assign cpu_resp_valid = lookup_read_hit_now || resp_valid_r;
 
@@ -356,7 +347,6 @@ always_ff @(posedge clk) begin
         req_valid_r <= 1'b0;
         ready_r <= 1'b0;
         resp_valid_r <= 1'b0;
-        dout_r <= 32'h0;
         line_r <= 128'h0;
         mem_valid_r <= 1'b0;
         mem_addr_r <= 32'h0;
@@ -453,7 +443,6 @@ always_ff @(posedge clk) begin
                     req_uncacheable_r <= cpu_uncacheable;
                     req_tag_r <= cpu_tag;
                     req_set_r <= cpu_set;
-                    req_word_r <= cpu_word;
                     state <= S_LOOKUP;
                 end
             end
@@ -482,7 +471,6 @@ always_ff @(posedge clk) begin
                     fill_valid2_r <= rd_valid2_r;
                     fill_valid3_r <= rd_valid3_r;
                     fill_count <= {WORD_OFFSET_BITS{1'b0}};
-                    fill_target_word <= req_word_r;
                     fill_line <= 128'h0;
                     fill_requested <= 1'b0;
                     state <= S_FILL;
@@ -503,7 +491,6 @@ always_ff @(posedge clk) begin
                     if (fill_count == {WORD_OFFSET_BITS{1'b1}}) begin
                         write_cache_line(fill_way, fill_set, fill_line_next);
                         write_cache_tag(fill_way, fill_set, fill_tag);
-                        dout_r <= select_word(fill_line_next, fill_target_word);
                         line_r <= fill_line_next;
                         resp_valid_r <= 1'b1;
                         case (fill_way)
@@ -522,7 +509,6 @@ always_ff @(posedge clk) begin
 
             S_BYPASS_WAIT: begin
                 if (mem_resp_valid) begin
-                    dout_r <= mem_dout;
                     line_r <= {4{mem_dout}};
                     resp_valid_r <= 1'b1;
                     state <= S_IDLE;
