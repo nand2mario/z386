@@ -23,7 +23,8 @@ z386's BRAM is ~76% L1 cache (16 KB instruction + 16 KB data, twice ao486's cach
 
 To learn more about the 80386 microcode, read [80386 microcode disassembled](https://www.reenigne.org/blog/80386-microcode-disassembled/).
 
-z386 was written mainly from January to April 2026. These blog posts record the process of studying the 386 microarchitecture and building z386:
+I also wrote a blog series analyzing the 386 microarchitecture and documenting the process of building z386:
+
 * [80386 Multiplication and Division](https://nand2mario.github.io/posts/2026/80386_multiplication_and_division/)
 * [80386 Barrel Shifter](https://nand2mario.github.io/posts/2026/80386_barrel_shifter/)
 * [80386 Protection](https://nand2mario.github.io/posts/2026/80386_protection/)
