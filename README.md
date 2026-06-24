@@ -19,7 +19,7 @@ Comparison of z386 v0.4 with ao486 on a DE10-Nano:
 |DOOM FPS (max details)| 23.0 | 21.0 |
 |Boots Windows | Not yet | Yes |
 
-z386's BRAM is ~76% L1 cache (16 KB instruction + 16 KB data, twice ao486's caches) and ~24% the microcode ROM (37 bits × 2560 entries). The L1 cache size is tunable via the `SET_BITS` parameter.
+z386's BRAM is ~76% L1 cache (16 KB instruction + 16 KB data, twice ao486's caches) and ~24% the microcode ROM (37 bits × 2560 entries). The L1 cache size is tunable via the `DCACHE_SET_BITS` and `ICACHE_SET_BITS` parameters.
 
 To learn more about the 80386 microcode, read [80386 microcode disassembled](https://www.reenigne.org/blog/80386-microcode-disassembled/).
 
