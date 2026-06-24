@@ -54,14 +54,6 @@ module z386
     output             dbg_vm
 );
 
-localparam bit TRACE_DEBUG_EN  = 1'b0;
-localparam bit TRACE_GATE_EN   = 1'b0;
-localparam bit TRACE_MODE_EN   = 1'b0;
-localparam bit TRACE_PAGING_EN = 1'b0;
-localparam bit TRACE_POST8_EN  = 1'b0;
-localparam bit TRACE_PROT_EN   = 1'b0;
-localparam bit TRACE_UCODE_EN  = 1'b0;
-
 reg dbg_first_done;                 // Debug: first instruction finished execution
 reg halted;                         // Tracks when the core is halted
 reg [31:0] debug_ip;                // Debug: IP at instruction completion
@@ -221,15 +213,6 @@ assign     i_entry = i_entry_raw && !any_fault;
 wire       interrupt_at_boundary = i_rni_delay && interrupt_pending && !single_step;
 assign     i_pop = init_cycle && !stall && !page_fault && !interrupt_at_boundary && !q_flush;
 
-// Stall: hold the current memory uop until paging can accept it, then hold DLY
-// while the accepted request is owned by paging.
-//
-// Optimistic read release: during mem_dly_grace (the dcache lookup cycle of a
-// non-crossing demand read) a pure-DLY uop may execute one cycle early — on a
-// hit the data is written to OPR_R at the end of that same cycle, and no
-// microcode word both carries DLY and sources OPR_R.  If the read turns out to
-// be a miss, mem_opt_wait (registered in paging) stalls every following uop
-// until the fill completes.
 wire       core_live = !halted && uc_active && !fault_suppress_delay_slot && !interrupt_entry;
 wire       dly_grace_now = mem_dly_grace && uc_p_pure_dly;
 wire       posted_write_release = mem_write_dly_grace && !uc_busreq;    // release non-busop writes after one cycle
@@ -244,9 +227,7 @@ wire       prot_result_now = prot_result_valid && prot_test_inflight;
 wire       repeat_active = uc_is_rpt && (COUNTR[4:0] != 0 || prot_test_inflight) && !prot_result_now
                            && !(uc_is_wio && interrupt_pending);
 
-// uc_exec: master enable for microcode execution.  Equivalent to
-// !stall_mem && !stall_wio && core_live, written with mem_servicing as the
-// select so core_live is not double-counted through mem_req_current.
+// uc_exec: master enable for microcode execution
 wire       uc_exec = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) && !stall_wio;
 wire       uc_exec_writeback = uc_exec;  // local copies for reducing fanout
 wire       uc_exec_mul_start = uc_exec;
@@ -663,8 +644,6 @@ wire [2:0]  i_seg = i.seg;
 wire [2:0]  i_reg_dst_reg_sel = i.dst_reg_sel;
 wire [2:0]  i_reg_src_reg_sel = i.src_reg_sel;
 
-// Segmentation unit command encoder: translates raw microcode fields to commands
-// Resolved modrm-based segment for DES_OS/DES_SR (used by encoder)
 wire [3:0] modrm_resolved_seg = apply_seg_override_type(
     calc_default_seg_type(i_modrm, i_sib, i_has_sib, i_reg_addr32), i_seg);
 
@@ -745,8 +724,6 @@ always_comb begin
         seg_cmd = SEG_CMD_INIT_SEG;
     end else if (uc_dest == DEST_DESCSW) begin
         seg_cmd = SEG_CMD_DESCSW;
-    // STSSAF/CTSSAF are delivered via the stssaf/ctssaf_pulse sideband so the
-    // same uop's busop command is not lost (608 = CTSSAF+SDEL, 74B = STSSAF+IN=+)
     end else begin
         case (uc_buscode)
             BUSOP_IND_PLUS_ALU,
@@ -861,9 +838,6 @@ wire        mem_req_to_paging = mem_req_current && !gp_fault_trigger;
 wire        mem_write_now = uc_is_write || (io_busop_wr && mem_is_io);
 wire [3:0]  mem_be_now = iack_busop ? 4'b1111 :
                           calc_be(mem_eff_size, ind_linear[1:0]);
-// ind_linear already prefers linear_early for the demand read (see above),
-// so the cache/byte-enables/paging all get the seg-add-free linear from here.
-// One registered linear for both the demand path and the live TLB (iack uses IND).
 wire [31:0] paging_linear_addr = iack_busop ? IND : ind_linear;
 wire        paging_live_valid  = iack_busop ? 1'b1 : ind_linear_valid;
 wire        paging_mem_rd_ind = (uc_buscode == BUSOP_RD_IND);
@@ -954,14 +928,6 @@ always @(posedge clk) begin
     if (reset_n && uc_addr == 12'h890 && !EFLAGS[17])
         $display("%0t: PM FAULT CS:EIP=%0x:%0x SIGMA=%08x TMPF=%08x EFL=%08x", $time, CS, EIP, SIGMA, TMPF, EFLAGS);
 end
-// Debug: log IDT base changes
-// reg [31:0] dbg_idt_base_q;
-// always @(posedge clk) begin
-//     dbg_idt_base_q <= seg_cache[SEG_IDT].base;
-//     if (reset_n && dbg_idt_base_q != seg_cache[SEG_IDT].base)
-//         $display("%0t: IDT base %08x -> %08x uc=%03x CS:EIP=%0x:%0x", $time,
-//                  dbg_idt_base_q, seg_cache[SEG_IDT].base, uc_addr, CS, EIP);
-// end
 // synthesis translate_on
 
 // CR3 register update
@@ -1191,9 +1157,7 @@ wire [31:0] forwarded_esp = delay_slot_writes_esp ? dest_value : ESP;
 // delay-slot uop writes, and how)
 localparam [1:0] FWD_BLO = 2'd0, FWD_BHI = 2'd1, FWD_W = 2'd2, FWD_D = 2'd3;
 
-// {we, sel[2:0], mode[1:0]} for a delay-slot write to microcode dest `dest`.
-// IRF is included here for the reference; the functional path overrides IRF's
-// COUNTR-derived fields with the live COUNTR.
+// {we, sel[2:0], mode[1:0]} for a delay-slot write to microcode dest `dest`
 function automatic [5:0] decode_dly_gpr(input [6:0] dest);
     reg       we; reg [2:0] sel; reg [1:0] mode; reg [2:0] rs;
     begin
@@ -1267,10 +1231,7 @@ wire       dly_gpr_we   = i_rni_delay &&
 wire [2:0] dly_gpr_sel  = dly_is_irf_pre_r ? COUNTR[2:0]              : dly_gpr_sel_pre_r;
 wire [1:0] dly_gpr_mode = dly_is_irf_pre_r ? (is_dword ? FWD_D : FWD_W) : dly_gpr_mode_pre_r;
 
-// EA decode registered at i_entry.  decq[0]/i_bus is stable from i_entry through
-// i_pop (i_entry requires !decq_empty and the queue isn't popped until i_pop), so
-// latching the EA decode one cycle early moves the modrm->ea_dec logic off the
-// i_pop EA path -- modrm->IND was the top clk_sys setup path.
+// EA decode registered at i_entry
 reg [7:0]  ea_dec_base_sel_r, ea_dec_index_sel_r;
 reg [1:0]  ea_dec_scale_r;
 reg [31:0] ea_dec_disp_r;
@@ -1373,7 +1334,7 @@ reg        misc2_flag;              // Set by SMISC2 {-35-}, tested by JMISC2 {-
 reg        error_code_flag;         // Set by SERRCF {-36-}, tested by JNERRC {-56-}
 reg        interrupt_hw;            // Set for hardware interrupts, tested by JINTSW {-52-}
 reg        intr_pending;            // Latched INTR request (level-sampled, cleared by CINTLA)
-reg        intr_latch_inhibit;     // Suppress re-latching after CINTLA until intr deasserts
+reg        intr_latch_inhibit;      // Suppress re-latching after CINTLA until intr deasserts
 reg        nmi_pending;             // Latched NMI request (edge-detected, cleared on NMI entry)
 reg        nmi_blocked;             // NMI service in progress (set by SETNMI, cleared by CLRNMI)
 reg        nmi_prev;                // Previous NMI value for edge detection
@@ -1398,10 +1359,7 @@ wire [31:0] br_disp        = br_is_rel8 ? {{24{i.displacement[7]}}, i.displaceme
 wire [31:0] br_target      = EIP + br_disp;
 // synthesis translate_off
 always @(posedge clk) begin
-    // Only validate the microcode-PREF flush path: there pf_flush_addr uses IND
-    // (= pf_flush_ip), so IND must equal the branch target.  The early_redirect
-    // path uses br_target directly and leaves IND stale, so comparing against it
-    // there is a false positive.
+    // Validate the microcode-PREF flush path
     if (reset_n && q_flush && !early_redirect && is_dword && (br_is_jcc || br_is_jmp_rel || br_is_call_rel) &&
         (pf_flush_ip !== (CS_base + br_target)))   // compare LINEAR vs LINEAR (pf_flush_ip is IND = CS_base+EIP+disp)
         $display("%0t: BR TARGET MISMATCH computed=%08x actual=%08x op=%02x CS:EIP=%0x:%0x",
@@ -1873,12 +1831,6 @@ always_ff @(posedge clk) begin
                                           (i_bus.opcode == 8'hAC) || (i_bus.opcode == 8'hAD));
         instr_cf <= eflags_fwd[0];      // RCL/RCR carry-in: forward the committing CF (eflags_fwd)
         instr_is_cmp <= i_bus.opcode[7:2] == 6'b100000 || i_bus.opcode[7:3] == 5'b00111;
-        // Early-read eligible = the demand-read linear is registered at i_pop
-        // (ind_linear): modrm EA, stack (POP/RET), or moffs.  All feed the live
-        // TLB through the registered ind_linear, so issuing the dcache request at
-        // PG_IDLE (early read) adds no seg adder to the cone.  The early_rd path's
-        // !mem_write filter limits this to reads; microcode IND reads (set in
-        // uc_exec, not at i_pop) stay on the normal path via !mem_rd_ind.
         instr_ind_is_ea <= i_bus.has_modrm || i_bus.stack_op || i_bus.has_moffs;
         // Pre-decode ALU group op: eliminates i.opcode/i.modrm muxes from ALU critical path
         alu_grp_op <= i_bus.opcode[7] ? i_bus.modrm[5:3] : i_bus.opcode[5:3];
@@ -3062,6 +3014,7 @@ alu u_alu (
 //=============================================================================
 // Two-cycle ALU flag retirement
 //=============================================================================
+// Flags are timing critical in x86, so pipelining them over two cycles.
 // Cycle 1: registers the raw result and the cheap carry-chain flags (CF/AF/OF)
 // Cycle 2: derives ZF/SF/PF and commits to EFLAGS and uc_flags
 reg        flag2_eflags_p;     // commit to EFLAGS this cycle (producer had uc[37])
@@ -3190,7 +3143,6 @@ logic [4:0]  shift_size;     // original shift amount
 logic        shift_overflow; // SHL/SHR/SAR count > width (result is 0 or sign-extended)
 logic        shift_eq_width; // count == width (for SHL/SHR CF special case)
 logic        shift_eq_cf;    // saved CF for count==width case
-logic        bsr_rotate_mode; // BSR uses ROL where shift_lo = shift_hi for proper wrap
 
 // Optimization: shift/bit-test execution microcode uses a smaller source-selector subset
 logic [31:0] shift_src_value;
@@ -3272,8 +3224,6 @@ wire         shift_last_out_msb = shifted[width];
 // Simplified shift CF for uc_flags: left shift uses MSB, right shift uses LSB
 wire         shift_cf = shift_swap ? shift_last_out_msb : shift_last_out_lsb;
 
-logic [63:0] concat;
-logic [5:0]  shift_amt;
 wire  [5:0]  width = (op_size == 2'd0) ? 6'd8 : (op_size == 2'd1) ? 6'd16 : 6'd32;
 wire  [31:0] shift_width_mask = (op_size == 2'd0) ? 32'h0000_00FF :
                                 (op_size == 2'd1) ? 32'h0000_FFFF :
