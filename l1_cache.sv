@@ -161,7 +161,6 @@ reg [1:0] fill_way;
 reg [2:0] fill_plru_r;
 reg fill_requested;
 reg fill_target_returned;
-reg fill_valid0_r, fill_valid1_r, fill_valid2_r, fill_valid3_r;
 
 reg [31:0] dout_r;
 reg resp_valid_r;
@@ -561,10 +560,6 @@ always_ff @(posedge clk) begin
                     fill_tag <= req_tag_r;
                     fill_way <= plru_victim(rd_plru_r);
                     fill_plru_r <= rd_plru_r;
-                    fill_valid0_r <= rd_valid0_r;
-                    fill_valid1_r <= rd_valid1_r;
-                    fill_valid2_r <= rd_valid2_r;
-                    fill_valid3_r <= rd_valid3_r;
                     fill_count <= {WORD_OFFSET_BITS{1'b0}};
                     fill_target_word <= req_word_r;
                     fill_requested <= 1'b0;
@@ -595,12 +590,9 @@ always_ff @(posedge clk) begin
 
                     if (fill_count == {WORD_OFFSET_BITS{1'b1}}) begin
                         write_cache_tag(fill_way, fill_set, fill_tag);
-                        case (fill_way)
-                            2'd0: begin valid_way1[fill_set] <= fill_valid1_r; valid_way2[fill_set] <= fill_valid2_r; valid_way3[fill_set] <= fill_valid3_r; end
-                            2'd1: begin valid_way0[fill_set] <= fill_valid0_r; valid_way2[fill_set] <= fill_valid2_r; valid_way3[fill_set] <= fill_valid3_r; end
-                            2'd2: begin valid_way0[fill_set] <= fill_valid0_r; valid_way1[fill_set] <= fill_valid1_r; valid_way3[fill_set] <= fill_valid3_r; end
-                            default: begin valid_way0[fill_set] <= fill_valid0_r; valid_way1[fill_set] <= fill_valid1_r; valid_way2[fill_set] <= fill_valid2_r; end
-                        endcase
+                        // Do NOT restore the other ways' valid bits from the
+                        // fill-START snapshot -- a snoop invalidation landing
+                        // DURING this fill must survive (same bug as l1_icache).
                         plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
                         state <= S_IDLE;
                         ready_r <= ready_when_idle;

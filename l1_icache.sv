@@ -133,7 +133,6 @@ reg [1:0] fill_way;
 reg [127:0] fill_line;
 reg [2:0] fill_plru_r;
 reg fill_requested;
-reg fill_valid0_r, fill_valid1_r, fill_valid2_r, fill_valid3_r;
 
 reg [127:0] line_r;
 reg resp_valid_r;
@@ -466,10 +465,6 @@ always_ff @(posedge clk) begin
                     fill_tag <= req_tag_r;
                     fill_way <= plru_victim(rd_plru_r);
                     fill_plru_r <= rd_plru_r;
-                    fill_valid0_r <= rd_valid0_r;
-                    fill_valid1_r <= rd_valid1_r;
-                    fill_valid2_r <= rd_valid2_r;
-                    fill_valid3_r <= rd_valid3_r;
                     fill_count <= {WORD_OFFSET_BITS{1'b0}};
                     fill_line <= 128'h0;
                     fill_requested <= 1'b0;
@@ -493,12 +488,12 @@ always_ff @(posedge clk) begin
                         write_cache_tag(fill_way, fill_set, fill_tag);
                         line_r <= fill_line_next;
                         resp_valid_r <= 1'b1;
-                        case (fill_way)
-                            2'd0: begin valid_way1[fill_set] <= fill_valid1_r; valid_way2[fill_set] <= fill_valid2_r; valid_way3[fill_set] <= fill_valid3_r; end
-                            2'd1: begin valid_way0[fill_set] <= fill_valid0_r; valid_way2[fill_set] <= fill_valid2_r; valid_way3[fill_set] <= fill_valid3_r; end
-                            2'd2: begin valid_way0[fill_set] <= fill_valid0_r; valid_way1[fill_set] <= fill_valid1_r; valid_way3[fill_set] <= fill_valid3_r; end
-                            default: begin valid_way0[fill_set] <= fill_valid0_r; valid_way1[fill_set] <= fill_valid1_r; valid_way2[fill_set] <= fill_valid2_r; end
-                        endcase
+                        // Only write_cache_tag (above) sets valid for fill_way.
+                        // Do NOT restore the other ways' valid bits from the
+                        // fill-START snapshot: a snoop invalidation that landed
+                        // DURING this fill (self-modifying code) must survive.
+                        // Restoring fill_validN_r clobbered it -> stale instruction
+                        // line -> crash (FastDoom SMC, frequent at 8KB fill rate).
                         plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
                         state <= S_IDLE;
                         ready_r <= 1'b1;
