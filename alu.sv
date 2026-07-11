@@ -16,7 +16,9 @@ module alu
     // 1 when this op updates ZF/SF/PF.  The two-cycle flag retirement
     // derives them from the registered result; NOT/MOVZX/MOVSX preserve
     // all flags and AAA/AAS preserve ZF/SF/PF.
-    output        zsp_update
+    output        zsp_update,
+    // v50 timing-first: dedicated pre-assembled Z/S/P for the z386-level eflags_ahead overlay (the jcc pop-time condition capture).
+    output [2:0]  zsp_ahead    // {sf, zf, pf}
 );
 
 // -----------------------------------------------------------------------------
@@ -288,11 +290,7 @@ wire is_adjust = (op == ALU_DAA) || (op == ALU_DAS) || (op == ALU_AAA) || (op ==
 wire [31:0] R = slice_result;
 wire flag_byte_mode = is_byte || is_adjust;
 
-// Zero-flag anticipation for adder-based ops, independent of the carry chain:
-//   x + y + cin == 0 (mod 2^w)  ⟺  (x ^ y)[w-1:0] == ({(x|y), cin} << ...)[w-1:0]
-// i.e. the XOR of the two sides is all-zero over the operand width.  This
-// removes the carry-chain + 32-bit reduce from the ZF path (the dominant
-// EFLAGS setup violations).  Logic/pass ops keep the shallow |R reduce.
+// Zero-flag anticipation for adder-based ops, independent of the carry chain
 wire [31:0] za_neq = (arg1_bus ^ arg2_bus) ^
                      {arg1_bus[30:0] | arg2_bus[30:0], carry_in0};
 wire zfa_byte  = ~|za_neq[7:0];
@@ -316,6 +314,11 @@ wire cf_byte  = slice_carry[7];
 wire cf_word  = slice_carry[15];
 wire cf_dword = slice_carry[31];
 wire cout_msb = flag_byte_mode ? cf_byte : (is_word ? cf_word : cf_dword);
+
+wire zfa_sized = is_dword ? zfa_dword : is_word ? zfa_word : zfa_byte;
+wire zf_ahead  = use_adder_zf ? zfa_sized :
+                 is_dword ? (|R == 0) : is_word ? (|R[15:0] == 0) : (|R[7:0] == 0);
+assign zsp_ahead = {r_msb, zf_ahead, ~^R[7:0]};
 
 reg [31:0] f2;
 always @* begin

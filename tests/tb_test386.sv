@@ -48,6 +48,7 @@ module tb_test386;
         .inta(inta),
         .snoop_addr(32'h0),
         .snoop_valid(1'b0),
+        .a20_enable(1'b1),
         .single_step(1'b0), // Continuous execution for test386.asm
         .dbg_CS(),
         .dbg_EIP(),

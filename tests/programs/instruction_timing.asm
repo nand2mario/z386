@@ -51,6 +51,9 @@ STORE_ADDR  equ 0x240
 XCHG_ADDR   equ 0x280
 STACK_TOP   equ 0x800
 POP_STACK   equ 0x880
+REP_SRC     equ 0x400
+REP_DST     equ 0x600
+REP_COUNT   equ 64
 
 LOAD_VALUE  equ 0x11223344
 STORE_VALUE equ 0x55667788
@@ -60,6 +63,7 @@ IMM_VALUE   equ 0x2468ACE0
 POP_VALUE   equ 0xCAFEBABE
 XCHG_MEM_INIT equ 0x11112222
 XCHG_REG_INIT equ 0x33334444
+ADDM_INIT   equ 0x10000000
 
 start:
     xor eax, eax
@@ -339,6 +343,10 @@ phase_jmp_fail:
 phase_lea:
     mov esi, LOAD_ADDR
     mov edi, 4
+    ; Let the prefetch/decode run ahead before the run of 2-cycle leas, so the
+    ; measured steady state is the lea's real cost and not a decode-queue-empty
+    ; frontend bubble (which only appears in back-to-back runs of short ops).
+    times 32 nop
 
 lea_01: lea eax, [esi + edi*4 + 0x20]
 lea_02: lea eax, [esi + edi*4 + 0x20]
@@ -550,10 +558,7 @@ pop_mem_08: pop dword [edi]
     cmp dword [edi], POP_VALUE
     jne short phase_pop_mem_fail
 
-    mov al, STATUS_PASS
-    mov dx, STATUS_PORT
-    out dx, al
-    hlt
+    jmp phase_alu_rm
 
 phase_pop_mem_fail:
     jmp fail_12
@@ -616,6 +621,279 @@ fail:
     mov dx, DATA_PORT
     out dx, al
     mov al, STATUS_FAIL
+    mov dx, STATUS_PORT
+    out dx, al
+    hlt
+
+fail_13:
+    mov al, 0x13
+    jmp fail
+
+    times (0x1300 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 19: ALU reg, mem  (add eax, [esi]) — entry point 0x027
+;   Repeated `add eax, [esi]` from the same aligned dword (read + ALU).
+;------------------------------------------------------------------------------
+phase_alu_rm:
+    mov esi, LOAD_ADDR
+    mov dword [esi], LOAD_VALUE
+    xor eax, eax
+
+alu_rm_01: add eax, [esi]
+alu_rm_02: add eax, [esi]
+alu_rm_03: add eax, [esi]
+alu_rm_04: add eax, [esi]
+alu_rm_05: add eax, [esi]
+alu_rm_06: add eax, [esi]
+alu_rm_07: add eax, [esi]
+alu_rm_08: add eax, [esi]
+
+    cmp eax, (LOAD_VALUE * ITERATIONS) & 0xFFFFFFFF
+    jne short phase_alu_rm_fail
+    jmp phase_jcc_taken_fwd
+
+phase_alu_rm_fail:
+    jmp fail_13
+
+    times (0x1400 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 20: Conditional jump taken FORWARD
+;   ZF=0 set once and settled, then a chain of forward TAKEN jnz (each skips a
+;   nop to its successor).  Measured steady-state jccf_N -> jccf_{N+1}.
+;------------------------------------------------------------------------------
+phase_jcc_taken_fwd:
+    mov eax, 1
+    or eax, eax                ; ZF=0 -> every JNZ below is taken
+    nop
+    nop                        ; settle ZF before the first branch
+jccf_01: jnz jccf_02
+    nop
+jccf_02: jnz jccf_03
+    nop
+jccf_03: jnz jccf_04
+    nop
+jccf_04: jnz jccf_05
+    nop
+jccf_05: jnz jccf_06
+    nop
+jccf_06: jnz jccf_07
+    nop
+jccf_07: jnz jccf_08
+    nop
+jccf_08: jnz jccf_done
+    nop
+jccf_done:
+    jmp phase_jcc_nt_back
+
+    times (0x1500 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 21: Conditional jump NOT taken BACKWARD
+;   ZF=1 once, then fall-through backward jnz instructions.
+;------------------------------------------------------------------------------
+phase_jcc_nt_back:
+    xor eax, eax               ; ZF=1 -> JNZ not taken
+    jmp jccnb_start
+jccnb_target:                  ; backward target (never reached)
+    mov al, 0x15
+    jmp fail
+jccnb_start:
+jccnb_01: jnz short jccnb_target
+jccnb_02: jnz short jccnb_target
+jccnb_03: jnz short jccnb_target
+jccnb_04: jnz short jccnb_target
+jccnb_05: jnz short jccnb_target
+jccnb_06: jnz short jccnb_target
+jccnb_07: jnz short jccnb_target
+jccnb_08: jnz short jccnb_target
+    jmp phase_call
+
+    times (0x1600 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 22: CALL taken
+;   Steady-state CALL to a returning stub; backward loop control with settled ZF.
+;   Measured branch i_first (call) -> target i_first (call_fn).
+;------------------------------------------------------------------------------
+phase_call:
+    mov esp, STACK_TOP
+    mov ecx, ITERATIONS
+    nop
+    nop
+call_loop:
+call_branch: call call_fn         ; CALL taken (measured branch -> target)
+             dec ecx
+             nop
+             nop                   ; settle ZF before the loop branch
+             jnz short call_loop
+             jmp short call_done
+call_fn:                          ; CALL target
+             ret
+call_done:
+    jmp phase_byte_load
+
+    times (0x1700 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 23: Byte load (mov al, [esi]) — DOOM render-loop #1 opcode (8A)
+;------------------------------------------------------------------------------
+phase_byte_load:
+    mov esi, LOAD_ADDR
+    mov byte [esi], 0x5A
+    xor eax, eax
+bload_01: mov al, [esi]
+bload_02: mov al, [esi]
+bload_03: mov al, [esi]
+bload_04: mov al, [esi]
+bload_05: mov al, [esi]
+bload_06: mov al, [esi]
+bload_07: mov al, [esi]
+bload_08: mov al, [esi]
+    cmp al, 0x5A
+    jne short phase_byte_load_fail
+    jmp phase_byte_store
+phase_byte_load_fail:
+    mov al, 0x14
+    jmp fail
+
+    times (0x1800 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 24: Byte store (mov [edi], al) — DOOM framebuffer writes (88)
+;------------------------------------------------------------------------------
+phase_byte_store:
+    mov edi, STORE_ADDR
+    mov byte [edi], 0x00
+    mov al, 0xA5
+bstore_01: mov [edi], al
+bstore_02: mov [edi], al
+bstore_03: mov [edi], al
+bstore_04: mov [edi], al
+bstore_05: mov [edi], al
+bstore_06: mov [edi], al
+bstore_07: mov [edi], al
+bstore_08: mov [edi], al
+    cmp byte [edi], 0xA5
+    jne short phase_byte_store_fail
+    jmp phase_shift_imm
+phase_byte_store_fail:
+    mov al, 0x15
+    jmp fail
+
+    times (0x1900 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 25: Shift r/m, imm8 (shr eax, 4) — DOOM coordinate math (C1)
+;------------------------------------------------------------------------------
+phase_shift_imm:
+    mov eax, 0xF0000000
+shimm_01: shr eax, 4
+shimm_02: shr eax, 4
+shimm_03: shr eax, 4
+shimm_04: shr eax, 4
+shimm_05: shr eax, 4
+shimm_06: shr eax, 4
+shimm_07: shr eax, 4
+shimm_08: shr eax, 4
+    cmp eax, 0
+    jne short phase_shift_imm_fail
+    jmp phase_alu_imm
+phase_shift_imm_fail:
+    mov al, 0x16
+    jmp fail
+
+    times (0x1A00 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 26: ALU r/m, imm32 (cmp ebx, imm32) — fixed-point / addr arith (81)
+;------------------------------------------------------------------------------
+phase_alu_imm:
+    mov ebx, 0x12345678
+aluimm_01: cmp ebx, 0x2468ACE0
+aluimm_02: cmp ebx, 0x2468ACE0
+aluimm_03: cmp ebx, 0x2468ACE0
+aluimm_04: cmp ebx, 0x2468ACE0
+aluimm_05: cmp ebx, 0x2468ACE0
+aluimm_06: cmp ebx, 0x2468ACE0
+aluimm_07: cmp ebx, 0x2468ACE0
+aluimm_08: cmp ebx, 0x2468ACE0
+    jmp phase_rep_movs
+
+    times (0x1B00 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 27: rep movsb (string copy) — DOOM column/span blit (A4)
+;   Each labeled copy is one `rep movsb` of REP_COUNT bytes; the preceding 3
+;   movs reset ESI/EDI/ECX, so the measured interval is one rep plus that reset.
+;------------------------------------------------------------------------------
+phase_rep_movs:
+    cld                     ; ES base == DS base (set by test config); DF=0
+    mov esi, REP_SRC
+    mov edi, REP_DST
+    mov ecx, REP_COUNT
+rmovs_01: rep movsb
+    mov esi, REP_SRC
+    mov edi, REP_DST
+    mov ecx, REP_COUNT
+rmovs_02: rep movsb
+    mov esi, REP_SRC
+    mov edi, REP_DST
+    mov ecx, REP_COUNT
+rmovs_03: rep movsb
+    mov esi, REP_SRC
+    mov edi, REP_DST
+    mov ecx, REP_COUNT
+rmovs_04: rep movsb
+    mov esi, REP_SRC
+    mov edi, REP_DST
+    mov ecx, REP_COUNT
+rmovs_05: rep movsb
+    mov esi, REP_SRC
+    mov edi, REP_DST
+    mov ecx, REP_COUNT
+rmovs_06: rep movsb
+    mov esi, REP_SRC
+    mov edi, REP_DST
+    mov ecx, REP_COUNT
+rmovs_07: rep movsb
+    mov esi, REP_SRC
+    mov edi, REP_DST
+    mov ecx, REP_COUNT
+rmovs_08: rep movsb
+    jmp phase_alu_mem
+
+    times (0x1C00 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 28: ALU mem RMW — `add [edi], eax` (read-modify-write, ucode 04A)
+;------------------------------------------------------------------------------
+phase_alu_mem:
+    mov edi, STORE_ADDR
+    mov eax, 1
+    mov dword [edi], ADDM_INIT
+
+addm_01: add [edi], eax
+addm_02: add [edi], eax
+addm_03: add [edi], eax
+addm_04: add [edi], eax
+addm_05: add [edi], eax
+addm_06: add [edi], eax
+addm_07: add [edi], eax
+addm_08: add [edi], eax
+
+    cmp dword [edi], ADDM_INIT + 8
+    jne short phase_alu_mem_fail
+    jmp phase_done
+
+phase_alu_mem_fail:
+    jmp fail_01
+
+    times (0x1D00 - ($ - $$)) db 0x90
+
+phase_done:
+    mov al, STATUS_PASS
     mov dx, STATUS_PORT
     out dx, al
     hlt

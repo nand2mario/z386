@@ -5,6 +5,52 @@ package z386_pkg;
 // Decoded Instruction Entry Type
 //=============================================================================
 
+// z386x FAST-path class descriptor. V52 derives it from the registered
+// microcode entry point instead of carrying these 16 bits in every decoded
+// instruction queue entry.
+typedef struct packed {
+    logic fast;        // completes at its RNI word (+ optional commit sideband)
+    logic multi_word;  // RNI word is not the entry word (shifts, loads,
+                       // ALU/CMP r,m, MOVZX); the chain fires one cycle before
+                       // the RNI word, detected via uc_next
+    logic [2:0] commit_sel; // 0 none; ALU (alu_result->DSTREG), SHIFT
+                       // (shift_result->DSTREG) and SIGSRC (SIGMA->SRCREG,
+                       // width from the executing BITS16/32) commit at the
+                       // RNI-word cycle; MEM (OPR_R) commits one cycle later
+                       // (deferred), only when the slot was chained away
+    logic keep_slot;   // memory classes: the slot word (OPR_R writeback / WR
+                       // DLY) is real work — execute it normally when
+                       // unchained; never turn it into a dead slot
+    logic reads_flags; // consumes CF (ADC/SBB/RCL/RCR): never chain INTO — the
+                       // previous instruction's flags are still in two-cycle retirement
+    logic uses_ea;     // consumes EA/moffs/IND at i_pop (LEA, loads, stores):
+                       // never chain INTO — base/index GPRs may be written by
+                       // the still-executing predecessor
+    logic reads_dst;   // EX-cycle GPR sources, for the load-use chain-out gate
+    logic reads_src;   //   (a MEM-commit load's value lands one cycle after
+    logic reads_ecx;   //    the chained successor reads its operands)
+    logic writes_srcreg; // LEA: the entry word writes SRCREG (modrm reg field)
+                       //   via uc_dest - the EA chain-into gate must see it
+    logic op_byte;     // operand size is byte (precomputed: byte selectors
+                       //   encode {high,reg[1:0]}, needed by overlap checks)
+    logic jcc;         // Jcc rel: chains only when NOT taken (fast_issueJ at
+                       //   i_first, gated on the settled-EFLAGS condition);
+                       //   taken keeps the 21.z386 early redirect + microcode
+    logic writes_flags; // produces arithmetic flags: a reads_flags successor
+                       //   may chain only after a non-flag-writing predecessor
+    logic br_rel;      // relative branch (Jcc/JMP rel/CALL rel): its target is
+                       //   a decode-time constant - request a speculative
+                       //   target-line fetch at i_pop (independent of .fast)
+} fast_class_t;
+
+localparam [2:0] FAST_COMMIT_NONE   = 3'd0;
+localparam [2:0] FAST_COMMIT_ALU    = 3'd1;
+localparam [2:0] FAST_COMMIT_SHIFT  = 3'd2;
+localparam [2:0] FAST_COMMIT_MEM    = 3'd3;
+localparam [2:0] FAST_COMMIT_SIGSRC = 3'd4;
+localparam [2:0] FAST_COMMIT_ESP    = 3'd5;  // PUSH: SIGMA (post-push ESP,
+                                             // precomputed at i_pop) -> ESP
+
 typedef struct packed {
     logic [7:0]  opcode;
     logic [7:0]  modrm;
@@ -41,7 +87,15 @@ typedef struct packed {
     // Register selection (computed from modrm/opcode)
     logic [2:0]  src_reg_sel;          // SRCREG selection
     logic [2:0]  dst_reg_sel;          // DSTREG selection
+
+    // EA base/index onehot selectors are computed at decode time (D1), so
+    // chain gates and the early-start latch do not re-derive them from ModR/M.
+    logic [7:0]  ea_base_onehot;
+    logic [7:0]  ea_index_onehot;
 } dec_entry_t;
+
+// Optimizer-generated recipe lookup and entry-point-derived FAST classifier.
+`include "ucode_recipes.svh"
 
 // Prefix enums
 typedef enum logic [1:0] {
@@ -61,12 +115,317 @@ typedef enum logic [2:0] {
     PREFIX_GS    = 3'b110
 } prefix_seg_t;
 
-//=============================================================================
+// z386x FAST-path classification (doc/z386x/design.md)
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-z386-pkg-sv-118
+
+
+function automatic fast_class_t dec_fast_class(input dec_entry_t e);
+    logic mod11;
+    logic [2:0] grp;
+    fast_class_t r;
+    r = '0;
+    mod11 = e.has_modrm && (e.modrm[7:6] == 2'b11);
+    // Operand byte-ness: 40-4F and 50-5F are always wide, B0-BF use
+    // opcode[3], everything else in the FAST set is a w-bit form.
+    if (e.opcode[7:4] == 4'h4 || e.opcode[7:4] == 4'h5)
+        r.op_byte = 1'b0;
+    else if (e.opcode[7:4] == 4'hB && !e.has_0f)
+        r.op_byte = !e.opcode[3];
+    else
+        r.op_byte = !e.opcode[0];
+    if (e.has_0f && e.rep_lock == PREFIX_NOREPLOCK) begin
+        // 0F B6/B7/BE/BF MOVZX/MOVSX r,r/m: SZ_EXT then BITS16/32+RNI; the
+        // slot (SIGMA->SRCREG) is replaced by the SIGSRC sideband whose width
+        // comes from the executing BITS op. DSTREG (the r/m source) is read
+        // at the entry word, one cycle after i_pop - settled, so no gates.
+        if (e.opcode[7:4] == 4'h8) begin
+            // 0F 80-8F Jcc rel16/32: same shape as 70-7F
+            r.fast = 1'b1; r.jcc = 1'b1; r.multi_word = 1'b1;
+            r.reads_flags = 1'b1; r.br_rel = 1'b1;
+        end else if ((e.opcode[7:4] == 4'hB) && (e.opcode[2:1] == 2'b11) && e.has_modrm) begin
+            r.fast = 1'b1; r.multi_word = 1'b1; r.commit_sel = FAST_COMMIT_SIGSRC;
+            r.writes_srcreg = 1'b1;
+            if (!mod11) r.uses_ea = 1'b1;
+            else r.reads_dst = 1'b1;   // SZ_EXT reads DSTREG at the entry word =
+                                       // the deferred-load-commit cycle when
+                                       // chained out of a load: gate needed
+        end
+    end else if (!e.has_0f && e.rep_lock == PREFIX_NOREPLOCK) begin
+        if (e.opcode[7:6] == 2'b00) begin
+            // 00-3B ALU/CMP r,r (mod=11) and 04..3D ALU/CMP A,imm forms
+            grp = e.opcode[5:3];
+            if ((!e.opcode[2] && mod11) || (e.opcode[2:1] == 2'b10)) begin
+                r.fast        = 1'b1;
+                r.commit_sel  = (grp != 3'b111) ? FAST_COMMIT_ALU : FAST_COMMIT_NONE; // CMP: flags only
+                r.reads_flags = (grp == 3'b010) || (grp == 3'b011);  // ADC/SBB
+                r.writes_flags = 1'b1;
+                r.reads_dst   = 1'b1;
+                r.reads_src   = !e.opcode[2];        // r,r forms read both
+            end else if (e.opcode[2:0] == 3'b110) begin
+                // 06/0E/16/1E PUSH seg (07/17/1F POP seg load segments - SEQ).
+                // 09B: SEGREG->OPR_W + WR + RNI; slot = SIGMA->eSP + DLY,
+                // replaced by the ESP commit when chained away.
+                r.fast = 1'b1; r.commit_sel = FAST_COMMIT_ESP;
+                r.keep_slot = 1'b1; r.uses_ea = 1'b1;
+            end else if (!e.opcode[2] && e.has_modrm) begin
+                // Memory forms: only the read-only shapes are FAST. ALU r,m (d=1, groups 0-6): 027 RD/DLY/OPR_R->TMPB/ALU+RNI CMP r,m / CMP m,r (group...
+                // Details: doc/z386x/implementation_notes.md#src-24-z386x-z386-pkg-sv-182
+                if (e.opcode[1]) begin
+                    r.fast = 1'b1; r.multi_word = 1'b1; r.uses_ea = 1'b1;
+                    r.commit_sel = (grp != 3'b111) ? FAST_COMMIT_ALU : FAST_COMMIT_NONE;
+                    r.writes_flags = 1'b1;
+                end else if (grp == 3'b111) begin
+                    r.fast = 1'b1; r.multi_word = 1'b1; r.uses_ea = 1'b1;   // CMP m,r
+                    r.writes_flags = 1'b1;
+                end else begin
+                    // ALU m,r RMW (d=0, groups 0-6): M5 F-RMW retimed ucode 04A RD / 04B DLY+JMP / 04C ALU(OPR_R,SRCREG) / 046 SIGMA->OPR_W+WR+RNI / 047 DLY....
+                    // Details: doc/z386x/implementation_notes.md#src-24-z386x-z386-pkg-sv-196
+                    r.fast = 1'b1; r.multi_word = 1'b1; r.uses_ea = 1'b1;
+                    r.keep_slot = 1'b1; r.writes_flags = 1'b1;
+                end
+            end
+        end else if (e.opcode[7:4] == 4'h4) begin
+            // 40-4F INC/DEC r
+            r.fast = 1'b1; r.commit_sel = FAST_COMMIT_ALU; r.reads_dst = 1'b1;
+            r.writes_flags = 1'b1;
+        end else if (e.opcode[7:4] == 4'h7) begin
+            // 70-7F Jcc rel8: not-taken flow is 065 JNcond -> 066 RNi(+PREF suppressed) - chainJ fires at 065 on the settled condition. Taken flow...
+            // Details: doc/z386x/implementation_notes.md#src-24-z386x-z386-pkg-sv-213
+            r.fast = 1'b1; r.jcc = 1'b1; r.multi_word = 1'b1;
+            r.reads_flags = 1'b1; r.br_rel = 1'b1;
+        end else if (e.opcode[7:3] == 5'b01010) begin
+            // 50-57 PUSH r: 086 DSTREG->OPR_W + WR + RNI; slot SIGMA->eSP+DLY.
+            // reads_dst: the pushed register is read at the entry word (the
+            // deferred-load-commit cycle when chained out of a load).
+            r.fast = 1'b1; r.commit_sel = FAST_COMMIT_ESP;
+            r.keep_slot = 1'b1; r.uses_ea = 1'b1; r.reads_dst = 1'b1;
+        end else if (e.opcode[7:3] == 5'b01011) begin
+            // 58-5F POP r: 09F SIGMA->eSP + RD (ESP written at the entry word),
+            // 0A0 DLY+RNI, slot OPR_R->DSTREG - the load shape: deferred MEM
+            // commit when chained away.
+            r.fast = 1'b1; r.multi_word = 1'b1; r.commit_sel = FAST_COMMIT_MEM;
+            r.keep_slot = 1'b1; r.uses_ea = 1'b1;
+        end else if (e.opcode == 8'h68 || e.opcode == 8'h6A) begin
+            // PUSH imm: 09D IMM->OPR_W + WR + RNI; slot SIGMA->eSP+DLY
+            r.fast = 1'b1; r.commit_sel = FAST_COMMIT_ESP;
+            r.keep_slot = 1'b1; r.uses_ea = 1'b1;
+        end else if (e.opcode == 8'h80 || e.opcode == 8'h81 || e.opcode == 8'h83) begin
+            grp = e.modrm[5:3];
+            if (mod11) begin
+                // ALU/CMP r,imm
+                r.fast        = 1'b1;
+                r.commit_sel  = (grp != 3'b111) ? FAST_COMMIT_ALU : FAST_COMMIT_NONE;
+                r.reads_flags = (grp == 3'b010) || (grp == 3'b011);
+                r.writes_flags = 1'b1;
+                r.reads_dst   = 1'b1;
+            end else if (grp == 3'b111) begin
+                // CMP m,imm: read-only mem CMPTST shape
+                r.fast = 1'b1; r.multi_word = 1'b1; r.uses_ea = 1'b1;
+                r.writes_flags = 1'b1;
+            end else begin
+                // ALU m,imm RMW (039 retimed like 04A): store-shaped FAST,
+                // same rationale as the ALU m,r class above.
+                r.fast = 1'b1; r.multi_word = 1'b1; r.uses_ea = 1'b1;
+                r.keep_slot = 1'b1; r.writes_flags = 1'b1;
+            end
+        end else if (e.opcode == 8'h84 || e.opcode == 8'h85) begin
+            if (mod11) begin
+                // TEST r,r
+                r.fast = 1'b1; r.reads_dst = 1'b1; r.reads_src = 1'b1;
+            end else begin
+                // TEST m,r: read-only mem CMPTST shape
+                r.fast = 1'b1; r.multi_word = 1'b1; r.uses_ea = 1'b1;
+            end
+            r.writes_flags = 1'b1;
+        end else if (e.opcode[7:2] == 6'b100010) begin
+            if (mod11) begin
+                // 88-8B MOV r,r
+                r.fast = 1'b1; r.commit_sel = FAST_COMMIT_ALU; r.reads_src = 1'b1;
+            end else if (e.opcode[1]) begin
+                // 8A/8B MOV r,m: 019 RD, 01A DLY+RNI (v43 fold); slot writes
+                // OPR_R->DSTREG and stays live when unchained; when chained
+                // away, the deferred MEM commit replaces it.
+                r.fast = 1'b1; r.multi_word = 1'b1; r.commit_sel = FAST_COMMIT_MEM;
+                r.keep_slot = 1'b1; r.uses_ea = 1'b1;
+            end else begin
+                // 88/89 MOV m,r: 013 OPR_W write + WR + RNI; slot is the DLY.
+                // Retire-on-accept is enforced at the WR issue (mem_block_idle).
+                r.fast = 1'b1; r.keep_slot = 1'b1; r.uses_ea = 1'b1;
+                r.reads_src = 1'b1;
+            end
+        end else if (e.opcode == 8'h8D && e.has_modrm && (e.modrm[7:6] != 2'b11)) begin
+            // LEA r,m: entry word 0B9 writes SRCREG (modrm reg field) from IND
+            // itself (no sideband); mod=11 is #UD and stays on the SEQ path
+            r.fast = 1'b1; r.uses_ea = 1'b1; r.writes_srcreg = 1'b1;
+        end else if (e.opcode[7:2] == 6'b101000) begin
+            // A0/A1 MOV A,moffs (load) — same 019 routine as MOV r,m;
+            // A2/A3 MOV moffs,A (store) — same 013 routine as MOV m,r
+            r.fast = 1'b1; r.keep_slot = 1'b1; r.uses_ea = 1'b1;
+            if (!e.opcode[1]) begin
+                r.multi_word = 1'b1; r.commit_sel = FAST_COMMIT_MEM;
+            end else begin
+                r.reads_src = 1'b1;   // 013 reads SRCREG (the accumulator)
+            end
+        end else if (e.opcode == 8'hEB || e.opcode == 8'hE9 || e.opcode == 8'hE8) begin
+            // JMP rel8/rel32, CALL rel: speculative target-line fetch, and the
+            // routines end at 068 SIGMA->eIP+RNI - chainN reclaims the final
+            // slot with the composed EIP write. CALL's i_pop does the stack
+            // SIGMA precompute (uses_ea via the stack gate).
+            r.br_rel = 1'b1;
+            r.fast = 1'b1; r.multi_word = 1'b1;
+            if (e.opcode == 8'hE8) r.uses_ea = 1'b1;
+        end else if (e.opcode == 8'hC3 || e.opcode == 8'hC2) begin
+            // RET / RET iw (near): 072 RD + new-ESP, 073 eSP + jump, 074
+            // IND=OPR_R, JMP_PREF..., 068 eIP+RNI - chainN reclaims the final
+            // slot when the PREF refill decodes the return target in time.
+            r.fast = 1'b1; r.multi_word = 1'b1; r.uses_ea = 1'b1;
+        end else if (e.opcode == 8'h98) begin
+            // CBW/CWDE: same SZ_EXT + BITS16/32 + RNI shape as MOVZX r,r.
+            // reads_dst: SZ_EXT reads AL/AX at the entry word, which is the
+            // deferred-commit cycle when chained out of a load (mov al,[m];
+            // cbw read stale AL - broke the DOS 7.1 boot loader).
+            r.fast = 1'b1; r.multi_word = 1'b1; r.commit_sel = FAST_COMMIT_SIGSRC;
+            r.writes_srcreg = 1'b1; r.reads_dst = 1'b1;
+        end else if (e.opcode[7:1] == 7'b1010100) begin
+            // A8/A9 TEST A,imm
+            r.fast = 1'b1; r.reads_dst = 1'b1; r.writes_flags = 1'b1;
+        end else if (e.opcode[7:4] == 4'hB) begin
+            // B0-BF MOV r,imm
+            r.fast = 1'b1; r.commit_sel = FAST_COMMIT_ALU;
+        end else if ((e.opcode[7:1] == 7'b1100011) && (e.modrm[5:3] == 3'b000)) begin
+            if (mod11) begin
+                // C6/C7 MOV r,imm register form (other reg fields are #UD -> SEQ)
+                r.fast = 1'b1; r.commit_sel = FAST_COMMIT_ALU;
+            end else begin
+                // C6/C7 MOV m,imm: 015 IMM->OPR_W + WR + RNI; slot is the DLY
+                r.fast = 1'b1; r.keep_slot = 1'b1; r.uses_ea = 1'b1;
+            end
+        end else if (e.opcode[7:1] == 7'b1111011) begin
+            // F6/F7 group 3: /0 TEST r/m,imm; register /2 NOT, /3 NEG
+            if (e.modrm[5:3] == 3'b000) begin
+                if (mod11) begin
+                    r.fast = 1'b1; r.reads_dst = 1'b1;        // TEST r,imm
+                end else begin
+                    r.fast = 1'b1; r.multi_word = 1'b1; r.uses_ea = 1'b1; // TEST m,imm
+                end
+                r.writes_flags = 1'b1;
+            end else if (mod11 && (e.modrm[5:3] == 3'b010 || e.modrm[5:3] == 3'b011)) begin
+                // NOT preserves flags but NEG writes them - be conservative
+                r.fast = 1'b1; r.commit_sel = FAST_COMMIT_ALU; r.reads_dst = 1'b1;
+                r.writes_flags = 1'b1;
+            end
+        end else if ((e.opcode[7:1] == 7'b1111111) && mod11 && (e.modrm[5:4] == 2'b00)) begin
+            // FE/FF INC/DEC r (register forms, /0 /1)
+            r.fast = 1'b1; r.commit_sel = FAST_COMMIT_ALU; r.reads_dst = 1'b1;
+            r.writes_flags = 1'b1;
+        end else if (((e.opcode[7:1] == 7'b1100000) || (e.opcode[7:2] == 6'b110100)) && mod11
+                     && (e.modrm[5:3] != 3'b010) && (e.modrm[5:3] != 3'b011)
+                     && (e.modrm[5:3] != 3'b110)) begin
+            // C0/C1 shift r,imm; D0/D1 shift r,1; D2/D3 shift r,CL - two-word routines (0F9/0FF): SHIFT1 count capture, then SHIFT2 with RNI; the...
+            // Details: doc/z386x/implementation_notes.md#src-24-z386x-z386-pkg-sv-349
+            r.fast = 1'b1; r.multi_word = 1'b1; r.commit_sel = FAST_COMMIT_SHIFT;
+            r.reads_dst = 1'b1; r.writes_flags = 1'b1;
+            r.reads_ecx = e.opcode[1] && (e.opcode[7:2] == 6'b110100); // D2/D3 r,CL
+        end
+    end
+    dec_fast_class = r;
+endfunction
+
+// EA register decode helpers (moved from z386.sv; shared with the decoder).
+
+function automatic [7:0] decode_base_register_32(input [7:0] modrm_byte, input [7:0] sib_byte, input has_sib);
+    reg [1:0] mod;
+    reg [2:0] rm;
+
+    mod = modrm_byte[7:6];
+    rm = modrm_byte[2:0];
+
+    if (has_sib && rm == 3'b100) begin
+        // SIB byte addressing - decode base from i.sib[2:0]
+        case (sib_byte[2:0])
+            3'b000: decode_base_register_32 = 8'b0000_0001;  // EAX
+            3'b001: decode_base_register_32 = 8'b0000_0010;  // ECX
+            3'b010: decode_base_register_32 = 8'b0000_0100;  // EDX
+            3'b011: decode_base_register_32 = 8'b0000_1000;  // EBX
+            3'b100: decode_base_register_32 = 8'b0001_0000;  // ESP
+            3'b101: decode_base_register_32 = (mod == 2'b00) ? 8'b0000_0000 : 8'b0010_0000;  // None or EBP
+            3'b110: decode_base_register_32 = 8'b0100_0000;  // ESI
+            3'b111: decode_base_register_32 = 8'b1000_0000;  // EDI
+        endcase
+    end else begin
+        // Non-SIB addressing - decode base from rm
+        case (rm)
+            3'b000: decode_base_register_32 = 8'b0000_0001;  // EAX
+            3'b001: decode_base_register_32 = 8'b0000_0010;  // ECX
+            3'b010: decode_base_register_32 = 8'b0000_0100;  // EDX
+            3'b011: decode_base_register_32 = 8'b0000_1000;  // EBX
+            3'b100: decode_base_register_32 = 8'b0001_0000;  // ESP
+            3'b101: decode_base_register_32 = (mod == 2'b00) ? 8'b0000_0000 : 8'b0010_0000;  // None or EBP
+            3'b110: decode_base_register_32 = 8'b0100_0000;  // ESI
+            3'b111: decode_base_register_32 = 8'b1000_0000;  // EDI
+        endcase
+    end
+endfunction
+
+
+function automatic [7:0] decode_index_register_32(input [7:0] sib_byte, input has_sib);
+    if (!has_sib) begin
+        decode_index_register_32 = 8'b0000_0000;  // No index
+    end else begin
+        case (sib_byte[5:3])
+            3'b000: decode_index_register_32 = 8'b0000_0001;  // EAX
+            3'b001: decode_index_register_32 = 8'b0000_0010;  // ECX
+            3'b010: decode_index_register_32 = 8'b0000_0100;  // EDX
+            3'b011: decode_index_register_32 = 8'b0000_1000;  // EBX
+            3'b100: decode_index_register_32 = 8'b0000_0000;  // No index
+            3'b101: decode_index_register_32 = 8'b0010_0000;  // EBP
+            3'b110: decode_index_register_32 = 8'b0100_0000;  // ESI
+            3'b111: decode_index_register_32 = 8'b1000_0000;  // EDI
+        endcase
+    end
+endfunction
+
+
+function automatic [15:0] decode_base_register_16(input [7:0] modrm_byte);
+    reg [1:0] mod;
+    reg [2:0] rm;
+
+    mod = modrm_byte[7:6];
+    rm = modrm_byte[2:0];
+
+    case (rm)
+        3'b000: decode_base_register_16 = {8'b0100_0000, 8'b0000_1000};  // BX + SI
+        3'b001: decode_base_register_16 = {8'b1000_0000, 8'b0000_1000};  // BX + DI
+        3'b010: decode_base_register_16 = {8'b0100_0000, 8'b0010_0000};  // BP + SI
+        3'b011: decode_base_register_16 = {8'b1000_0000, 8'b0010_0000};  // BP + DI
+        3'b100: decode_base_register_16 = {8'b0000_0000, 8'b0100_0000};  // SI only
+        3'b101: decode_base_register_16 = {8'b0000_0000, 8'b1000_0000};  // DI only
+        3'b110: decode_base_register_16 = (mod == 2'b00) ? 16'h0000 : {8'b0000_0000, 8'b0010_0000};  // None or BP
+        3'b111: decode_base_register_16 = {8'b0000_0000, 8'b0000_1000};  // BX only
+    endcase
+endfunction
+
+// EA base/index onehot selectors as stored in dec_entry_t (zero when the
+// instruction has no register-based EA: no modrm, moffs, or reg form).
+function automatic [15:0] dec_ea_onehots(input dec_entry_t e);
+    logic [7:0] base_sel, index_sel;
+    logic [15:0] regs16;
+    base_sel = 8'h00; index_sel = 8'h00;
+    regs16 = decode_base_register_16(e.modrm);
+    if (e.has_modrm && !e.has_moffs) begin
+        if (e.addr32) begin
+            base_sel  = decode_base_register_32(e.modrm, e.sib, e.has_sib);
+            index_sel = decode_index_register_32(e.sib, e.has_sib);
+        end else begin
+            base_sel  = regs16[7:0];
+            index_sel = regs16[15:8];
+        end
+    end
+    dec_ea_onehots = {index_sel, base_sel};
+endfunction
+
 // Segment Descriptor Cache
-//=============================================================================
-// Each segment register (ES, CS, SS, DS, FS, GS) has a hidden descriptor cache
-// that holds the segment attributes loaded from GDT/LDT in protected mode.
-// In real mode, base = selector << 4, limit = 0xFFFF, and attributes have defaults.
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-z386-pkg-sv-457
 
 // Segment register indices
 localparam [3:0] SEG_ES  = 4'd0;
@@ -112,12 +471,6 @@ typedef struct packed {
     logic        D_B;           // Default size: D for code (0=16-bit, 1=32-bit), B for stack
     logic        G;             // Granularity: 0=byte, 1=4KB pages (limit *= 4096)
     logic        A;             // Accessed bit (set by CPU on access)
-    // Derived flags for quick access (computed from seg_type when S=1):
-    logic        executable;    // 1=code segment, 0=data segment (seg_type[3])
-    logic        expand_down;   // Data: expand-down (seg_type[2] when executable=0)
-    logic        conforming;    // Code: conforming (seg_type[2] when executable=1)
-    logic        writable;      // Data: writable (seg_type[1] when executable=0)
-    logic        readable;      // Code: readable (seg_type[1] when executable=1)
 } seg_desc_t;
 
 // Default descriptor for real mode initialization
@@ -133,11 +486,6 @@ function automatic seg_desc_t seg_desc_real_mode(input [15:0] selector);
     desc.D_B        = 1'b0;                       // 16-bit default
     desc.G          = 1'b0;                       // Byte granularity
     desc.A          = 1'b1;                       // Accessed
-    desc.executable = 1'b0;                       // Data segment
-    desc.expand_down= 1'b0;                       // Expand up
-    desc.conforming = 1'b0;                       // Not applicable
-    desc.writable   = 1'b1;                       // Writable
-    desc.readable   = 1'b1;                       // Readable
     return desc;
 endfunction
 
@@ -153,11 +501,6 @@ function automatic seg_desc_t seg_desc_real_mode_code(input [15:0] selector);
     desc.D_B        = 1'b0;                       // 16-bit default
     desc.G          = 1'b0;
     desc.A          = 1'b1;
-    desc.executable = 1'b1;                       // Code segment
-    desc.expand_down= 1'b0;
-    desc.conforming = 1'b0;
-    desc.writable   = 1'b0;                       // Code not writable
-    desc.readable   = 1'b1;                       // Readable
     return desc;
 endfunction
 
@@ -173,11 +516,6 @@ function automatic seg_desc_t seg_desc_reset_cs();
     desc.D_B        = 1'b0;                           // 16-bit default
     desc.G          = 1'b0;
     desc.A          = 1'b1;
-    desc.executable = 1'b1;                           // Code segment
-    desc.expand_down= 1'b0;
-    desc.conforming = 1'b0;
-    desc.writable   = 1'b0;                           // Code not writable
-    desc.readable   = 1'b1;                           // Readable
     return desc;
 endfunction
 
@@ -193,11 +531,6 @@ function automatic seg_desc_t seg_desc_idt_real_mode();
     desc.D_B        = 1'b0;                       // 16-bit
     desc.G          = 1'b0;                       // Byte granularity
     desc.A          = 1'b1;
-    desc.executable = 1'b0;
-    desc.expand_down= 1'b0;
-    desc.conforming = 1'b0;
-    desc.writable   = 1'b0;                       // Read-only for IVT access
-    desc.readable   = 1'b1;
     return desc;
 endfunction
 
@@ -226,11 +559,6 @@ function automatic seg_desc_t decode_descriptor(input [31:0] desc_lo, input [31:
     d.D_B          = desc_hi[22];
     d.G            = desc_hi[23];
     d.A            = desc_hi[8];
-    d.executable   = desc_hi[11];
-    d.expand_down  = !desc_hi[11] && desc_hi[10];
-    d.conforming   = desc_hi[11] && desc_hi[10];
-    d.writable     = !desc_hi[11] && desc_hi[9];
-    d.readable     = desc_hi[11] && desc_hi[9];
     return d;
 endfunction
 
@@ -254,11 +582,6 @@ function automatic seg_desc_t merge_sdes(seg_desc_t existing, input [31:0] data)
     merge_sdes.seg_type    = data[27:24];
     merge_sdes.base[23:0]  = data[23:0];
     merge_sdes.A           = data[24];  // Type[0] = Accessed
-    merge_sdes.executable  = data[27];  // Type[3]
-    merge_sdes.expand_down = !data[27] && data[26];  // !Type[3] && Type[2]
-    merge_sdes.conforming  = data[27] && data[26];   // Type[3] && Type[2]
-    merge_sdes.writable    = !data[27] && data[25];  // !Type[3] && Type[1]
-    merge_sdes.readable    = data[27] && data[25];   // Type[3] && Type[1]
 endfunction
 
 // SAR: merge access rights into existing descriptor cache.
@@ -273,11 +596,6 @@ function automatic seg_desc_t merge_sar(seg_desc_t existing, input [31:0] data);
     merge_sar.G           = data[7];
     merge_sar.D_B         = data[6];
     merge_sar.A           = data[8];   // Type[0] = Accessed
-    merge_sar.executable  = data[11];  // Type[3]
-    merge_sar.expand_down = !data[11] && data[10];  // !Type[3] && Type[2]
-    merge_sar.conforming  = data[11] && data[10];   // Type[3] && Type[2]
-    merge_sar.writable    = !data[11] && data[9];   // !Type[3] && Type[1]
-    merge_sar.readable    = data[11] && data[9];    // Type[3] && Type[1]
 endfunction
 
 // SDEL: merge lo DWORD fields (descriptor bytes 0-1) into existing cache.
@@ -486,6 +804,7 @@ localparam DEST_LATTTF = 7'h78;  // Faulting linear address (page fault)
 localparam DEST_PFERRC = 7'h7A;  // Page fault error code
 localparam DEST_PDBR = 7'h7B;    // Page directory base register (CR3) for LPCR reads
 localparam DEST_PAGER5 = 7'h7D;  // Page cache register (paging-related, NOP for now)
+localparam DEST_USTEP_ALU = 7'h7E; // Optimized FAST word: ALU result -> DSTREG
 
 // ALU Source field (ABCDEF) constants
 localparam ALUSRC_EAX = 6'h00;
@@ -501,6 +820,9 @@ localparam ALUSRC_IMM = 6'h09;        // Full immediate
 localparam ALUSRC_TMPB = 6'h0B;
 localparam ALUSRC_TMPC = 6'h0C;
 localparam ALUSRC_TMPD = 6'h0D;
+// z386x extension (M5 F-ALUM): OPR_R as an ALU source. 0x0F is unused as a consumed ALU source in the base CROM (only 880/88E carry it,...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-z386-pkg-sv-857
+localparam ALUSRC_OPR_R = 6'h0F;
 localparam ALUSRC_ALLONES = 6'h10;    // 0xFFFFFFFF mask
 localparam ALUSRC_TMPG = 6'h12;
 localparam ALUSRC_TMPH = 6'h13;
@@ -976,14 +1298,8 @@ localparam PF_P = 0;      // 0=not present, 1=protection violation
 localparam PF_W = 1;      // 0=read, 1=write
 localparam PF_U = 2;      // 0=supervisor, 1=user
 
-//=============================================================================
 // Protection Unit (PLA4) Test Constants
-//=============================================================================
-// Test type constants for protection unit (corresponds to ABCDEF field in microcode)
-// These select which protection rule to enforce when TSTDES, LDTST, etc. execute.
-//
-// The protection unit validates segment/gate descriptors according to x86
-// privilege rules and routes to appropriate microcode handlers on violations.
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-z386-pkg-sv-1339
 
 // Selector validation tests (PLA4 test constants 0x00-0x0F)
 localparam logic [5:0] TST_SEL_NONSS    = 6'h00;  // Non-stack segment selector (DS/ES/FS/GS)

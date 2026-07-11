@@ -1,18 +1,5 @@
-//
-// Paging Unit for 80386 Processor
-// Integrates TLB and Page Walker for address translation.
-// Also handles DWORD-crossing splits: receives linear address + op details,
-// does TLB translation, splits crossings into two aligned sub-requests,
-// and feeds tuples to BIU.
-//
-// This is the single arbiter for ALL memory accesses:
-//   - Memory/IO from microcode (pulse: mem_req / mem_servicing)
-//   - Prefetch (toggle protocol: pf_req_toggle / pf_ack_toggle)
-//   - Page walks (internal, routed to BIU)
-//
-// When CR0.PG=0, bypasses paging (linear = physical) and still handles
-// crossing detection and splitting.
-//
+// Paging Unit for 80386 Processor Integrates TLB and Page Walker for address translation. Also handles DWORD-crossing splits: receives...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-unit-sv-1
 
 module paging_unit
     import z386_pkg::*;
@@ -45,7 +32,9 @@ module paging_unit
                                            // a faulting / TLB-missing write never releases the delay slot.
     output reg          mem_opt_wait,      // Optimistic read past its grace cycle and still in flight:
                                            // sequencer must stall any uop until completion
-    // Parameters needs to be valid on the cycle mem_req is high only and will be registered
+    output              mem_write_wait,    // Demand WRITE that did not post in its PG_MEM_TLB cycle
+                                           // and can still fault (permission now, walk fault later, or the second half of a crossing access). The issuing instruction may already...
+                                           // Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-unit-sv-49
     input        [31:0] linear_addr,       // Registered linear (reloc(IND)) for BOTH the demand path
                                            // (-> req_linear / tlb_lookup_addr) and the live TLB; the
                                            // seg-adder stays off the live cone since it is registered
@@ -178,13 +167,8 @@ assign tlb_lookup_addr = tlb_lookup_addr_r;
 wire s_idle = (state == PG_IDLE);
 wire idle_mem_req = s_idle && mem_req && !mem_servicing;
 wire idle_mem_precheck = s_idle && mem_req_precheck && !mem_servicing;
-// P0/P1 prefetch timing:
-//   P0 prefetch toggles pf_req_toggle and presents pf_linear_addr.
-//   P1 paging translates the registered prefetch address and launches icache.
-// Demand memory still has priority through mem_req_upcoming, which is generated
-// before segment-fault masking. Do not also gate on mem_req here, since mem_req
-// includes same-cycle fault suppression and would route EA/segmentation fault
-// logic into the icache launch path.
+// P0/P1 prefetch timing: P0 prefetch toggles pf_req_toggle and presents pf_linear_addr. P1 paging translates the registered prefetch...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-unit-sv-189
 wire idle_pf_req = s_idle && pf_pending && !fast_path_pending && !mem_req_upcoming;
 
 paging_tlb tlb_inst (
@@ -281,11 +265,8 @@ wire slow_tlb_user_ok = !slow_is_user_mode || tlb_user;
 wire slow_tlb_write_ok = !req_is_write || tlb_writable || (!slow_is_user_mode && !wp_enable);
 wire slow_tlb_access_ok = slow_tlb_user_ok && slow_tlb_write_ok;
 
-// Live precompute of "this demand write will post" (TLB hit, writable, dirty —
-// no fault, no page walk), from the live TLB + the combinational request CPL /
-// write inputs.  Mirrors slow_tlb_access_ok plus the dirty bit (a non-dirty
-// write goes to a dirty walk and must NOT release the delay slot).  Registered
-// below as write_will_post so the post-write grace carries no live TLB cone.
+// Live precompute of "this demand write will post" (TLB hit, writable, dirty — no fault, no page walk), from the live TLB + the...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-unit-sv-292
 wire live_is_user     = (cpl == 2'd3);
 wire live_user_ok     = !live_is_user || live_tlb_user;
 wire live_write_ok    = !mem_write || live_tlb_writable || (!live_is_user && !wp_enable);
@@ -366,18 +347,18 @@ always_ff @(posedge clk) begin
 end
 // synthesis translate_on
 wire req_mem_posted_done = req_mem_dcache_accept && req_is_write && dcache_req_complete;
-// Loop 1: release the post-write DLY when the write posts.  write_will_post
-// (registered from the live TLB at PG_IDLE) replaces the combinational
-// req_mem_posted_done so no live TLB cone reaches uc_exec.  A non-faulting write
-// always posts (the FSM retries if the dcache is momentarily busy), so the DLY
-// release only needs the no-fault guarantee write_will_post provides.
+// Loop 1: release the post-write DLY when the write posts. write_will_post (registered from the live TLB at PG_IDLE) replaces the...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-unit-sv-377
 assign mem_write_dly_grace = (state == PG_MEM_TLB) && req_is_write && write_will_post && !req_crossing;
-// Posted-write completion, computed from the registered/demand write terms only.
-// The combinational dcache_req_valid/dcache_req_write carry early_rd_present (the
-// live TLB) -- but a posted write is never an early read, so early_rd_present's
-// contribution here is always masked to 0 (dcache_req_write = early_rd ? 0 : ..).
-// Dropping it removes the live TLB from this signal, and thus from the OPR_R
-// write-enable cone (old Family B), with no functional change.
+// Fault-capable window of a demand write (see the port comment).  States
+// after translation succeeds (WALK_LOOKUP, CROSS_LOOKUP2/WAIT2, IDLE with
+// fast_path_pending) cannot fault and are excluded.
+assign mem_write_wait = req_is_write && !mem_write_dly_grace &&
+                        (state == PG_MEM_TLB   || state == PG_WALKING     ||
+                         state == PG_CROSS_WAIT1 || state == PG_CROSS_PREP2 ||
+                         state == PG_CROSS_TLB2  || state == PG_CROSS_WALK2);
+// Posted-write completion, computed from the registered/demand write terms only. The combinational dcache_req_valid/dcache_req_write...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-unit-sv-390
 wire posted_write_isw = (state == PG_MEM_TLB) ? req_is_write : dcache_req_write_r;
 wire dcache_posted_write_done = (dcache_req_valid_r || req_mem_dcache_candidate) &&
                                 posted_write_isw && dcache_req_accepted && dcache_req_complete;
@@ -397,12 +378,8 @@ wire        early_rd_idx_drive = (state == PG_IDLE) && idle_mem_req &&
 wire        early_rd_tlb_ok    = !pg_enable || (live_tlb_hit && live_user_ok);
 wire        early_rd_present   = early_rd_idx_drive && mem_ea_read && !idle_mem_crossing &&
                                  !mem_rd_ind && early_rd_tlb_ok;
-// Early write: post a cacheable, non-crossing, non-check-only write at PG_IDLE
-// from the live TLB.  Validated (zero EARLY-WRITE mismatches over test386 full
-// paging / Dhrystone / singlestep): the live physical == the demand physical
-// whenever live_write_posts, which already requires live_valid + hit +
-// write/dirty/user.  Same physical as the early read; folds write traffic into
-// the PG_IDLE issue so req_mem_present keeps only crossings / cache-busy / ucode.
+// Early write: post a cacheable, non-crossing, non-check-only write at PG_IDLE from the live TLB. Validated (zero EARLY-WRITE mismatches...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-unit-sv-415
 wire        early_wr_idx_drive = (state == PG_IDLE) && idle_mem_req &&
                                  mem_write && !mem_is_io && !mem_is_inta;
 wire        early_wr_present   = early_wr_idx_drive && !idle_mem_crossing &&
@@ -415,15 +392,8 @@ wire        early_wr_accept    = early_wr_present && dcache_req_accepted;
 wire        early_present      = early_rd_present || early_wr_present;
 
 assign dcache_req_valid = dcache_req_valid_r || req_mem_dcache_candidate || early_present;
-// PIPT cache request: drive the cache off the physical address only -- no
-// separate early-index port.  Page frame [31:12] uses the TLB-selected path
-// (early_present at PG_IDLE / req_mem_present at PG_MEM_TLB).  Page offset [11:0]
-// -- which carries the cache set/word index [11:2] -- is translation-invariant,
-// so it uses the TLB-free early_idx_drive select; the cache indexes off
-// dcache_req_phys_addr[11:2] (like l1_icache) and its index path never crosses
-// the live TLB.  In the accept cases the two selects agree (early_present implies
-// early_idx_drive); a non-accepted PG_IDLE preread gets the right index with a
-// stale frame, which is unused.
+// PIPT cache request: drive the cache off the physical address only -- no separate early-index port. Page frame [31:12] uses the...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-unit-sv-433
 wire [19:0] dcache_req_frame  = early_present   ? early_phys[31:12] :
                                 req_mem_present  ? req_mem_phys[31:12] :
                                                    dcache_req_phys_addr_r[31:12];
@@ -735,23 +705,16 @@ always_ff @(posedge clk or negedge reset_n) begin
                             state <= PG_CROSS_WAIT1;
                         end
                     end else if (early_rd_accept) begin
-                        // SET-read-at-019: the dcache accepted the early read
-                        // (presented this cycle with the live physical), so the
-                        // SET preread already ran at 019.  Collect the data next
-                        // cycle via fast_path_pending and stay in PG_IDLE; the
-                        // finalize/OPR_R lands at 01A -- one cycle earlier.
+                        // SET-read-at-019: the dcache accepted the early read (presented this cycle with the live physical), so the SET preread already ran at...
+                        // Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-unit-sv-753
                         latch_biu_meta(2'd0, op_size_bytes_m1(mem_op_size), 1'b0,
                                        linear_addr[1:0], 1'b0, 1'b0);
                         fast_path_pending <= 1'b1;
                         mem_dly_grace <= 1'b1;   // optimistic release for the finalize cycle
                         rd_ind_active <= 1'b0;
                     end else if (early_wr_accept) begin
-                        // Early posted write: the store-queue write was enqueued
-                        // this cycle from the live physical (accept => post), so
-                        // the access is done.  Clear servicing and stay in
-                        // PG_IDLE -- no PG_MEM_TLB, no posted-write DLY grace; the
-                        // following DLY uop runs next cycle with servicing low.
-                        // OPR_R is skipped this cycle via early_wr_accept.
+                        // Early posted write: the store-queue write was enqueued this cycle from the live physical (accept => post), so the access is done. Clear...
+                        // Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-unit-sv-764
                         latch_biu_meta(2'd0, op_size_bytes_m1(mem_op_size), 1'b1,
                                        linear_addr[1:0], 1'b0, 1'b0);
                         rd_ind_active <= 1'b0;

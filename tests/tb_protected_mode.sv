@@ -1,10 +1,7 @@
 `timescale 1ns/1ns
 
-//
-// Testbench for z386 - Protected Mode Test Runner
-// Generic testbench for protected mode tests with configurable segment descriptors
-// and paging.
-//
+// Testbench for z386 - Protected Mode Test Runner Generic testbench for protected mode tests with configurable segment descriptors and...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-tests-tb-protected-mode-sv-3
 
 /* verilator lint_off SYNCASYNCNET */
 
@@ -55,6 +52,7 @@ module tb_protected_mode;
         .inta(inta),
         .snoop_addr(32'h0),
         .snoop_valid(1'b0),
+        .a20_enable(1'b1),
         .single_step(1'b0), // Continuous execution
         .dbg_CS(),
         .dbg_EIP(),
@@ -347,11 +345,6 @@ module tb_protected_mode;
         desc.D_B        = flags[7];
         desc.G          = flags[6];
         desc.A          = flags[5];
-        desc.executable = flags[15];
-        desc.expand_down= ~flags[15] & flags[14];
-        desc.conforming = flags[15] & flags[14];
-        desc.writable   = ~flags[15] & flags[13];
-        desc.readable   = flags[15] & flags[13];
         return desc;
     endfunction
 

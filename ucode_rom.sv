@@ -1,9 +1,5 @@
-// Microcode ROM with predecode.
-//
-// The ROM stores the original 37-bit microcode word (ucode.hex / ucode.mif).
-// Takes two cycles as 386 allows for better timing; bits 50:37 are predecoded
-// combinationally in the spare ROM output register stage, so no expanded
-// ROM image is needed.
+// Microcode ROM with predecode. The physical ROM stores a 37-bit native microcode word plus a 3-bit v52 D2 early kind. Execution still...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-ucode-rom-sv-1
 module ucode_rom
     import z386_pkg::*;
 #(
@@ -14,7 +10,8 @@ module ucode_rom
     input       [11:0] addr,
     output      [50:0] q_early,
     output      [50:0] q,
-    output      [5:0]  q_shift_source,  // replicated from q[23:18] for shift unit
+    output      [2:0]  q_kind_early,
+    output      [5:0]  q_shift_source,
     output      [5:0]  q_shift_alu_src,
     output      [6:0]  q_shift_aluop
 );
@@ -82,12 +79,12 @@ function automatic [13:0] ucode_predecode(input [36:0] w);
 endfunction
 
 `ifdef Z386_QUARTUS_M10K_UCODE
-wire [36:0] q_mem;
+wire [39:0] q_mem;
 reg  [50:0] q_r;
 
 altsyncram #(
     .operation_mode("ROM"),
-	    .width_a(37),
+	    .width_a(40),
 	    .widthad_a(12),
 	    .numwords_a(2560),
 	    .outdata_reg_a("UNREGISTERED"),
@@ -113,7 +110,7 @@ altsyncram #(
 
 always_ff @(posedge clk) begin
     if (ce) begin
-        q_r <= {ucode_predecode(q_mem), q_mem};
+        q_r <= {ucode_predecode(q_mem[36:0]), q_mem[36:0]};
         q_shift_source_r <= q_mem[23:18];
         q_shift_alu_src_r <= q_mem[36:31];
         q_shift_aluop_r <= q_mem[17:11];
@@ -121,14 +118,15 @@ always_ff @(posedge clk) begin
 end
 
 assign q = q_r;
-assign q_early = {ucode_predecode(q_mem), q_mem};
+assign q_early = {ucode_predecode(q_mem[36:0]), q_mem[36:0]};
+assign q_kind_early = q_mem[39:37];
 `else
 `ifdef Z386_QUARTUS_LOGIC_UCODE
-(* ramstyle = "logic" *) reg [36:0] microcode_rom [0:2559];
+(* ramstyle = "logic" *) reg [39:0] microcode_rom [0:2559];
 `else
-(* ram_style = "block" *) reg [36:0] microcode_rom [0:2559] /* synthesis syn_ramstyle = "block_ram" */;
+(* ram_style = "block" *) reg [39:0] microcode_rom [0:2559] /* synthesis syn_ramstyle = "block_ram" */;
 `endif
-	reg [36:0] q_mem;
+	reg [39:0] q_mem;
 	reg [50:0] q_r;
 
 initial begin
@@ -138,7 +136,7 @@ end
 	always_ff @(posedge clk) begin
 	    if (ce) begin
 	        q_mem <= microcode_rom[addr];
-	        q_r <= {ucode_predecode(q_mem), q_mem};
+	        q_r <= {ucode_predecode(q_mem[36:0]), q_mem[36:0]};
 	        q_shift_source_r <= q_mem[23:18];
 	        q_shift_alu_src_r <= q_mem[36:31];
 	        q_shift_aluop_r <= q_mem[17:11];
@@ -146,7 +144,8 @@ end
 	end
 
 assign q = q_r;
-assign q_early = {ucode_predecode(q_mem), q_mem};
+assign q_early = {ucode_predecode(q_mem[36:0]), q_mem[36:0]};
+assign q_kind_early = q_mem[39:37];
 `endif
 
 assign q_shift_source = q_shift_source_r;

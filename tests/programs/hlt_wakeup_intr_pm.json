@@ -1,0 +1,17 @@
+{
+  "asm": "hlt_wakeup_intr_pm.asm",
+  "start_mode": "real",
+  "cr0": 0,
+  "cr3": 0,
+  "eip": 0,
+  "initial_selectors": {
+    "DS": 0,
+    "SS": 0,
+    "ES": 0,
+    "FS": 0,
+    "GS": 0
+  },
+  "d_init": 0,
+  "page_tables": [],
+  "continue_on_hlt": true
+}

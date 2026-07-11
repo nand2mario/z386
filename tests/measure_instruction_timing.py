@@ -23,7 +23,7 @@ from pathlib import Path
 
 TEST_NAME = "instruction_timing"
 TESTS_DIR = Path(__file__).resolve().parent
-DEFAULT_TRACE = TESTS_DIR / "protected_mode_tests" / "traces" / f"{TEST_NAME}.vcd"
+DEFAULT_TRACE = TESTS_DIR / "programs" / "traces" / f"{TEST_NAME}.vcd"
 
 SIGNALS = {
     "clk": "TOP.tb_protected_mode.clk",
@@ -86,6 +86,7 @@ STEADY_PHASES = [
     # rep movsb of REP_COUNT(64) bytes + 3-mov ESI/EDI/ECX reset per copy.
     # 80386 ref ~ 5 + 4*count; 64B ~= 261.  z386 currently ~333 (~5.2 cyc/byte).
     SteadyPhase("rep_movsb", "rep movsb (64B)", 261.0, (0x1B10, 0x1B21, 0x1B32, 0x1B43, 0x1B54, 0x1B65, 0x1B76, 0x1B87)),
+    SteadyPhase("alu_mem_rmw", "add [edi], eax", 7.0, (0x1C10, 0x1C12, 0x1C14, 0x1C16, 0x1C18, 0x1C1A, 0x1C1C, 0x1C1E)),
 ]
 
 BRANCH_PHASES = [
@@ -95,27 +96,71 @@ BRANCH_PHASES = [
 ]
 
 
-# Best-case z386 0.1 baseline from doc/early-start.md.  These are constants so
-# the timing script can show progress against the documented starting point.
-Z386_01_MIN_CYCLES = {
+# Best-case z386 0.4 baseline (= 21.z386 / 24.z386x M0), measured 20260705
+# (doc/z386x/m0.md).  Constants so the script shows progress vs the pre-FAST
+# starting point.
+Z386_04_MIN_CYCLES = {
+    "load": 3.0,
+    "store": 2.0,
+    "push_reg_to_mem": 2.0,
     "move_reg_to_reg": 2.0,
+    "load_immediate": 2.0,
     "alu_reg_to_reg": 2.0,
+    "pop_mem_to_reg": 3.0,
+    "conditional_jump_not_taken": 3.0,
+    "conditional_jump_not_taken_back": 3.0,
+    "conditional_jump_taken_fwd": 7.0,
+    "lea": 2.0,
     "rotate_reg_cl": 3.0,
     "xchg_reg_reg": 3.0,
-    "conditional_jump_not_taken": 3.0,
-    "load": 7.0,
-    "store": 5.0,
-    "push_reg_to_mem": 5.0,
-    "pop_mem_to_reg": 6.0,
-    "lea": 4.0,
-    "xchg_mem_reg": 11.0,
-    "push_imm_to_mem": 6.0,
-    "push_seg_to_mem": 5.0,
-    "push_mem_to_mem": 11.0,
-    "pop_mem_to_mem": 11.0,
-    "conditional_jump_taken": 12.0,
-    "unconditional_jump": 9.0,
-    "load_immediate": 3.0,
+    "xchg_mem_reg": 5.0,
+    "push_imm_to_mem": 2.0,
+    "push_seg_to_mem": 2.0,
+    "push_mem_to_mem": 5.0,
+    "pop_mem_to_mem": 5.0,
+    "alu_reg_mem": 5.0,
+    "byte_load": 3.0,
+    "byte_store": 2.0,
+    "shift_reg_imm": 3.0,
+    "alu_reg_imm": 2.0,
+    "rep_movsb": 333.0,
+    "alu_mem_rmw": 6.0,
+    "conditional_jump_taken": 6.0,
+    "unconditional_jump": 6.0,
+    "call_taken": 7.0,
+}
+
+# 80486 targets: the 24.z386x design goals (doc/z386x/ideas.md table) plus
+# published i486 cycle counts where the design table is silent.
+TARGET_486_CYCLES = {
+    "load": 1.0,
+    "store": 1.0,
+    "push_reg_to_mem": 1.0,
+    "move_reg_to_reg": 1.0,
+    "load_immediate": 1.0,
+    "alu_reg_to_reg": 1.0,
+    "pop_mem_to_reg": 1.0,
+    "conditional_jump_not_taken": 1.0,
+    "conditional_jump_not_taken_back": 1.0,
+    "conditional_jump_taken_fwd": 3.0,
+    "lea": 1.0,
+    "rotate_reg_cl": 3.0,
+    "xchg_reg_reg": 3.0,
+    "xchg_mem_reg": 5.0,
+    "push_imm_to_mem": 1.0,
+    "push_seg_to_mem": 3.0,
+    "push_mem_to_mem": 4.0,
+    "pop_mem_to_mem": 5.0,
+    "alu_reg_mem": 2.0,
+    "byte_load": 1.0,
+    "byte_store": 1.0,
+    "shift_reg_imm": 2.0,
+    "alu_reg_imm": 1.0,
+    "rep_movsb": 204.0,          # i486 REP MOVSB ~ 12 + 3n, n = 64
+    "alu_mem_rmw": 3.0,          # i486 ADD m,r
+    "conditional_jump_taken": 3.0,
+    "unconditional_jump": 3.0,
+    "call_taken": 3.0,
 }
 
 
@@ -181,12 +226,21 @@ def apply_changes(
     eip_id = ids["eip"]
     i_first_id = ids["i_first"]
     eip_value = parse_bit_value(state.get(eip_id, ""))
-    if (
+    # One event per instruction start. Normally that is an i_first rising
+    # edge, but z386x FAST->FAST chains keep i_first high across consecutive
+    # instructions — there, each instruction start shows as an EIP change
+    # while i_first stays 1 (EIP advances at every chained i_pop).
+    i_first_rise = (
         i_first_id in changes
         and prev_values.get(i_first_id) == "0"
         and state.get(i_first_id) == "1"
-        and eip_value is not None
-    ):
+    )
+    chained_start = (
+        eip_id in changes
+        and state.get(i_first_id) == "1"
+        and i_first_id not in changes
+    )
+    if (i_first_rise or chained_start) and eip_value is not None:
         i_first_events.append((time_value, eip_value))
 
 
@@ -285,24 +339,30 @@ def format_table_row(columns: list[str], widths: list[int]) -> str:
 
 
 def print_comparison_table(results: list[PhaseResult], color_enabled: bool) -> None:
-    headers = ["Instruction class", "80386 target", "z386 0.1", "z386 current"]
+    headers = ["Instruction class", "80386 target", "80486 target", "z386 0.4", "z386 current"]
     rows: list[list[str]] = []
 
     for result in results:
         current = min(result.samples) if result.samples else None
-        baseline = Z386_01_MIN_CYCLES.get(result.name)
+        baseline = Z386_04_MIN_CYCLES.get(result.name)
+        target486 = TARGET_486_CYCLES.get(result.name)
         current_text = fmt_cycles(current)
         if current is not None:
-            current_text = colorize(current_text, classify_delta(current - result.target_cycles), color_enabled)
+            # color against the 486 goal when defined, else the 386 target
+            ref = target486 if target486 is not None else result.target_cycles
+            current_text = colorize(current_text, classify_delta(current - ref), color_enabled)
         rows.append([
             result.description,
             fmt_cycles(result.target_cycles),
+            fmt_cycles(target486),
             fmt_cycles(baseline),
             current_text,
         ])
 
     plain_rows = [
-        [result.description, fmt_cycles(result.target_cycles), fmt_cycles(Z386_01_MIN_CYCLES.get(result.name)),
+        [result.description, fmt_cycles(result.target_cycles),
+         fmt_cycles(TARGET_486_CYCLES.get(result.name)),
+         fmt_cycles(Z386_04_MIN_CYCLES.get(result.name)),
          fmt_cycles(min(result.samples) if result.samples else None)]
         for result in results
     ]
@@ -496,6 +556,10 @@ def main() -> int:
             "  delta vs 386 target: "
             f"{colorize(f'{delta_text} cycles', level, color_enabled)}"
         )
+        target486 = TARGET_486_CYCLES.get(result.name)
+        if target486 is not None and avg is not None:
+            d486 = avg - target486
+            print(f"  delta vs 486 target: {d486:+.1f} cycles (486 = {target486:g})")
         print()
 
     return 0

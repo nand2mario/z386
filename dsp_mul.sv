@@ -1,9 +1,5 @@
-//=============================================================================
 // DSP-Based 32x32 Multiplier
-//=============================================================================
-// Uses four 17x17 signed multipliers (fits in FPGA DSP blocks like DSP48).
-// Computes 32x32->64 bit multiplication in 4 cycles instead of 32.
-//
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-dsp-mul-sv-1
 module dsp_mul (
     input               clk,
     input               reset_n,

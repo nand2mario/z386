@@ -14,7 +14,11 @@ module alu_alt
     output [31:0] result,
     output [31:0] flags_out,
     // 1 when this op updates ZF/SF/PF (see alu.sv)
-    output        zsp_update
+    output        zsp_update,
+    // v50 timing-first: dedicated pre-assembled Z/S/P for the z386-level
+    // eflags_ahead overlay (see alu.sv) - here tapped from the existing
+    // raw_result flag wires (pre output assembly, not f2).
+    output [2:0]  zsp_ahead    // {sf, zf, pf}
 );
 
 wire is_byte  = (op_size == 2'd0);
@@ -225,6 +229,7 @@ wire zf_word  = raw_result[15:0] == 16'h0000;
 wire zf_dword = raw_result == 32'h0000_0000;
 wire zf_result = is_dword ? zf_dword : (is_word ? zf_word : zf_byte);
 wire pf_result = ~^raw_result[7:0];
+assign zsp_ahead = {r_msb, zf_result, pf_result};
 
 wire add_a_sign = flag_byte_mode ? add_a[7] : (is_word ? add_a[15] : add_a[31]);
 wire of_b_sign = flag_byte_mode ? of_operand[7] : (is_word ? of_operand[15] : of_operand[31]);

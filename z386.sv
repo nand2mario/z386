@@ -1,17 +1,18 @@
+// z386x - An x86 core with the original 386 microcode and some 486-style pipelining
 //
-// z386 - An 80386 core driven by the original 386 microcode
-// nand2mario, April 2026
+// nand2mario, July 2026
 //
-// Functional units:
-//   1. Bus Interface Unit
-//   2. Instruction Decode Unit (3-level instruction queue)
-//   3. Prefetch Unit (16-byte prefetch queue)
+// Functional units
+//   1. Prefetch and Bus Interface
+//   2. Decode1 (structural decode)
+//   3. Decode2 (literals capture and early-address)
 //   4. Segmentation Unit
 //   5. Paging Unit (including TLB)
 //   6. Protection Test Unit
-//   7. Control Unit (microcode sequencer)
-//   8. Data Unit (ALU, register file, barrel shifter)
-//
+//   7. Execution (control unit for both microcode and fast instructions)
+//   8. Write-back
+//   9. Data Unit (ALU, register file, barrel shifter)
+
 module z386
     import z386_pkg::*;
 #(
@@ -43,6 +44,8 @@ module z386
     // External memory writers can invalidate matching L1 lines.
     input      [31:0]  snoop_addr,
     input              snoop_valid,
+
+    input              a20_enable,  // A20 gate input
 
     // Debug/test control
     input              single_step, // Halt after each instruction (for single-step tests)
@@ -111,6 +114,7 @@ reg [31:0] alu_dst, alu_src;        // ALU inputs this cycle
 reg [4:0]  alu_op5;                 // ALU operation this cycle
 reg [31:0] alu_src_r;               // Registered alu_src for jumps (32-bit)
 wire [31:0] alu_result;
+wire [2:0]  alu_zsp_ahead;
 
 // Shifter
 wire [31:0] shift_result;
@@ -149,19 +153,32 @@ wire [1:0] cpl = vm ? 2'd3 : !pe ? 2'd0 : CS[1:0];
 reg [2:0]  latched_pf_code;         // Latched page fault error code (for LPCR microcode access)
 reg [31:0] latched_pf_addr;         // Latched faulting linear address (for LPCR microcode access)
 
-wire [31:0] q_window;               // 4-byte aligned window at queue head
-wire [31:0] q_window_next;          // next-cycle window (feeds entry-PLA ROM addr one cycle early)
+wire [31:0] win_d1;                 // registered window at the prefetcher's D1 cursor
+wire [5:0]  d1_avail;               // bytes fetched beyond the D1 cursor
+wire [3:0]  d1_adv;                 // D1 cursor advance this cycle (a prefix, or
+                                    //   the instruction rest at handoff, 0-11)
+wire [31:0] win_lit;                // D2 literal window at pop_cursor + lit_off
+wire [5:0]  lit_avail;              // bytes fetched beyond that point
+wire [4:0]  dec_lit_off;            // literal offset from the pop cursor
+wire        dec_pop_now;            // one instruction completed D2: pop its bytes
+wire [4:0]  dec_pop_len;            //   (registered length from the skeleton)
 wire       pf_full;
-wire       pf_empty;
-wire [5:0] pf_count;                // Prefetch bytes currently buffered
-wire [2:0] q_pop_bytes;             // Pop 1/2/4 bytes from queue
 wire       q_flush;                 // Flush queue (branch/jump) - combinational for i.immediate gating
 wire       pe_mode_toggle_now;      // CR0.PE changed this cycle: re-decode next bytes in new mode
 reg        uc_ctl_pref;             // Previous-cycle predecode: current uop is BUSOP_PREF
 
-assign pe_mode_toggle_now = uc_exec && (uc_dest == DEST_CR0) && (dest_value[0] != CR0[0]);
+// The live compare read dest_value[0] -- doc/z386x/core_notes_v51.md #1
+wire cr0_wr_bit0 = (uc_source == SRC_MDTMP) ? RESULT[0] :
+                   (uc_source == SRC_SIGMA) ? SIGMA[0]  : 1'b0;
+assign pe_mode_toggle_now = uc_exec && (uc_dest == DEST_CR0) && (cr0_wr_bit0 != CR0[0]);
 assign q_flush = (uc_exec && uc_ctl_pref && !uc_cond_jump_taken_prev && !early_redirected)
                || early_redirect || pe_mode_toggle_now;
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && uc_exec && (uc_dest == DEST_CR0) && (dest_value[0] !== cr0_wr_bit0))
+        $fatal(1, "CR0-WRITE SOURCE INVARIANT BROKEN: uc_addr=%03x src=%02x dv0=%b fast0=%b",
+               uc_addr, uc_source, dest_value[0], cr0_wr_bit0);
+// synthesis translate_on
 
 wire        page_fault;             // Page fault (declared fully at paging unit instantiation)
 wire [1:0]  prot_cpl;               // CPL for protection unit (declared fully near protection logic)
@@ -171,6 +188,8 @@ reg  [1:0]  arpl_rpl_latch;         // ARPL RPL latch (declared fully near ARPL 
 wire        mem_servicing;          // memory request in flight
 wire        mem_dly_grace;          // optimistic read: DLY may execute this (lookup) cycle
 wire        mem_write_dly_grace;    // posted write in PG_MEM_TLB: next non-bus uop may execute now
+wire        mem_write_wait;         // unposted demand write still fault-capable: stall ALL uops
+                                    // (its instruction may be FAST-chained away already)
 wire        mem_opt_wait;           // optimistic read missed: stall all uops until fill done
 wire        mem_accepted;           // memory request accepted (ready pulse)
 wire        mem_complete_now;       // combinational, request completing THIS cycle
@@ -204,19 +223,47 @@ reg        init_cycle;              // Cycle or cycles after i_entry - uc is bei
 reg        uc_active;               // Tracks when instruction execution has begun
 reg        fault_suppress_delay_slot;   // Fault handling: suppress delay slot after fault triggers
 
-// i_entry: load entry point into uaddr (e.g. when RNI), set init_cycle (queue NOT popped yet)
-wire       i_entry_raw = (i_rni || i_rni_delay || ~uc_active) && ~halted && !stall && !decq_empty && !q_flush && !init_cycle &&
+// z386x FAST path (doc/z386x/design.md): a FAST instruction completes in its
+// entry microcode word; hardware commits the result in that same cycle, so the
+// RNI delay slot carries no work and its (stale) ROM word must not execute.
+reg        fast_i_r;                // `i` holds a FAST-class instruction (latched at i_pop)
+reg        fast_multi_r;            // ... and its RNI word is not the entry word
+reg        fast_jcc_r;              // ... and it is a Jcc (chain on not-taken only)
+reg        fast_wf_r;               // ... and it produces arithmetic flags
+reg [2:0]  fast_commit_sel_r;       // FAST sideband select (FAST_COMMIT_*) at the RNI-word cycle
+reg        fast_keep_slot_r;        // memory class: the slot word is real work when unchained
+reg        fast_memc_pending;       // deferred MEM commit: write OPR_R to a GPR this cycle
+reg [2:0]  fast_memc_dst;           //   destination selector (dst_reg_sel of the load)
+reg [1:0]  fast_memc_size;          //   operand size of the load
+reg        fast_shc_pending;        // deferred SHIFT commit: write the latched
+reg [2:0]  fast_shc_dst;            //   shifter result to a GPR this cycle
+reg [1:0]  fast_shc_size;           //   (see the fast_shc_* block for why)
+reg [31:0] fast_shc_data;
+reg        fast_dead_slot;          // delay slot of a FAST instruction: suppress uc_exec
+reg        fast_off = 1'b0;         // sim chicken bit: +z386x_fast_off forces all-SEQ (21.z386 behavior)
+// synthesis translate_off
+initial if ($test$plusargs("z386x_fast_off")) fast_off = 1'b1;
+// synthesis translate_on
+wire       fast_active;             // executing a FAST instruction's entry word this cycle
+wire       fast_last;               // executing a FAST instruction's RNI word this cycle
+
+// i_entry: load entry point into uaddr (e.g. when RNI)
+wire       fold_entry  = decq_empty && d2_push;
+wire       i_entry_raw = (i_rni || i_rni_delay || ~uc_active) && ~halted && !stall && (!decq_empty || fold_entry) && !q_flush && !init_cycle &&
                          !fault_suppress_delay_slot && !interrupt_entry;
-assign     i_entry = i_entry_raw && !any_fault;
+assign     i_entry = i_entry_raw && !any_fault_pop;
 
 // i_pop: actually pop the instruction queue
-wire       interrupt_at_boundary = i_rni_delay && interrupt_pending && !single_step;
-assign     i_pop = init_cycle && !stall && !page_fault && !interrupt_at_boundary && !q_flush;
+wire       interrupt_deliverable = nmi_request_active ||
+                                   (intr_pending && EFLAGS[9] && !inhibit_interrupts);
+wire       interrupt_at_boundary = i_rni_delay && interrupt_deliverable && !single_step;
+assign     i_pop = init_cycle && !stall && !any_fault_pop && !interrupt_at_boundary && !q_flush;
 
 wire       core_live = !halted && uc_active && !fault_suppress_delay_slot && !interrupt_entry;
 wire       dly_grace_now = mem_dly_grace && uc_p_pure_dly;
 wire       posted_write_release = mem_write_dly_grace && !uc_busreq;    // release non-busop writes after one cycle
-wire       mem_block_busy = (uc_bus_or_dly && !dly_grace_now && !posted_write_release) || mem_opt_wait; // demand op in flight
+wire       mem_block_busy = (uc_bus_or_dly && !dly_grace_now && !posted_write_release) ||
+                            mem_opt_wait || mem_write_wait; // demand op in flight
 wire       mem_block_idle = (uc_busreq && !mem_accepted);  // uop wants the bus, paging not ready
 wire       stall_mem = mem_servicing ? mem_block_busy : (mem_req_current && !mem_accepted);
 wire       stall_wio = (uc_is_wio && !interrupt_pending && !single_step);
@@ -228,23 +275,147 @@ wire       repeat_active = uc_is_rpt && (COUNTR[4:0] != 0 || prot_test_inflight)
                            && !(uc_is_wio && interrupt_pending);
 
 // uc_exec: master enable for microcode execution
-wire       uc_exec = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) && !stall_wio;
+wire       uc_exec = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) && !stall_wio && !fast_dead_slot;
 wire       uc_exec_writeback = uc_exec;  // local copies for reducing fanout
 wire       uc_exec_mul_start = uc_exec;
 wire       uc_exec_result = uc_exec;
 wire       uc_exec_shift = uc_exec;
 
-// seg_cmd_valid: seg_unit should commit the current seg_cmd this cycle
 assign     seg_cmd_valid = i_pop || uc_exec;
 
 dec_entry_t i_bus;            // Decoded instruction from decoder module
-wire        decq_has_jmp_call; // decode queue holds a JMP/CALL rel (halt speculative prefetch)
+wire       decq_has_jmp_call; // decode queue holds a JMP/CALL rel (halt speculative prefetch)
 wire       decq_empty;        // Decoder instruction queue empty
+dec_entry_t i_bus2;           // Second decode-queue entry (z386x FAST-chain lookahead)
+dec_entry_t i;                // Current instruction (latched at i_pop; written far below)
+wire       decq_has2;         // i_bus2 is valid
 
-// The microcode ROM contains 2560 entries of 37-bit ucode + 14-bit predecode
+// Combinational EA-operand decode shared by queue-head and D2-completion
+// chaining. Declare it before the fold gates for strict Quartus ordering.
+typedef struct packed {
+    logic [7:0]  base_sel;    // onehot GPR selector (bit i = GPR i)
+    logic [7:0]  index_sel;   // onehot GPR selector
+    logic [1:0]  scale;
+    logic [31:0] disp;
+    logic        is16;
+    logic        s2b;         // SIB scale-to-base (no index)
+} ea_dec_t;
+
+dec_entry_t d2_entry;         // entry completing D2 this cycle (AGU/i_entry source)
+ea_dec_t    d2_agu_dec;       // EA decode for d2_entry
+
+// z386x FAST->FAST chaining: while popping a FAST instruction
+fast_class_t fast_pop_fc, fast_next_fc, fast_head_fc;
+assign     fast_pop_fc    = recipe_fast_class(i_bus);
+assign     fast_next_fc   = recipe_fast_class(i_bus2);
+assign     fast_head_fc   = fast_pop_fc;   // queue head; = next instr during i_first
+wire       fast_pop_fast  = fast_pop_fc.fast && !fast_off;
+// reads_flags successors may chain when the predecessor writes -- doc/z386x/core_notes_v51.md #5
+wire       fast_next_ok   = decq_has2 && fast_next_fc.fast &&
+                            (!fast_next_fc.reads_flags || !fast_pop_fc.writes_flags ||
+                             fast_next_fc.jcc) &&
+                            (!fast_next_fc.uses_ea || !fast_ea1_conflict) &&
+                            !fast_memc_conf1 && !fast_shc_conf1;
+// Load-use gate: a MEM-commit load's value lands one cycle after a chained
+// successor reads its operands, so never chain a dst-sourcing successor out
+// of a load. Conservative reg-index overlap (byte regs match on [1:0]).
+function automatic logic fast_gpr_overlap(input [2:0] a, input logic a_byte,
+                                          input [2:0] b, input logic b_byte);
+    if (!a_byte && !b_byte)      fast_gpr_overlap = (a == b);
+    else if (a_byte && b_byte)   fast_gpr_overlap = (a[1:0] == b[1:0]);
+    else if (a_byte)             fast_gpr_overlap = !b[2] && (a[1:0] == b[1:0]);
+    else                         fast_gpr_overlap = !a[2] && (b[1:0] == a[1:0]);
+endfunction
+wire       fast_load_dst_byte = (op_size == 2'd0);
+// Successor operand byte-ness must be exact: byte selectors encode
+// {high,reg[1:0]}, so a wrong guess can MISS a real overlap (e.g. AH vs
+// EAX). Precomputed in D1 (fc.op_byte).
+wire       head_byte_op = fast_pop_fc.op_byte;
+wire       fast_loaduse_conflict =
+               (fast_head_fc.reads_dst &&
+                fast_gpr_overlap(i.dst_reg_sel, fast_load_dst_byte, i_bus.dst_reg_sel, head_byte_op)) ||
+               (fast_head_fc.reads_src &&
+                fast_gpr_overlap(i.dst_reg_sel, fast_load_dst_byte, i_bus.src_reg_sel, head_byte_op)) ||
+               (fast_head_fc.reads_ecx &&
+                fast_gpr_overlap(i.dst_reg_sel, fast_load_dst_byte, 3'd1, 1'b0));
+wire       fast_head_ok   = !decq_empty && fast_head_fc.fast &&
+                            (!fast_head_fc.reads_flags || !fast_wf_r ||
+                             fast_head_fc.jcc) &&
+                            (!fast_head_fc.uses_ea || !fast_ea2_conflict) &&
+                            !((fast_commit_sel_r == FAST_COMMIT_MEM ||
+                               fast_commit_sel_r == FAST_COMMIT_SHIFT) && fast_loaduse_conflict) &&
+                            !fast_memc_confN && !fast_shc_confN;
+// One-word FAST: the RNI word executes one cycle after i_pop
+wire       fast_uc_next_rni = (uc_next[10:8] == 3'b000);
+wire jcc_pop_unsafe = uc_exec && ((uc_aluop == ALUJMP_SHIFT2) ||
+                                  (uc_aluop == ALUJMP_SEZF));
+wire alu_wf_now = uc_exec && alu_update_flags;
+// Z/S/P from the ALU's dedicated z
+wire ahead_sf = alu_zsp_ahead[2];
+wire ahead_zf = alu_zsp_ahead[1];
+wire ahead_pf = alu_zsp_ahead[0];
+wire [31:0] eflags_ahead = !alu_wf_now ? eflags_fwd : {
+    eflags_fwd[31:12],
+    alu_flags[11],                                   // OF
+    eflags_fwd[10:8],
+    alu_zsp_update ? ahead_sf : eflags_fwd[7],       // SF
+    alu_zsp_update ? ahead_zf : eflags_fwd[6],       // ZF
+    eflags_fwd[5],
+    alu_flags[4],                                    // AF
+    eflags_fwd[3],
+    alu_zsp_update ? ahead_pf : eflags_fwd[2],       // PF
+    eflags_fwd[1],
+    alu_flags[0]};                                   // CF (incl. preserve)
+// The FOLD's decision is consumed LIVE by fast_issue1 -> uaddr
+wire       jcc_fold_unsafe = alu_wf_now || jcc_pop_unsafe;
+wire       jcc_fold_now = i_pop && fast_pop_fast && fast_pop_fc.jcc &&
+                          !jcc_fold_unsafe &&
+                          !check_condition(i_bus.opcode[3:0], eflags_fwd);
+reg        jcc_fold_r;
+wire       jcc_fold_active = jcc_fold_r && i_first;   // the folded 065 cycle (level through stalls)
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        jcc_fold_r <= 1'b0;
+    else if (q_flush || interrupt_entry || any_fault)
+        jcc_fold_r <= 1'b0;
+    else if (i_pop)
+        jcc_fold_r <= jcc_fold_now;
+    else if (!stall)
+        jcc_fold_r <= 1'b0;
+end
+// synthesis translate_off
+// The pop-time fold decision and the 065-cycle evaluation must agree: a
+// mismatch means a flag write escaped the jcc_fold_unsafe gate.
+always @(posedge clk)
+    if (reset_n && jcc_fold_active && uc_exec && br_jcc_taken)
+        $display("%0t JCC-FOLD MISMATCH: pop said not-taken, 065 says taken. opcode=%02x EFLAGS=%08x",
+                 $time, i.opcode, EFLAGS);
+// synthesis translate_on
+
+// Jcc: chain fires at i_first (065) only when the settled-EFLAGS condition resolves NOT taken
+wire       fast_issue1    = i_pop && fast_pop_fast &&
+                            ((!fast_pop_fc.multi_word && !fast_pop_fc.jcc) ||
+                             jcc_fold_now) && fast_next_ok;
+wire       fast_issueN    = fast_i_r && fast_multi_r && uc_exec && fast_uc_next_rni &&
+                            !i_pop && !i_rni_delay && !q_flush && fast_head_ok;
+// jcc_pop_cond_v_r && !jcc_pop_taken_r: the registered pop-time NOT-taken
+// decision (see its definition near early_redirect) - keeps the live
+// eflags_fwd condition cone out of the chain/uaddr paths. Pop-invalid Jcc
+// simply doesn't chain (normal boundary).
+wire       fast_issueJ    = fast_active && fast_jcc_r && uc_exec &&
+                            jcc_pop_cond_v_r && !jcc_pop_taken_r &&
+                            !q_flush && fast_head_ok && !jcc_fold_r;
+wire       fast_issue     = (fast_issue1 || fast_issueN || fast_issueJ) &&
+                            !interrupt_pending && !single_step && !any_fault_pop;
+
+// The physical microcode ROM contains 37-bit native words plus the v52
+// three-bit early kind.  The execution bus remains native ucode + 14-bit
+// predecode.
 wire        microcode_rom_ce = !stall && !repeat_active;
 wire [50:0] uc_rom_q;
 wire [50:0] uc_rom_early;
+wire [2:0]  uc_kind_early;
+(* noprune *) reg [2:0] early_kind_probe_r;
 wire [5:0]  uc_source_shift;
 wire [5:0]  uc_alu_src_shift;
 wire [6:0]  uc_aluop_shift;
@@ -257,10 +428,29 @@ ucode_rom microcode_rom (
     .addr(uaddr_now),
     .q_early(uc_rom_early),
     .q(uc_rom_q),
+    .q_kind_early(uc_kind_early),
     .q_shift_source(uc_source_shift),
     .q_shift_alu_src(uc_alu_src_shift),
     .q_shift_aluop(uc_aluop_shift)
 );
+
+always_ff @(posedge clk) begin
+    if (i_pop)
+        early_kind_probe_r <= uc_kind_early;
+end
+
+// synthesis translate_off
+// At i_pop, q_early is the entry word launched by i_entry.  Prove that the
+// physical ROM annotation agrees with the optimizer-generated entry lookup;
+// instruction legality comes from recipe_fast_class() and registered operands.
+always @(posedge clk) begin
+    if (reset_n && i_pop &&
+        (uc_kind_early !== recipe_early_kind(i_bus.entry_point)))
+        $fatal(1, "ucode early-kind mismatch: entry=%03x rom=%0d expected=%0d",
+               i_bus.entry_point, uc_kind_early,
+               recipe_early_kind(i_bus.entry_point));
+end
+// synthesis translate_on
 
 // ROM1 decoder for instruction layout decoding
 `include "pla_control.svh"
@@ -268,12 +458,11 @@ ucode_rom microcode_rom (
 // Decoder23 PLA: Opcode → Microcode Entry Point
 `include "pla_entry.svh"
 
-wire [15:0] ea_regs_16 = decode_base_register_16(i_bus.modrm);
 
 //=============================================================================
-// Prefetch queue and Bus Interface Unit
+// Unit 1: Prefetch queue and Bus Interface
 //=============================================================================
-// Forward declarations to avoid implicit wire inference in synthesis
+// Forward declarations
 wire [31:0] pf_flush_addr;          // Prefetch flush address
 wire [5:0]  uc_buscode;             // Bus operation code from microcode
 wire [6:0]  uc_dest;                // Destination field from microcode
@@ -281,7 +470,6 @@ wire [5:0]  uc_source;              // Source field from microcode
 wire [31:0] dest_value;             // Destination value for writes
 wire        gp_fault_trigger;       // GP fault trigger
 wire        div_overflow;           // Division overflow
-// stack_init_pending is a reg, declared later
 
 wire [11:0] prot_jump_addr;         // Microcode jump address from protection unit
 wire        prot_jump_valid;        // jump_addr is a redirect (non-zero)
@@ -289,7 +477,7 @@ wire        prot_validation_ok;     // M flag: Descriptor validated
 wire        prot_result_valid;      // Pipelined result is valid (2 cycles after test)
 
 wire        dcache_req_valid;
-wire [31:0] dcache_req_phys_addr;
+wire [31:0] dcache_req_phys_addr_raw;
 wire        dcache_req_write;
 wire [3:0]  dcache_req_be;
 wire [31:0] dcache_req_wdata;
@@ -299,10 +487,18 @@ wire        dcache_req_accepted;
 wire        dcache_req_complete;
 wire [31:0] dcache_rdata;
 wire        icache_req_valid;
-wire [31:0] icache_req_phys_addr;
+wire [31:0] icache_req_phys_addr_raw;
 wire        icache_req_accepted;
 wire        icache_req_complete;
 wire [127:0] icache_rdata;
+
+// A20 gate (bit-20 mask) applied BEFORE the L1 caches
+wire [31:0] dcache_req_phys_addr = (!a20_enable && !dcache_req_is_io)
+                                 ? (dcache_req_phys_addr_raw & ~32'h0010_0000)
+                                 : dcache_req_phys_addr_raw;
+wire [31:0] icache_req_phys_addr = !a20_enable
+                                 ? (icache_req_phys_addr_raw & ~32'h0010_0000)
+                                 : icache_req_phys_addr_raw;
 
 wire [31:0] dcache_cpu_dout;
 wire        dcache_cpu_ready;
@@ -444,7 +640,8 @@ always_ff @(posedge clk) begin
             ext_addr_r <= dcache_req_phys_addr[31:2];
             ext_be_r <= dcache_req_be;
             ext_burstcount_r <= 8'd1;
-            ext_dout_r <= dcache_req_wdata;
+            if (dcache_req_write)
+                ext_dout_r <= dcache_req_wdata;
             ext_write_r <= dcache_req_write;
             ext_io_r <= dcache_req_is_io;
             ext_inta_r <= dcache_req_is_inta;
@@ -454,7 +651,8 @@ always_ff @(posedge clk) begin
             ext_addr_r <= dcache_mem_addr[31:2];
             ext_be_r <= dcache_mem_be;
             ext_burstcount_r <= dcache_mem_burstcount;
-            ext_dout_r <= dcache_mem_din;
+            if (dcache_mem_write)
+                ext_dout_r <= dcache_mem_din;
             ext_write_r <= dcache_mem_write;
             ext_io_r <= 1'b0;
             ext_inta_r <= 1'b0;
@@ -563,12 +761,15 @@ prefetch prefetch_inst (
     .clk(clk),
     .reset_n(reset_n),
     // Queue output to decoder
-    .q_window(q_window),
-    .q_window_next(q_window_next),
+    .win_d1(win_d1),
+    .d1_avail(d1_avail),
+    .d1_adv(d1_adv),
+    .win_lit(win_lit),
+    .lit_avail(lit_avail),
+    .lit_off(dec_lit_off),
     .q_full(pf_full),
-    .q_empty(pf_empty),
-    .pf_count(pf_count),
-    .q_pop_bytes(q_pop_bytes),
+    .pop_now(dec_pop_now),
+    .pop_len(dec_pop_len),
     // Flush
     .q_flush(q_flush),
     .pf_flush_addr(pf_flush_addr),
@@ -581,22 +782,61 @@ prefetch prefetch_inst (
     .pf_fault(pf_fault),
     // Control
     .pf_suspend(page_fault),
-    .halt_speculative(decq_has_jmp_call)
+    .halt_speculative(decq_has_jmp_call),
+
+    // z386x speculative branch-target line
+    .spec_req(pf_spec_req),
+    .spec_linear(spec_target_lin),
+    .spec_owner(pf_spec_owner_r),
+    .spec_kill(pf_spec_kill)
 );
 
+// z386x speculative branch-target fetch
+wire        spec_br_rel8   = !i_bus.has_0f && (i_bus.opcode[7:4] == 4'h7 || i_bus.opcode == 8'hEB);
+wire [31:0] spec_disp      = spec_br_rel8 ? {{24{i_bus.displacement[7]}}, i_bus.displacement[7:0]}
+                                          : i_bus.displacement;
+// Stale-EIP pop guard: a pop CHAINED into a control transfer's
+wire        spec_eip_stale = uc_exec && fast_last && (uc_dest == DEST_eIP);
+wire [31:0] spec_target_lin = CS_base + EIP + ({27'd0, i_bus.length} + spec_disp);
+wire        pf_spec_req    = i_pop && fast_pop_fc.br_rel && i_bus.data32 && !fast_off &&
+                             !spec_eip_stale;
+// Ownership: set when an instruction's i_pop requests a spec fetch, cleared
+// by any later pop, flush, or interrupt entry - so it is only up while the
+// requesting branch itself is the current instruction, which is exactly when
+// its taken-flush address provably equals the spec target.
+reg pf_spec_owner_r;
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        pf_spec_owner_r <= 1'b0;
+    else begin
+        if (i_pop)
+            pf_spec_owner_r <= pf_spec_req;
+        if (q_flush || interrupt_entry || any_fault)
+            pf_spec_owner_r <= 1'b0;
+    end
+end
+
+// Any committed store or external snoop may make the buffered
+wire        pf_spec_kill   = (dcache_req_valid && dcache_req_write) ||
+                             snoop_valid || cr3_write ||
+                             (uc_exec && (uc_dest == DEST_CR0));
+
 //=============================================================================
-// Instruction Decode Unit
+// Unit 2: Decode1 (structural decode)
 //=============================================================================
 decoder decoder_inst (
     .clk        (clk),
     .reset_n    (reset_n),
 
-    // Prefetch queue interface
-    .q_window   (q_window),
-    .q_window_next(q_window_next),
-    .pf_count   (pf_count),
-    .pf_empty   (pf_empty),
-    .q_pop_bytes(q_pop_bytes),
+    // Prefetch queue interface (two-cursor protocol)
+    .win_d1     (win_d1),
+    .d1_avail   (d1_avail),
+    .d1_adv     (d1_adv),
+    .win_lit    (win_lit),
+    .lit_avail  (lit_avail),
+    .lit_off    (dec_lit_off),
+    .pop_now    (dec_pop_now),
+    .pop_len    (dec_pop_len),
 
     // Mode signals
     .D          (D),
@@ -609,11 +849,575 @@ decoder decoder_inst (
     // Decoded instruction output
     .i_bus      (i_bus),
     .decq_empty (decq_empty),
-    .decq_has_jmp_call(decq_has_jmp_call)
+    .i_bus2     (i_bus2),
+    .decq_has2  (decq_has2),
+    .decq_has_jmp_call(decq_has_jmp_call),
+
+    // Step 3a D2-AGU sidecar (observer)
+    .d2_entry   (d2_entry),
+    .d2_push    (d2_push),
+    .skel_entry_point(skel_entry_point),
+    .d2_ea_lin  (d2_agu_lin),
+    .d2_ea_v    (d2_agu_valid),
+    .ea_inval_gpr(ea_inval_gpr),
+    .ea_inval_all(ea_inval_all),
+    .head_ea_lin(head_ea_lin),
+    .head_ea_v  (head_ea_v)
 );
 
+wire        d2_push;
+wire [11:0] skel_entry_point;
+wire [31:0] head_ea_lin;
+wire        head_ea_v;
+
 //=============================================================================
-// Segmentation Unit
+// Unit 3: Decode2 - literals capture and early-address (EA decode, relocate,
+//                    and required forwarding to start memory operations at i_pop)
+//=============================================================================
+
+// Decode an entry's precomputed EA selectors for the head and chain targets.
+function automatic ea_dec_t ea_decode_of(input dec_entry_t e);
+    ea_dec_t r;
+    // Defaults (also the "no modrm / has moffs" case)
+    r = '0;
+    // base/index onehot selectors are precomputed in D1 (decq-registered)
+    r.base_sel  = e.ea_base_onehot;
+    r.index_sel = e.ea_index_onehot;
+    if (e.has_modrm && !e.has_moffs) begin
+        if (e.addr32) begin
+            // 32-bit addressing mode
+            r.scale     = e.has_sib ? e.sib[7:6] : 2'b00;
+            r.s2b       = e.has_sib && (e.sib[5:3] == 3'b100);  // No index, scale to base
+        end else begin
+            // 16-bit addressing mode
+            r.is16      = 1'b1;
+        end
+
+        // Displacement value (sign-extend disp8, use full disp16/disp32)
+        begin
+            automatic logic [31:0] disp_val;
+            if (e.modrm[7:6] == 2'b01)
+                // disp8 - sign extend
+                disp_val = {{24{e.displacement[7]}}, e.displacement[7:0]};
+            else if (e.modrm[7:6] == 2'b10)
+                // disp16 or disp32
+                disp_val = e.addr32 ? e.displacement : {{16{e.displacement[15]}}, e.displacement[15:0]};
+            else
+                // disp32 for [disp32] or [disp16] modes (mod=00, special rm)
+                disp_val = e.addr32 ? e.displacement : {16'h0, e.displacement[15:0]};
+
+            // POP r/m (8F) with ESP base: Intel 386 says EA uses post-increment ESP.
+            if (e.opcode == 8'h8F && e.addr32 && e.has_sib && e.sib[2:0] == 3'b100) begin
+                disp_val = disp_val + (e.data32 ? 32'd4 : 32'd2);
+            end
+            r.disp = disp_val;
+        end
+        // Zero disp when not used
+        if (e.modrm[7:6] == 2'b00 || e.modrm[7:6] == 2'b11) begin
+            if (e.addr32) begin
+                // 32-bit: special rm is rm=101 (non-SIB) or sib_base=101 (SIB)
+                if (e.has_sib && e.modrm[2:0] == 3'b100) begin
+                    if (e.sib[2:0] != 3'b101)
+                        r.disp = 32'h0;  // SIB, no disp32
+                end else begin
+                    if (e.modrm[2:0] != 3'b101)
+                        r.disp = 32'h0;  // Non-SIB, no disp32
+                end
+            end else begin
+                // 16-bit: special rm is rm=110
+                if (e.modrm[2:0] != 3'b110)
+                    r.disp = 32'h0;
+            end
+        end
+    end
+    ea_decode_of = r;
+endfunction
+
+ea_dec_t ea_dec_cur;    // queue head (i_entry latch source, chain2 target)
+assign ea_dec_cur = ea_decode_of(i_bus);
+
+// z386x chain-INTO memory/LEA (EA reg-match): the target's i_p
+ea_dec_t fast_ea_dec2;  // chain1 target = the entry behind the head
+assign fast_ea_dec2 = ea_decode_of(i_bus2);
+function automatic [2:0] fast_wide_widx(input [2:0] sel, input logic is_byte);
+    fast_wide_widx = is_byte ? {1'b0, sel[1:0]} : sel;   // byte regs live in GPR 0-3
+endfunction
+
+function automatic logic fast_ea_conflict(
+    input logic we, input logic [2:0] widx,
+    input ea_dec_t ea, input dec_entry_t entry, input logic ignore_esp
+);
+    fast_ea_conflict = we &&
+        (ea.base_sel[widx] || ea.index_sel[widx] ||
+         (entry.stack_op && (widx == 3'd4) && !ignore_esp));
+endfunction
+
+// chain1 predecessor = the popping one-word instruction
+wire        fast_pred1_we   = (fast_pop_fc.commit_sel == FAST_COMMIT_ALU) ||
+                              (fast_pop_fc.commit_sel == FAST_COMMIT_ESP) ||
+                              fast_pop_fc.writes_srcreg;
+wire [2:0]  fast_pred1_widx = (fast_pop_fc.commit_sel == FAST_COMMIT_ESP) ? 3'd4 :
+                fast_wide_widx(
+                fast_pop_fc.writes_srcreg ? i_bus.src_reg_sel : i_bus.dst_reg_sel,
+                !fast_pop_fc.writes_srcreg && fast_pop_fc.op_byte);
+wire        fast_ea1_conflict = fast_ea_conflict(
+                fast_pred1_we, fast_pred1_widx, fast_ea_dec2, i_bus2,
+                fast_pop_fc.commit_sel == FAST_COMMIT_ESP);
+// chainN predecessor = the executing multi-word instruction (`i`); its
+// commit lands at fast_last (or one cycle later for a load's deferred MEM
+// commit), so any committing predecessor gates. SIGSRC (MOVZX/CBW) writes
+// SRCREG, always word/dword.
+wire        fast_pred2_we   = (fast_commit_sel_r != FAST_COMMIT_NONE);
+wire [2:0]  fast_pred2_widx = (fast_commit_sel_r == FAST_COMMIT_SIGSRC)
+                              ? i.src_reg_sel
+                              : fast_wide_widx(i.dst_reg_sel, op_size == 2'd0);
+wire        fast_ea2_conflict = fast_ea_conflict(
+                fast_pred2_we, fast_pred2_widx, ea_dec_cur, i_bus, 1'b0);
+// In-flight deferred MEM (load/POP) commit gate -- doc/z386x/core_notes_v51.md #15
+wire        fast_memc_set  = fast_last && uc_exec && i_pop && !any_fault_pop &&
+                             (fast_commit_sel_r == FAST_COMMIT_MEM);
+wire        fast_memc_haz  = fast_memc_set || fast_memc_pending;
+wire [2:0]  fast_memc_hreg = fast_memc_set ? i.dst_reg_sel : fast_memc_dst;
+wire [1:0]  fast_memc_hsz  = fast_memc_set ? op_size        : fast_memc_size;
+wire [2:0]  fast_memc_widx = fast_wide_widx(fast_memc_hreg, fast_memc_hsz == 2'd0);
+function automatic logic fast_hazard_uses(
+    input ea_dec_t ea, input dec_entry_t entry, input fast_class_t fc,
+    input logic haz, input logic [2:0] widx, input logic [2:0] hreg,
+    input logic [1:0] hsz
+);
+    fast_hazard_uses = haz &&
+        (ea.base_sel[widx] || ea.index_sel[widx] ||
+         (fc.reads_dst && fast_gpr_overlap(hreg, hsz == 2'd0,
+                                           entry.dst_reg_sel, fc.op_byte)) ||
+         (fc.reads_src && fast_gpr_overlap(hreg, hsz == 2'd0,
+                                           entry.src_reg_sel, fc.op_byte)) ||
+         (fc.reads_ecx && fast_gpr_overlap(hreg, hsz == 2'd0, 3'd1, 1'b0)) ||
+         (entry.stack_op && (widx == 3'd4)));
+endfunction
+wire        fast_memc_conf1 = fast_hazard_uses(
+                fast_ea_dec2, i_bus2, fast_next_fc, fast_memc_haz, fast_memc_widx,
+                fast_memc_hreg, fast_memc_hsz);  // chain1 successor
+wire        fast_memc_confN = fast_hazard_uses(
+                ea_dec_cur, i_bus, fast_pop_fc, fast_memc_haz, fast_memc_widx,
+                fast_memc_hreg, fast_memc_hsz);  // chainN successor
+
+// z386x deferred SHIFT commit (same pattern; see fast_memc abo -- doc/z386x/core_notes_v51.md #16
+wire        fast_shc_set  = fast_last && uc_exec && i_pop && !any_fault_pop &&
+                            (fast_commit_sel_r == FAST_COMMIT_SHIFT);
+wire        fast_shc_haz  = fast_shc_set || fast_shc_pending;
+wire [2:0]  fast_shc_hreg = fast_shc_set ? i.dst_reg_sel : fast_shc_dst;
+wire [1:0]  fast_shc_hsz  = fast_shc_set ? op_size        : fast_shc_size;
+wire [2:0]  fast_shc_widx = fast_wide_widx(fast_shc_hreg, fast_shc_hsz == 2'd0);
+wire        fast_shc_conf1 = fast_hazard_uses(
+                fast_ea_dec2, i_bus2, fast_next_fc, fast_shc_haz, fast_shc_widx,
+                fast_shc_hreg, fast_shc_hsz);  // chain1 successor
+wire        fast_shc_confN = fast_hazard_uses(
+                ea_dec_cur, i_bus, fast_pop_fc, fast_shc_haz, fast_shc_widx,
+                fast_shc_hreg, fast_shc_hsz);  // chainN successor
+logic [7:0]  ea_dec_base_sel, ea_dec_index_sel;
+logic [1:0]  ea_dec_scale;
+logic [31:0] ea_dec_disp;
+logic        ea_dec_is_16bit, ea_dec_scale_to_base;
+assign ea_dec_base_sel      = ea_dec_cur.base_sel;
+assign ea_dec_index_sel     = ea_dec_cur.index_sel;
+assign ea_dec_scale         = ea_dec_cur.scale;
+assign ea_dec_disp          = ea_dec_cur.disp;
+assign ea_dec_is_16bit      = ea_dec_cur.is16;
+assign ea_dec_scale_to_base = ea_dec_cur.s2b;
+
+// !fast_dead_slot: a FAST instruction already committed its write at the
+// entry-word cycle, so the register file is current — no forwarding, and the
+// stale slot word's dest field must not be trusted.
+wire delay_slot_writes_esp = i_rni_delay && !fast_dead_slot && (uc_dest == DEST_eSP || uc_dest == DEST_ESP ||
+                                              (uc_dest == DEST_DSTREG && i.dst_reg_sel == 4 && op_size != 2'd0) ||
+                                              (uc_dest == DEST_SRCREG && i.src_reg_sel == 4 && op_size != 2'd0));
+// z386x: at a chained PUSH's RNI cycle, SIGMA holds the post-push ESP
+// (precomputed at its i_pop) - the minimal ESP tracker. push;push chains
+// read it here for their own i_pop precompute and stack addressing.
+wire        fast_esp_fwd = fast_last && (fast_commit_sel_r == FAST_COMMIT_ESP);
+
+// Dedicated delay-slot forward VALUE -- doc/z386x/core_notes_v51.md #17
+function automatic [31:0] dly_fwd_mux(input [5:0] s);
+    case (s)
+        SRC_CR0:    dly_fwd_mux = CR0;
+        SRC_TMPB:   dly_fwd_mux = TMPB;
+        SRC_TMPC:   dly_fwd_mux = TMPC;
+        SRC_TMPD:   dly_fwd_mux = TMPD;
+        SRC_TMPG:   dly_fwd_mux = TMPG;
+        SRC_TMP_TR: dly_fwd_mux = SLCTR;
+        SRC_COUNTR: dly_fwd_mux = COUNTR;
+        SRC_PROTUN: dly_fwd_mux = PROTUN;
+        SRC_TMPeSP: dly_fwd_mux = is_dword_src ? TMPeSP : {16'h0, TMPeSP[15:0]};
+        SRC_MDTMP:  dly_fwd_mux = RESULT;
+        SRC_SIGMA:  dly_fwd_mux = SIGMA;
+        SRC_LDTR:   dly_fwd_mux = {16'h0, LDTR};
+        SRC_TR:     dly_fwd_mux = {16'h0, TR};
+        SRC_OPR_R:  dly_fwd_mux = OPR_R;
+        SRC_IRF2:   dly_fwd_mux = IND;
+        SRC_ZERO:   dly_fwd_mux = 32'h0;
+        SRC_SRCREG: dly_fwd_mux = read_gpr(i_reg_src_reg_sel, op_size_src);
+        SRC_NEG1:   dly_fwd_mux = 32'hFFFF_FFFF;
+        default:    dly_fwd_mux = 32'h0;
+    endcase
+endfunction
+wire [31:0] dly_fwd_value = dly_fwd_mux(uc_source_shift);
+
+// synthesis translate_off
+// Re-prove the narrow mux against the full source read on every delay-slot
+// GPR write (the ROM can change; a new source field must be added here).
+always @(posedge clk)
+    if (reset_n && dly_gpr_we && uc_exec &&
+        (dly_fwd_value !== ((uc_source == SRC_IRF2) ? IND : dest_value)))
+        $fatal(1, "DLY-FWD MUX MISMATCH: uc_addr=%03x src=%02x narrow=%08x full=%08x",
+               uc_addr, uc_source, dly_fwd_value, dest_value);
+// synthesis translate_on
+
+wire        shc_esp_fwd = fast_shc_pending && (fast_shc_dst == 3'd4) &&
+                          (fast_shc_size != 2'd0);
+wire [31:0] forwarded_esp = fast_esp_fwd          ? SIGMA         :
+                            delay_slot_writes_esp ? dly_fwd_value :
+                            shc_esp_fwd           ? (fast_shc_size == 2'd1
+                                                     ? {ESP[31:16], fast_shc_data[15:0]}
+                                                     : fast_shc_data) : ESP;
+
+// Delay-slot GPR write descriptor for early-EA forwarding (which GPR the
+// delay-slot uop writes, and how)
+localparam [1:0] FWD_BLO = 2'd0, FWD_BHI = 2'd1, FWD_W = 2'd2, FWD_D = 2'd3;
+
+// {we, sel[2:0], mode[1:0]} for a delay-slot write to microcode dest `dest`
+function automatic [5:0] decode_dly_gpr(input [6:0] dest);
+    reg       we; reg [2:0] sel; reg [1:0] mode; reg [2:0] rs;
+    begin
+        we = 1'b0; sel = 3'd0; mode = FWD_D;
+        case (dest)
+            DEST_DSTREG, DEST_SRCREG: begin
+                rs = (dest == DEST_DSTREG) ? i.dst_reg_sel : i.src_reg_sel;
+                we = 1'b1;
+                if (op_size == 2'd0) begin               // byte: rs[2]=high-byte, rs[1:0]=GPR
+                    sel  = {1'b0, rs[1:0]};
+                    mode = rs[2] ? FWD_BHI : FWD_BLO;
+                end else begin
+                    sel  = rs;
+                    mode = (op_size == 2'd1) ? FWD_W : FWD_D;
+                end
+            end
+            DEST_EAX, DEST_ECX, DEST_EDX, DEST_EBX,
+            DEST_ESP, DEST_EBP, DEST_ESI, DEST_EDI:
+                begin we = 1'b1; sel = dest[2:0]; mode = FWD_D; end
+            DEST_eSP:
+                begin we = 1'b1; sel = 3'd4;
+                      mode = (pe && seg_cache[SEG_SS].D_B) ? FWD_D : FWD_W; end
+            DEST_AX, DEST_CX, DEST_DX, DEST_BX, DEST_SP, DEST_BP, DEST_SI, DEST_DI:
+                begin we = 1'b1; sel = dest[2:0]; mode = FWD_W; end
+            DEST_AL, DEST_CL, DEST_DL, DEST_BL:
+                begin we = 1'b1; sel = {1'b0, dest[1:0]}; mode = FWD_BLO; end
+            DEST_AH, DEST_CH, DEST_DH, DEST_BH:
+                begin we = 1'b1; sel = {1'b0, dest[1:0]}; mode = FWD_BHI; end
+            DEST_eAX_AL:
+                begin we = 1'b1; sel = 3'd0;
+                      mode = (op_size == 2'd0) ? FWD_BLO : (op_size == 2'd1) ? FWD_W : FWD_D; end
+            DEST_eDX_AH: begin
+                we = 1'b1;
+                if (op_size == 2'd0) begin sel = 3'd0; mode = FWD_BHI; end  // AH
+                else begin sel = 3'd2; mode = (op_size == 2'd1) ? FWD_W : FWD_D; end
+            end
+            DEST_eCX: begin we = 1'b1; sel = 3'd1; mode = i.addr32 ? FWD_D : FWD_W; end
+            DEST_eSI: begin we = 1'b1; sel = 3'd6; mode = i.addr32 ? FWD_D : FWD_W; end
+            DEST_eDI: begin we = 1'b1; sel = 3'd7; mode = i.addr32 ? FWD_D : FWD_W; end
+            DEST_IRF: if (COUNTR[5:3] != 3'b100)
+                begin we = 1'b1; sel = COUNTR[2:0]; mode = is_dword ? FWD_D : FWD_W; end
+            default: ;
+        endcase
+        decode_dly_gpr = {we, sel, mode};
+    end
+endfunction
+
+// Predecode from uc_next (the microword that becomes uc next cycle); register on
+// the same enable as uc so dly_gpr_*_pre_r tracks decode_dly_gpr(uc_dest).
+wire [5:0] dly_gpr_pre   = decode_dly_gpr(uc_next[30:24]);
+wire       dly_is_irf_pre = (uc_next[30:24] == DEST_IRF);
+reg        dly_gpr_we_pre_r;
+reg [2:0]  dly_gpr_sel_pre_r;
+reg [1:0]  dly_gpr_mode_pre_r;
+reg        dly_is_irf_pre_r;
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        dly_gpr_we_pre_r <= 1'b0; dly_gpr_sel_pre_r <= 3'd0;
+        dly_gpr_mode_pre_r <= FWD_D; dly_is_irf_pre_r <= 1'b0;
+    end else if (microcode_rom_ce) begin
+        dly_gpr_we_pre_r   <= dly_gpr_pre[5];
+        dly_gpr_sel_pre_r  <= dly_gpr_pre[4:2];
+        dly_gpr_mode_pre_r <= dly_gpr_pre[1:0];
+        dly_is_irf_pre_r   <= dly_is_irf_pre;
+    end
+end
+
+// Functional descriptor: registered predecode, IRF index taken live from COUNTR.
+// !fast_dead_slot: a FAST instruction's slot word is stale and writes nothing;
+// its result committed at the entry-word cycle, so the register file is current.
+wire       dly_gpr_we   = i_rni_delay && !fast_dead_slot &&
+                          (dly_is_irf_pre_r ? (COUNTR[5:3] != 3'b100) : dly_gpr_we_pre_r);
+wire [2:0] dly_gpr_sel  = dly_is_irf_pre_r ? COUNTR[2:0]              : dly_gpr_sel_pre_r;
+wire [1:0] dly_gpr_mode = dly_is_irf_pre_r ? (is_dword ? FWD_D : FWD_W) : dly_gpr_mode_pre_r;
+
+// EA decode registered at i_entry
+reg [7:0]  ea_dec_base_sel_r, ea_dec_index_sel_r;
+reg [2:0]  ea_dec_base_idx_r, ea_dec_index_idx_r;  // priority-encoded at the latch
+reg [1:0]  ea_dec_scale_r;
+reg [31:0] ea_dec_disp_r;
+reg        ea_dec_base_valid_r, ea_dec_index_valid_r;
+reg        ea_dec_is_16bit_r, ea_dec_scale_to_base_r;
+function automatic [2:0] onehot_idx(input [7:0] oh);
+    onehot_idx = oh[1] ? 3'd1 : oh[2] ? 3'd2 : oh[3] ? 3'd3 : oh[4] ? 3'd4 :
+                 oh[5] ? 3'd5 : oh[6] ? 3'd6 : oh[7] ? 3'd7 : 3'd0;
+endfunction
+// Latched at i_entry (target = queue head) and at z386x chained entries
+// (chain1 target = the entry behind the head, chain2 target = the head).
+always_ff @(posedge clk) begin
+    if (i_entry || fast_issue) begin
+        // fold_entry: the head is landing this edge - decode the completing
+        // entry (d2_agu_dec is the AGU's ea_decode_of(d2_entry), reused).
+        automatic ea_dec_t sel = (fast_issue && fast_issue1) ? fast_ea_dec2 :
+                                 (i_entry && decq_empty)     ? d2_agu_dec  : ea_dec_cur;
+        ea_dec_base_sel_r      <= sel.base_sel;
+        ea_dec_index_sel_r     <= sel.index_sel;
+        ea_dec_base_idx_r      <= onehot_idx(sel.base_sel);
+        ea_dec_index_idx_r     <= onehot_idx(sel.index_sel);
+        ea_dec_base_valid_r    <= |sel.base_sel;
+        ea_dec_index_valid_r   <= |sel.index_sel;
+        ea_dec_scale_r         <= sel.scale;
+        ea_dec_disp_r          <= sel.disp;
+        ea_dec_is_16bit_r      <= sel.is16;
+        ea_dec_scale_to_base_r <= sel.s2b;
+    end
+end
+
+// Live i_pop EA path, SHARED between IND (offset) and ind_linear (offset + segment base)
+wire [31:0] ea_fwd_base  = fwd_ea_gpr(ea_dec_base_valid_r,  ea_dec_base_idx_r);
+wire [31:0] ea_fwd_index = fwd_ea_gpr(ea_dec_index_valid_r, ea_dec_index_idx_r);
+
+wire [63:0] pop_ea_prep = calc_ea_prep(ea_fwd_base, ea_fwd_index,
+                                       ea_dec_scale_r, ea_dec_scale_to_base_r);
+wire [31:0] pop_ea_a = pop_ea_prep[63:32];  // base_val
+wire [31:0] pop_ea_b = pop_ea_prep[31:0];   // scaled_val
+wire [31:0] pop_ea_c = ea_dec_disp_r;
+wire [31:0] pop_ea_off = pop_ea_a + pop_ea_b + pop_ea_c;   // ternary (one ALM level)
+wire [31:0] ea_early = ea_dec_is_16bit_r ? {16'h0, pop_ea_off[15:0]} : pop_ea_off;
+
+// Fused linear -- doc/z386x/core_notes_v51.md #18
+wire [31:0] pop_csa_s = pop_ea_a ^ pop_ea_b ^ pop_ea_c;
+wire [31:0] pop_csa_c = ((pop_ea_a & pop_ea_b) | (pop_ea_a & pop_ea_c) |
+                         (pop_ea_b & pop_ea_c)) << 1;
+wire [31:0] pop_lin32 = pop_csa_s + pop_csa_c + seg_base_pending;
+wire [31:0] pop_lin16 = {16'h0, pop_ea_off[15:0]} + seg_base_pending;
+wire [31:0] pop_ind_linear = (ea_dec_is_16bit_r || !eff_mask_pending)
+                           ? pop_lin16 : pop_lin32;
+// synthesis translate_off
+// The fused adder must equal the two-stage reference on every modrm capture.
+always @(posedge clk)
+    if (reset_n && i_pop && i_bus.has_modrm && !i_bus.stack_op && !i_bus.has_moffs &&
+        (pop_ind_linear !== ((eff_mask_pending ? ea_early : {16'h0, ea_early[15:0]})
+                            + seg_base_pending)))
+        $fatal(1, "POP-LIN FUSE MISMATCH: fused=%08x ref=%08x ea=%08x seg=%08x m16=%b e16=%b",
+               pop_ind_linear,
+               (eff_mask_pending ? ea_early : {16'h0, ea_early[15:0]}) + seg_base_pending,
+               ea_early, seg_base_pending, ea_dec_is_16bit_r, eff_mask_pending);
+// synthesis translate_on
+
+// D2-AGU observer
+assign d2_agu_dec = ea_decode_of(d2_entry);
+wire [31:0] d2_agu_base  = onehot_gpr_mux(d2_agu_dec.base_sel);
+wire [31:0] d2_agu_index = onehot_gpr_mux(d2_agu_dec.index_sel);
+wire [63:0] d2_agu_prep  = calc_ea_prep(d2_agu_base, d2_agu_index,
+                                        d2_agu_dec.scale, d2_agu_dec.s2b);
+wire [31:0] d2_agu_a = d2_agu_prep[63:32];
+wire [31:0] d2_agu_b = d2_agu_prep[31:0];
+wire [31:0] d2_agu_c = d2_agu_dec.disp;
+wire [3:0] d2_agu_seg = apply_seg_override_type(
+    calc_default_seg_type(d2_entry.modrm, d2_entry.sib, d2_entry.has_sib,
+                          d2_entry.addr32), d2_entry.seg);
+wire [31:0] d2_agu_segbase = seg_cache[d2_agu_seg].base;
+wire [31:0] d2_agu_lin = (d2_agu_a ^ d2_agu_b ^ d2_agu_c)
+                       + (((d2_agu_a & d2_agu_b) | (d2_agu_a & d2_agu_c) |
+                           (d2_agu_b & d2_agu_c)) << 1)
+                       + d2_agu_segbase;
+
+// GPR-write snoop: one-hot of architectural GPRs written THIS cycle
+function automatic [7:0] gpr_wr_expand(input [2:0] sel);
+    gpr_wr_expand = (8'h1 << sel) | (8'h1 << {1'b0, sel[1:0]});
+endfunction
+// {inval_all, onehot} for the current uc word's destination
+function automatic [8:0] gpr_dest_probe(input [6:0] dst);
+    gpr_dest_probe = {1'b1, 8'h00};
+    case (dst)
+        DEST_EAX, DEST_AX, DEST_eAX_AL: gpr_dest_probe = {1'b0, 8'h01};
+        DEST_ECX, DEST_CX, DEST_eCX:    gpr_dest_probe = {1'b0, 8'h02};
+        DEST_EDX, DEST_DX:              gpr_dest_probe = {1'b0, 8'h04};
+        DEST_EBX, DEST_BX:              gpr_dest_probe = {1'b0, 8'h08};
+        DEST_ESP, DEST_SP, DEST_eSP:    gpr_dest_probe = {1'b0, 8'h10};
+        DEST_EBP, DEST_BP:              gpr_dest_probe = {1'b0, 8'h20};
+        DEST_ESI, DEST_SI, DEST_eSI:    gpr_dest_probe = {1'b0, 8'h40};
+        DEST_EDI, DEST_DI, DEST_eDI:    gpr_dest_probe = {1'b0, 8'h80};
+        DEST_DSTREG: gpr_dest_probe = {1'b0, gpr_wr_expand(i.dst_reg_sel)};
+        DEST_SRCREG: gpr_dest_probe = {1'b0, gpr_wr_expand(i.src_reg_sel)};
+        DEST_USTEP_ALU: gpr_dest_probe = {1'b0, gpr_wr_expand(i.dst_reg_sel)};
+        DEST_IRF:    gpr_dest_probe = (COUNTR[5:3] != 3'b100)
+                                    ? {1'b0, 8'h01 << COUNTR[2:0]}
+                                    : {1'b1, 8'h00};   // seg selector row: clear all
+        // Frequent, provably GPR/segment-free destinations: no-op.
+        DEST_TMPB, DEST_TMPC, DEST_TMPD, DEST_TMPE, DEST_TMPF,
+        DEST_TMPG, DEST_TMPH, DEST_TMPeIP, DEST_TMPeSP,
+        DEST_OPR_W, DEST_OPROFF, DEST_CSOPCD, DEST_CR2,
+        DEST_EIP, DEST_eIP, DEST_IP, DEST_EFLAGS, DEST_FLAGS,
+        DEST_FLAGSB, DEST_FLAGSL, DEST_COUNTR, DEST_COUNT5,
+        DEST_MDTMP, DEST_MDTMP4, DEST_PROTUN, DEST_SLCTR,
+        DEST_TMP_TR, DEST_FSVeIP, DEST_DR6,
+        7'h7F:                          gpr_dest_probe = 9'h0;
+        default: ;
+    endcase
+endfunction
+wire [8:0] d2_agu_ucprobe = uc_exec ? gpr_dest_probe(uc_dest) : 9'h0;
+wire [7:0] ea_inval_gpr =
+    d2_agu_ucprobe[7:0] |
+    (fast_shc_pending ? gpr_wr_expand(fast_shc_dst) : 8'h0) |
+    ((uc_exec && fast_memc_pending) ? gpr_wr_expand(fast_memc_dst) : 8'h0) |
+    ((uc_exec && fast_last && !any_fault && fast_commit_sel_r == FAST_COMMIT_ALU)
+        ? gpr_wr_expand(i.dst_reg_sel) : 8'h0) |
+    ((uc_exec && fast_last && !any_fault && fast_commit_sel_r == FAST_COMMIT_SIGSRC)
+        ? gpr_wr_expand(i.src_reg_sel) : 8'h0) |
+    ((uc_exec && fast_last && !any_fault && fast_commit_sel_r == FAST_COMMIT_ESP)
+        ? 8'h10 : 8'h0) |
+    ((uc_exec && uc_aluop == ALUJMP_CLZF && i.has_0f && i.opcode == 8'hBD)
+        ? gpr_wr_expand(i.src_reg_sel) : 8'h0);
+// Clear-all events: segment state may change under any committed seg
+// command or descriptor load; the effective-mask mode must be stable.
+reg d2_agu_effmask_r;
+always_ff @(posedge clk) d2_agu_effmask_r <= eff_mask_pending;
+// Only cache-MUTATING segment commands clear the sidecars; INIT_SEG /
+// UPDATE_SEG select which base to read (every memory pop issues one) and
+// mutate nothing.
+wire seg_cmd_mutates = (seg_cmd != SEG_CMD_NONE) &&
+                       (seg_cmd != SEG_CMD_INIT_SEG) &&
+                       (seg_cmd != SEG_CMD_UPDATE_SEG) &&
+                       (seg_cmd != SEG_CMD_SPCR);
+wire ea_inval_all = d2_agu_ucprobe[8] ||
+                    (seg_cmd_valid && seg_cmd_mutates) ||
+                    (d2_agu_effmask_r != eff_mask_pending);
+
+// Eligibility (MVP): plain 32-bit MEMORY modrm EA (mod!=11), no
+// moffs/stack, 32-bit mask active, and no conflicting write in the
+// compute cycle itself.
+wire d2_agu_valid = d2_push &&
+                    d2_entry.has_modrm && (d2_entry.modrm[7:6] != 2'b11) &&
+                    !d2_entry.has_moffs &&
+                    !d2_entry.stack_op && d2_entry.addr32 &&
+                    eff_mask_pending &&
+                    (((d2_agu_dec.base_sel | d2_agu_dec.index_sel) & ea_inval_gpr) == 8'h00);
+
+// Same-cycle conflict mask: a write committing at the CONSUMING edge
+wire head_ea_usable = head_ea_v &&
+    (((i_bus.ea_base_onehot | i_bus.ea_index_onehot) & ea_inval_gpr) == 8'h00) &&
+    !ea_inval_all;
+
+// synthesis translate_off
+// +ldtrace: memory-instruction anatomy (pop/first/request/complete edges).
+always @(posedge clk) if ($test$plusargs("ldtrace")) begin
+    if (i_pop)   $display("%0t LD pop  op=%02x eav=%b", $time, i_bus.opcode, head_ea_usable);
+    if (i_first) $display("%0t LD first op=%02x uaddr=%03x", $time, i.opcode, uc_addr);
+    if (mem_req_to_paging && mem_accepted)
+        $display("%0t LD req  wr=%b lin=%08x", $time, mem_write_now, ind_linear);
+    if (dcache_req_complete)
+        $display("%0t LD done", $time);
+end
+// Debug: catch GPR writes the snoop missed (+agu_dbg).
+reg [31:0] dbg_esi_prev; reg [7:0] dbg_inval_prev; reg [6:0] dbg_ucdest_prev;
+reg dbg_exec_prev;
+always @(posedge clk) begin
+    dbg_esi_prev <= ESI; dbg_inval_prev <= ea_inval_gpr;
+    dbg_ucdest_prev <= uc_dest; dbg_exec_prev <= uc_exec;
+    if ($test$plusargs("agu_dbg") && (ESI !== dbg_esi_prev) && !dbg_inval_prev[6])
+        $display("%0t ESIWR-MISSED %08x->%08x prev_ucdest=%02x prev_exec=%b prev_inval=%02x uaddr=%03x",
+                 $time, dbg_esi_prev, ESI, dbg_ucdest_prev, dbg_exec_prev,
+                 dbg_inval_prev, uc_addr);
+end
+always @(posedge clk) if ($test$plusargs("agu_dbg")) begin
+    if (d2_push)
+        $display("%0t AGUDBG land op=%02x v=%b lin=%08x bs=%02x agubase=%08x ESI=%08x aguseg=%0d segbase=%08x disp=%08x",
+                 $time, d2_entry.opcode, d2_agu_valid, d2_agu_lin,
+                 d2_entry.ea_base_onehot, d2_agu_base, ESI, d2_agu_seg,
+                 d2_agu_segbase, d2_agu_dec.disp);
+    if (ea_inval_gpr != 8'h0 || ea_inval_all)
+        $display("%0t AGUDBG inval gpr=%02x all=%b ucdest=%02x", $time,
+                 ea_inval_gpr, ea_inval_all, uc_dest);
+    if (i_pop)
+        $display("%0t AGUDBG pop op=%02x headeav=%b headlin=%08x", $time,
+                 i_bus.opcode, head_ea_v, head_ea_lin);
+    if (ESI !== dbg_esi_prev)
+        $display("%0t AGUDBG ESI %08x->%08x ucdest=%02x memc=%b dly_we=%b dly_sel=%0d",
+                 $time, dbg_esi_prev, ESI, dbg_ucdest_prev, fast_memc_pending,
+                 dly_gpr_we, dly_gpr_sel);
+end
+// THE 3a PROOF: a valid sidecar at pop must equal the pop-time compute.
+always @(posedge clk)
+    if (reset_n && i_pop && head_ea_usable && i_bus.has_modrm && !i_bus.stack_op &&
+        !i_bus.has_moffs && !$isunknown({head_ea_lin, pop_ind_linear}) &&
+        (head_ea_lin !== pop_ind_linear))
+        $fatal(1, "D2-AGU MISMATCH: sidecar=%08x pop=%08x op=%02x modrm=%02x EIP=%08x a32=%b seg=%0d bs=%02x is=%02x effm=%b i_pop=%b fi=%b",
+               head_ea_lin, pop_ind_linear, i_bus.opcode, i_bus.modrm, EIP,
+               i_bus.addr32, i_bus.seg, i_bus.ea_base_onehot,
+               i_bus.ea_index_onehot, eff_mask_pending, i_pop, fast_issue);
+reg [31:0] d2agu_pops, d2agu_hits;
+initial begin d2agu_pops = 0; d2agu_hits = 0; end
+int eaf_base, eaf_idx, eaf_both, eaf_disp, eaf_none, eaf_16;
+always @(posedge clk)
+    if (reset_n && i_pop && i_bus.has_modrm && !i_bus.stack_op && !i_bus.has_moffs &&
+        i_bus.modrm[7:6] != 2'b11) begin
+        if (!i_bus.addr32) eaf_16 <= eaf_16 + 1;
+        else case ({|ea_dec_base_sel_r, |ea_dec_index_sel_r})
+            2'b10: eaf_base <= eaf_base + 1;
+            2'b01: eaf_idx  <= eaf_idx + 1;
+            2'b11: eaf_both <= eaf_both + 1;
+            2'b00: eaf_disp <= eaf_disp + 1;
+        endcase
+    end
+final if ($test$plusargs("ea_form_stats"))
+    $display("ea forms: base=%0d idx=%0d BOTH=%0d disp=%0d a16=%0d",
+             eaf_base, eaf_idx, eaf_both, eaf_disp, eaf_16);
+final if ($test$plusargs("agu_stats"))
+    $display("D2-AGU coverage: %0d/%0d eligible pops had a valid sidecar",
+             d2agu_hits, d2agu_pops);
+always @(posedge clk)
+    if (reset_n && i_pop && i_bus.has_modrm && !i_bus.stack_op &&
+        !i_bus.has_moffs && i_bus.addr32) begin
+        d2agu_pops <= d2agu_pops + 1;
+        if (head_ea_usable) d2agu_hits <= d2agu_hits + 1;
+    end
+// synthesis translate_on
+
+// Relocate an about-to-be-committed IND value to its linear address
+function automatic [31:0] reloc(input [31:0] off);
+    reloc = (eff_mask_pending ? off : {16'h0, off[15:0]}) + seg_base_pending;
+endfunction
+
+// Dedicated reloc for the uc_exec/busop ind_linear write.
+(* keep *) wire [31:0] seg_base_pending_uc = seg_base_pending;
+function automatic [31:0] reloc_uc(input [31:0] off);
+    reloc_uc = (eff_mask_pending ? off : {16'h0, off[15:0]}) + seg_base_pending_uc;
+endfunction
+
+// 3-term relocation using ALM's fused 3-input add
+function automatic [31:0] reloc_add2(input [31:0] a, input [31:0] b, input mask16);
+    reloc_add2 = mask16 ? ({16'h0, a[15:0] + b[15:0]} + seg_base_pending_uc)
+                        : (a + b + seg_base_pending_uc);
+endfunction
+
+always_ff @(posedge clk) begin
+    if (i_pop)
+        ea_reg <= ea_early;
+end
+
+//=============================================================================
+// Unit 4: Segmentation Unit
 //=============================================================================
 wire [3:0]  mem_seg_sel;
 wire        mem_seg_is_io;
@@ -623,7 +1427,6 @@ wire        tss_access_flag;
 wire [31:0] seg_base_pending;  // next seg_base_r from seg unit; for unified linear_address relocate
 wire        eff_mask_pending;  // next (addr_size||is_dtable) from seg unit; 0 => mask offset to 16b
 wire [31:0] seg_lar_result, seg_llim_result, seg_lbas_result;
-// Internalized: addr_size, mem_seg_base_r, pm_seg_limit_r, mem_seg_base, mem_ea
 
 // Segmentation unit command encoder
 reg  [3:0]  seg_cmd;
@@ -632,7 +1435,8 @@ reg  [31:0] seg_cmd_data;
 wire        seg_cmd_valid;          // 1 when seg_cmd should execute (i_pop or uc_exec)
 
 // Decoded instruction register (all fields from decoder, latched at i_pop)
-dec_entry_t i;
+// dec_entry_t i; -- declaration moved up beside i_bus2 (Quartus cannot
+// forward-reference struct members from the fast-chain gates)
 wire [7:0]  i_modrm = i.modrm;
 wire [7:0]  i_sib = i.sib;
 wire        i_has_modrm = i.has_modrm;
@@ -641,8 +1445,8 @@ wire [31:0] i_reg_immediate = i.immediate;
 wire [31:0] i_reg_displacement = i.displacement;
 wire        i_reg_addr32 = i.addr32;
 wire [2:0]  i_seg = i.seg;
-wire [2:0]  i_reg_dst_reg_sel = i.dst_reg_sel;
-wire [2:0]  i_reg_src_reg_sel = i.src_reg_sel;
+wire [2:0] i_reg_dst_reg_sel = i.dst_reg_sel;
+wire [2:0] i_reg_src_reg_sel = i.src_reg_sel;
 
 wire [3:0] modrm_resolved_seg = apply_seg_override_type(
     calc_default_seg_type(i_modrm, i_sib, i_has_sib, i_reg_addr32), i_seg);
@@ -656,7 +1460,10 @@ wire [3:0] init_final_seg = i_bus.stack_op ? init_default_seg :
                             apply_seg_override_type(init_default_seg, i_bus.seg);
 
 // Pre-computed access size for limit check (replaces op_size + is_dword in seg unit)
-wire [1:0] gp_access_adj = (op_size == 2'd0) ? 2'd0 : is_dword ? 2'd3 : 2'd1;
+// Limit-check the actual access width: RD W/WR W = word (seg/limit reads; o32
+// stride only bumps ESP); else srcreg_size (byte for MOVSX/MOVZX, not dest op_size).
+wire [1:0] gp_access_adj = uc_is_word_op ? 2'd1 :
+                           (srcreg_size == 2'd0) ? 2'd0 : (srcreg_size == 2'd2) ? 2'd3 : 2'd1;
 
 wire        mem_op_eligible, gp_fault_mem_op, gp_fault_wr_op, ss_segment_fault;
 reg         copy_stack_dpl_s2, conform_dpl_s2;
@@ -777,20 +1584,24 @@ end  // always_comb
 
 
 //=============================================================================
-// Paging Unit
+// Unit 5: Paging Unit (including TLB)
 //=============================================================================
 
-// WR W / RD W access width = |IND_DELTA| (the stack/TSS slot stride)
+// WR W / RD W access width = |IND_DELTA| (the stack/TSS slot stride).
+// Ordinary accesses use source width: MOVZX/MOVSX read byte/word operands
+// even though their architectural destination and op_size are dword.
 wire ind_delta_dword = (IND_DELTA == 32'd4) || (IND_DELTA == -32'd4);
 wire [1:0] mem_eff_size = uc_is_word_op ? (ind_delta_dword ? 2'd2 : 2'd1) :
-                          uc_is_dword_op ? 2'd2 : op_size;
+                          uc_is_dword_op ? 2'd2 : srcreg_size;
 
 wire [31:0] mem_wdata = (uc_buscode == BUSOP_WR_OPR) ? OPR_R :
     uc_is_word_op ? read_uc_source(uc_source) :
     (uc_dest == DEST_OPR_W) ? (stack_init_pending ? read_uc_source(uc_source) : dest_value) :
     OPR_W;
 
-wire        any_fault = gp_fault_trigger || div_overflow || page_fault;
+// div_overflow fires only at the first DIV7/PREDIV word
+wire        any_fault_pop = gp_fault_trigger || page_fault;
+wire        any_fault = any_fault_pop || div_overflow;
 reg         any_fault_r;  // Registered any_fault: used for deferred SIGMA/TMPeSP writes
 always_ff @(posedge clk) any_fault_r <= any_fault;
 wire [2:0]  pg_fault_code;        // Page fault error code
@@ -854,15 +1665,16 @@ paging_unit paging_inst (
 
     // Memory/IO request: current RD/WR/IACK uop is held by stall until accepted.
     .mem_req            (mem_req_to_paging),
-    .mem_ea_read        (mem_ea_read),       // modrm/stack/moffs reads SET-read (linear relocated at i_pop); microcode IND reads excluded
+    .mem_ea_read        (mem_ea_read),      // modrm/stack/moffs reads SET-read (linear relocated at i_pop); microcode IND reads excluded
     .mem_req_precheck   (mem_req_current),
-    .mem_req_upcoming   (mem_req_upcoming),      // suppresses prefetch start to minimize contention
+    .mem_req_upcoming   (mem_req_upcoming), // suppresses prefetch start to minimize contention
     .mem_accepted       (mem_accepted),     // ready: request accepted this cycle
     .mem_servicing      (mem_servicing),
     .mem_complete_now   (mem_complete_now), // combinational: bus op completing this cycle
     .mem_dly_grace      (mem_dly_grace),
     .mem_write_dly_grace(mem_write_dly_grace),
     .mem_opt_wait       (mem_opt_wait),
+    .mem_write_wait     (mem_write_wait),
     .linear_addr        (paging_linear_addr),
     .live_valid         (paging_live_valid),
     .mem_op_size        (mem_eff_size),
@@ -886,7 +1698,7 @@ paging_unit paging_inst (
 
     // Demand-side physical request interface
     .dcache_req_valid   (dcache_req_valid),
-    .dcache_req_phys_addr(dcache_req_phys_addr),
+    .dcache_req_phys_addr(dcache_req_phys_addr_raw),
     .dcache_req_write   (dcache_req_write),
     .dcache_req_be      (dcache_req_be),
     .dcache_req_wdata   (dcache_req_wdata),
@@ -898,7 +1710,7 @@ paging_unit paging_inst (
 
     // Instruction-prefetch physical request interface
     .icache_req_valid   (icache_req_valid),
-    .icache_req_phys_addr(icache_req_phys_addr),
+    .icache_req_phys_addr(icache_req_phys_addr_raw),
     .icache_req_accepted(icache_req_accepted),
     .icache_req_complete(icache_req_complete),
     .icache_rdata       (icache_rdata),
@@ -936,15 +1748,12 @@ always_ff @(posedge clk) begin
         CR3 <= 32'h0;
     else if (cr3_write) begin
         CR3 <= IND;
-        // synthesis translate_off
-        $display("%0t: CR3 write %08x -> %08x uc=%03x CS:EIP=%0x:%0x", $time, CR3, IND, uc_addr, CS, EIP);
-        // synthesis translate_on
     end
 end
 
 
 //=============================================================================
-// Protection Unit (PLA4)
+// Unit 6: Protection Test Unit (PLA4)
 //=============================================================================
 // Pipeline enable: advance PLA4 pipeline in sync with microcode.
 wire prot_pipe_en = !stall;
@@ -996,12 +1805,12 @@ protection_unit protection_unit_inst (
     .descriptor_low16_nonzero(prot_desc_low16_nonzero),
     .selector_rpl     (slctr_fwd[1:0]),             // RPL from selector (forwarded)
     .selector_ti      (slctr_fwd[2]),               // Table indicator (forwarded)
-    .selector_null    (selector_null_wire),          // Null selector (Index=0, TI=0)
-    .selector_oob     (selector_oob_wire),           // Selector exceeds GDT/LDT limit
+    .selector_null    (selector_null_wire),         // Null selector (Index=0, TI=0)
+    .selector_oob     (selector_oob_wire),          // Selector exceeds GDT/LDT limit
 
     // Processor state
-    .cpl              (prot_cpl),                    // CPL (pending after WRITE_RPL, else effective CPL)
-    .pe_mode          (pe),                  // Protected mode active
+    .cpl              (prot_cpl),                   // CPL (pending after WRITE_RPL, else effective CPL)
+    .pe_mode          (pe),                         // Protected mode active
 
     // CR0 flags for FPU tests
     .cr0_et           (CR0[4]),                     // Extension type (287 vs 387)
@@ -1017,7 +1826,7 @@ protection_unit protection_unit_inst (
     // PTOVRR (0x68): fires test using saved test constant from PTSAV
     // PTSELE (0x6E) and others (bit3=1): fires test with inline test constant
     .test_const       (prot_test_const),
-    .aluop_type       (uc_aluop[3:0]),             // Lower 4 bits of aluop (controls Tiny PLA mux)
+    .aluop_type       (uc_aluop[3:0]),              // Lower 4 bits of aluop (controls Tiny PLA mux)
     .test_en          (prot_test_en),
 
     // Test mode (disabled in normal operation)
@@ -1073,210 +1882,8 @@ always_ff @(posedge clk) begin
 end
 
 //=============================================================================
-// EARLY-START  --  EA decode, relocate, and required forwarding to start 
-//                  memory operations at i_pop
-//=============================================================================
-
-// Combinational EA-operand decode
-logic [7:0]  ea_dec_base_sel, ea_dec_index_sel;
-logic [1:0]  ea_dec_scale;
-logic [31:0] ea_dec_disp;
-logic        ea_dec_is_16bit, ea_dec_scale_to_base;
-
-// EA predecode for early EA computation at i_pop.
-always_comb begin
-    // Defaults (also the "no modrm / has moffs" case)
-    ea_dec_base_sel  = 8'h00;
-    ea_dec_index_sel = 8'h00;
-    ea_dec_scale     = 2'b00;
-    ea_dec_is_16bit  = 1'b0;
-    ea_dec_scale_to_base = 1'b0;
-    ea_dec_disp      = 32'h0;
-    if (i_bus.has_modrm && !i_bus.has_moffs) begin
-        if (i_bus.addr32) begin
-            // 32-bit addressing mode
-            ea_dec_base_sel  = decode_base_register_32(i_bus.modrm, i_bus.sib, i_bus.has_sib);
-            ea_dec_index_sel = decode_index_register_32(i_bus.sib, i_bus.has_sib);
-            ea_dec_scale     = i_bus.has_sib ? i_bus.sib[7:6] : 2'b00;
-            ea_dec_scale_to_base = i_bus.has_sib && (i_bus.sib[5:3] == 3'b100);  // No index, scale to base
-            ea_dec_is_16bit  = 1'b0;
-        end else begin
-            // 16-bit addressing mode
-            ea_dec_base_sel  = ea_regs_16[7:0];   // First register
-            ea_dec_index_sel = ea_regs_16[15:8];  // Second register
-            ea_dec_scale     = 2'b00;  // No scaling in 16-bit mode
-            ea_dec_scale_to_base = 1'b0;
-            ea_dec_is_16bit  = 1'b1;
-        end
-
-        // Displacement value (sign-extend disp8, use full disp16/disp32)
-        begin
-            automatic logic [31:0] disp_val;
-            if (i_bus.modrm[7:6] == 2'b01)
-                // disp8 - sign extend
-                disp_val = {{24{i_bus.displacement[7]}}, i_bus.displacement[7:0]};
-            else if (i_bus.modrm[7:6] == 2'b10)
-                // disp16 or disp32
-                disp_val = i_bus.addr32 ? i_bus.displacement : {{16{i_bus.displacement[15]}}, i_bus.displacement[15:0]};
-            else
-                // disp32 for [disp32] or [disp16] modes (mod=00, special rm)
-                disp_val = i_bus.addr32 ? i_bus.displacement : {16'h0, i_bus.displacement[15:0]};
-
-            // POP r/m (8F) with ESP base: Intel 386 says EA uses post-increment ESP.
-            if (i_bus.opcode == 8'h8F && i_bus.addr32 && i_bus.has_sib && i_bus.sib[2:0] == 3'b100) begin
-                disp_val = disp_val + (i_bus.data32 ? 32'd4 : 32'd2);
-            end
-            ea_dec_disp = disp_val;
-        end
-        // Zero ea_disp when not used
-        if (i_bus.modrm[7:6] == 2'b00 || i_bus.modrm[7:6] == 2'b11) begin
-            if (i_bus.addr32) begin
-                // 32-bit: special rm is rm=101 (non-SIB) or sib_base=101 (SIB)
-                if (i_bus.has_sib && i_bus.modrm[2:0] == 3'b100) begin
-                    if (i_bus.sib[2:0] != 3'b101)
-                        ea_dec_disp = 32'h0;  // SIB, no disp32
-                end else begin
-                    if (i_bus.modrm[2:0] != 3'b101)
-                        ea_dec_disp = 32'h0;  // Non-SIB, no disp32
-                end
-            end else begin
-                // 16-bit: special rm is rm=110
-                if (i_bus.modrm[2:0] != 3'b110)
-                    ea_dec_disp = 32'h0;
-            end
-        end
-    end
-end
-
-wire delay_slot_writes_esp = i_rni_delay && (uc_dest == DEST_eSP || uc_dest == DEST_ESP ||
-                                              (uc_dest == DEST_DSTREG && i.dst_reg_sel == 4 && op_size != 2'd0) ||
-                                              (uc_dest == DEST_SRCREG && i.src_reg_sel == 4 && op_size != 2'd0));
-wire [31:0] forwarded_esp = delay_slot_writes_esp ? dest_value : ESP;
-
-// Delay-slot GPR write descriptor for early-EA forwarding (which GPR the
-// delay-slot uop writes, and how)
-localparam [1:0] FWD_BLO = 2'd0, FWD_BHI = 2'd1, FWD_W = 2'd2, FWD_D = 2'd3;
-
-// {we, sel[2:0], mode[1:0]} for a delay-slot write to microcode dest `dest`
-function automatic [5:0] decode_dly_gpr(input [6:0] dest);
-    reg       we; reg [2:0] sel; reg [1:0] mode; reg [2:0] rs;
-    begin
-        we = 1'b0; sel = 3'd0; mode = FWD_D;
-        case (dest)
-            DEST_DSTREG, DEST_SRCREG: begin
-                rs = (dest == DEST_DSTREG) ? i.dst_reg_sel : i.src_reg_sel;
-                we = 1'b1;
-                if (op_size == 2'd0) begin               // byte: rs[2]=high-byte, rs[1:0]=GPR
-                    sel  = {1'b0, rs[1:0]};
-                    mode = rs[2] ? FWD_BHI : FWD_BLO;
-                end else begin
-                    sel  = rs;
-                    mode = (op_size == 2'd1) ? FWD_W : FWD_D;
-                end
-            end
-            DEST_EAX, DEST_ECX, DEST_EDX, DEST_EBX,
-            DEST_ESP, DEST_EBP, DEST_ESI, DEST_EDI:
-                begin we = 1'b1; sel = dest[2:0]; mode = FWD_D; end
-            DEST_eSP:
-                begin we = 1'b1; sel = 3'd4;
-                      mode = (pe && seg_cache[SEG_SS].D_B) ? FWD_D : FWD_W; end
-            DEST_AX, DEST_CX, DEST_DX, DEST_BX, DEST_SP, DEST_BP, DEST_SI, DEST_DI:
-                begin we = 1'b1; sel = dest[2:0]; mode = FWD_W; end
-            DEST_AL, DEST_CL, DEST_DL, DEST_BL:
-                begin we = 1'b1; sel = {1'b0, dest[1:0]}; mode = FWD_BLO; end
-            DEST_AH, DEST_CH, DEST_DH, DEST_BH:
-                begin we = 1'b1; sel = {1'b0, dest[1:0]}; mode = FWD_BHI; end
-            DEST_eAX_AL:
-                begin we = 1'b1; sel = 3'd0;
-                      mode = (op_size == 2'd0) ? FWD_BLO : (op_size == 2'd1) ? FWD_W : FWD_D; end
-            DEST_eDX_AH: begin
-                we = 1'b1;
-                if (op_size == 2'd0) begin sel = 3'd0; mode = FWD_BHI; end  // AH
-                else begin sel = 3'd2; mode = (op_size == 2'd1) ? FWD_W : FWD_D; end
-            end
-            DEST_eCX: begin we = 1'b1; sel = 3'd1; mode = i.addr32 ? FWD_D : FWD_W; end
-            DEST_eSI: begin we = 1'b1; sel = 3'd6; mode = i.addr32 ? FWD_D : FWD_W; end
-            DEST_eDI: begin we = 1'b1; sel = 3'd7; mode = i.addr32 ? FWD_D : FWD_W; end
-            DEST_IRF: if (COUNTR[5:3] != 3'b100)
-                begin we = 1'b1; sel = COUNTR[2:0]; mode = is_dword ? FWD_D : FWD_W; end
-            default: ;
-        endcase
-        decode_dly_gpr = {we, sel, mode};
-    end
-endfunction
-
-// Predecode from uc_next (the microword that becomes uc next cycle); register on
-// the same enable as uc so dly_gpr_*_pre_r tracks decode_dly_gpr(uc_dest).
-wire [5:0] dly_gpr_pre   = decode_dly_gpr(uc_next[30:24]);
-wire       dly_is_irf_pre = (uc_next[30:24] == DEST_IRF);
-reg        dly_gpr_we_pre_r;
-reg [2:0]  dly_gpr_sel_pre_r;
-reg [1:0]  dly_gpr_mode_pre_r;
-reg        dly_is_irf_pre_r;
-always_ff @(posedge clk) begin
-    if (!reset_n) begin
-        dly_gpr_we_pre_r <= 1'b0; dly_gpr_sel_pre_r <= 3'd0;
-        dly_gpr_mode_pre_r <= FWD_D; dly_is_irf_pre_r <= 1'b0;
-    end else if (microcode_rom_ce) begin
-        dly_gpr_we_pre_r   <= dly_gpr_pre[5];
-        dly_gpr_sel_pre_r  <= dly_gpr_pre[4:2];
-        dly_gpr_mode_pre_r <= dly_gpr_pre[1:0];
-        dly_is_irf_pre_r   <= dly_is_irf_pre;
-    end
-end
-
-// Functional descriptor: registered predecode, IRF index taken live from COUNTR.
-wire       dly_gpr_we   = i_rni_delay &&
-                          (dly_is_irf_pre_r ? (COUNTR[5:3] != 3'b100) : dly_gpr_we_pre_r);
-wire [2:0] dly_gpr_sel  = dly_is_irf_pre_r ? COUNTR[2:0]              : dly_gpr_sel_pre_r;
-wire [1:0] dly_gpr_mode = dly_is_irf_pre_r ? (is_dword ? FWD_D : FWD_W) : dly_gpr_mode_pre_r;
-
-// EA decode registered at i_entry
-reg [7:0]  ea_dec_base_sel_r, ea_dec_index_sel_r;
-reg [1:0]  ea_dec_scale_r;
-reg [31:0] ea_dec_disp_r;
-reg        ea_dec_is_16bit_r, ea_dec_scale_to_base_r;
-always_ff @(posedge clk) begin
-    if (i_entry) begin
-        ea_dec_base_sel_r      <= ea_dec_base_sel;
-        ea_dec_index_sel_r     <= ea_dec_index_sel;
-        ea_dec_scale_r         <= ea_dec_scale;
-        ea_dec_disp_r          <= ea_dec_disp;
-        ea_dec_is_16bit_r      <= ea_dec_is_16bit;
-        ea_dec_scale_to_base_r <= ea_dec_scale_to_base;
-    end
-end
-
-// Early forwarded EA computed at i_pop, from the i_entry-registered EA decode.
-wire [31:0] ea_early = calc_ea_core(fwd_onehot_gpr(ea_dec_base_sel_r),
-                                    fwd_onehot_gpr(ea_dec_index_sel_r),
-                                    ea_dec_scale_r, ea_dec_disp_r,
-                                    ea_dec_is_16bit_r, ea_dec_scale_to_base_r);
-
-// Relocate an about-to-be-committed IND value to its linear address
-function automatic [31:0] reloc(input [31:0] off);
-    reloc = (eff_mask_pending ? off : {16'h0, off[15:0]}) + seg_base_pending;
-endfunction
-
-// Dedicated reloc for the uc_exec/busop ind_linear write.
-(* keep *) wire [31:0] seg_base_pending_uc = seg_base_pending;
-function automatic [31:0] reloc_uc(input [31:0] off);
-    reloc_uc = (eff_mask_pending ? off : {16'h0, off[15:0]}) + seg_base_pending_uc;
-endfunction
-
-// 3-term relocation using ALM's fused 3-input add
-function automatic [31:0] reloc_add2(input [31:0] a, input [31:0] b, input mask16);
-    reloc_add2 = mask16 ? ({16'h0, a[15:0] + b[15:0]} + seg_base_pending_uc)
-                        : (a + b + seg_base_pending_uc);
-endfunction
-
-always_ff @(posedge clk) begin
-    if (i_pop)
-        ea_reg <= ea_early;
-end
-
-//=============================================================================
-// Control Unit (Microcode Sequencer)
+// Unit 7: Execution - control unit for microcode and fast instructions
+// "chaining" = FAST issue pipelining
 //=============================================================================
 
 wire [5:0] uc_alu_src   = uc[36:31];  // ABCDEF: ALU source / jump offset
@@ -1296,16 +1903,18 @@ always_ff @(posedge clk) begin
     end
 end
 
-reg [11:0] microcode_return_stack [0:3]; // 4-entry return address stack
-reg [1:0]  microcode_sp;                 // Stack pointer (0-3)
+reg [11:0] microcode_return_stack [0:3];// 4-entry return address stack
+reg [1:0]  microcode_sp;                // Stack pointer (0-3)
 
-reg        uc_jump_taken_prev;      // Jump taken last cycle (for RNi: terminate only in delay slot)
-reg        uc_cond_jump_taken_prev; // Conditional jump taken last cycle (for PREF suppression)
+reg        uc_jump_taken_prev;          // Jump taken last cycle (for RNi: terminate only in delay slot)
+reg        uc_cond_jump_taken_prev;     // Conditional jump taken last cycle (for PREF suppression)
 
 //   RNI/RnI terminate unless we're in a delay slot of a taken jump (loop continues)
 //   RNi only terminates when in delay slot (after a jump)
+//   jcc_fold_active: pop-time-resolved not-taken Jcc terminates at 065 (M4 fold)
 assign i_rni = ((uc_is_rni || uc_is_rni_inhibit) && !uc_jump_taken_prev) ||
-                           (uc_is_rni_lc && uc_jump_taken_prev);
+                           (uc_is_rni_lc && uc_jump_taken_prev) ||
+                           jcc_fold_active;
 
 reg        instr_is_shxd;           // Instruction is a SHxD operation
 reg        instr_cf;                // CF bit at start of instruction
@@ -1326,6 +1935,9 @@ reg [2:0]  seg_reg_sel;             // Segment register index (0=ES,1=CS,2=SS,3=
 reg [31:0] COUNTR;                  // Counter register
 wire [31:0] countr_masked = i.addr32 ? COUNTR : {16'h0, COUNTR[15:0]};
 reg [31:0] TMPeIP;                  // Saved EIP for RPTI (repeat instruction)
+reg [31:0] wr_restart_eip;          // TMPeIP captured at every demand-write issue: a write
+                                    // fault (perm/walk/crossing) may surface after the issuing
+                                    // instruction was FAST-chained away and TMPeIP moved on
 reg [31:0] TMPeSP;                  // Saved ESP for fault handling
 reg        flags_backup_active;     // Set at i_pop/FLGSBA, cleared on interrupt_entry - guards FLAGSB writes
 reg        clear_if_pending;        // Set by {-2E-}, used by {-2F-} to clear IF during INT
@@ -1367,15 +1979,39 @@ always @(posedge clk) begin
 end
 // synthesis translate_on
 
-// i_first PRECISE early branch redirect (NOT a prediction). 
-wire br_jcc_taken = br_is_jcc && check_condition(i.opcode[3:0]);    
+// i_first PRECISE early branch redirect (NOT a prediction).
+wire br_jcc_taken = br_is_jcc && check_condition(i.opcode[3:0], eflags_fwd);
+// Registered pop-time condition (same validity gate as the NT
+reg jcc_pop_taken_r;    // condition value captured at the Jcc's i_pop
+reg jcc_pop_cond_v_r;   // capture was valid (flags settled at the pop)
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        jcc_pop_taken_r  <= 1'b0;
+        jcc_pop_cond_v_r <= 1'b0;
+    end else if (q_flush || interrupt_entry || any_fault) begin
+        jcc_pop_cond_v_r <= 1'b0;
+    end else if (i_pop) begin
+        jcc_pop_cond_v_r <= fast_pop_fc.jcc && !jcc_pop_unsafe;
+        jcc_pop_taken_r  <= check_condition(i_bus.opcode[3:0], eflags_ahead);
+    end
+end
+// synthesis translate_off
+// The registered pop-time decision must match the live 065 evaluation.
+always @(posedge clk)
+    if (reset_n && fast_active && fast_jcc_r && uc_exec && jcc_pop_cond_v_r &&
+        (jcc_pop_taken_r != br_jcc_taken))
+        $display("%0t JCC-POPCOND MISMATCH: pop=%b live=%b op=%02x", $time,
+                 jcc_pop_taken_r, br_jcc_taken, i.opcode);
+// synthesis translate_on
+wire br_jcc_taken_early = jcc_pop_cond_v_r && jcc_pop_taken_r;
 wire early_redirect = i_first && is_dword &&
-                      (br_is_jmp_rel || br_is_call_rel || br_jcc_taken);
+                      (br_is_jmp_rel || br_is_call_rel || br_jcc_taken_early);
 reg  early_redirected;
+// Cleared at the NEXT instruction's arrival
 always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n)                            early_redirected <= 1'b0;
     else if (early_redirect)                 early_redirected <= 1'b1;
-    else if (i_entry || interrupt_entry)     early_redirected <= 1'b0;
+    else if (i_entry || i_pop || interrupt_entry) early_redirected <= 1'b0;
 end
 
 // RNI variants (opcode field):
@@ -1400,11 +2036,14 @@ assign gp_fault_mem_op = uc_is_mem_busop && (uc_buscode != BUSOP_RD_D);
 assign gp_fault_wr_op = uc_is_write || uc_is_check_write;
 
 // DIV/IDIV Overflow Detection
-wire [31:0] div_upper_dividend = div_mask_to_size(SIGMA, op_size);
-wire [31:0] div_divisor = div_mask_to_size(TMPB, op_size);
+localparam logic DIV_OP_MASK   = 1'b0;
+localparam logic DIV_OP_NEGATE = 1'b1;
+
+wire [31:0] div_upper_dividend = div_op_by_size(DIV_OP_MASK, SIGMA, op_size);
+wire [31:0] div_divisor = div_op_by_size(DIV_OP_MASK, TMPB, op_size);
 
 // IDIV2 overflow: check if quotient magnitude fits in signed range
-wire [31:0] idiv_quotient = div_mask_to_size(RESULT, op_size);
+wire [31:0] idiv_quotient = div_op_by_size(DIV_OP_MASK, RESULT, op_size);
 wire [31:0] idiv_signed_max = (op_size == 2'd0) ? 32'h80 :
                               (op_size == 2'd1) ? 32'h8000 : 32'h80000000;
 wire idiv_signs_differ = idiv_dividend_neg ^ idiv_divisor_neg;
@@ -1421,7 +2060,7 @@ assign div_overflow = (div_first_cycle && uc_exec && (
 // Relative jump condition evaluator: returns true when relative jump should be taken
 function automatic logic is_reljump_taken(input [6:0] aluop);
     case (aluop)
-        ALUJMP_JNcond:  is_reljump_taken = !check_condition(i.opcode[3:0]);
+        ALUJMP_JNcond:  is_reljump_taken = !check_condition(i.opcode[3:0], eflags_fwd);
         ALUJMP_JCNTZ:   is_reljump_taken = (countr_masked == 32'h0);
         ALUJMP_JCNTNZ:  is_reljump_taken = (countr_masked != 32'h0);
         ALUJMP_JCT4N1:  is_reljump_taken = (countr_masked[3:0] != 4'h1);
@@ -1432,7 +2071,7 @@ function automatic logic is_reljump_taken(input [6:0] aluop);
         ALUJMP_JG:      is_reljump_taken = !uc_flags[6] && (uc_flags[7] == uc_flags[11]);
         ALUJMP_JNC:     is_reljump_taken = !uc_flags[0];
         ALUJMP_JNO:     is_reljump_taken = !uc_flags[11];
-        ALUJMP_JPEREQ:  is_reljump_taken = uc_jpereq_fwd;  // No FPU: pre-computed in ROM bit 44
+        ALUJMP_JPEREQ:  is_reljump_taken = uc_jpereq_fwd;       // No FPU: pre-computed in ROM bit 44
         ALUJMP_JNFLGB:  is_reljump_taken = !flags_backup_active;
         ALUJMP_JTSSAF:  is_reljump_taken = tss_access_flag;     // Jump if TSS access flag is set
         ALUJMP_JINTSW:  is_reljump_taken = !interrupt_hw;
@@ -1456,8 +2095,12 @@ endfunction
 wire desc_accessed_writeback = pe && (uc_aluop == ALUJMP_JMP) &&
                                (uc_addr == 12'h5D3) && !desc_raw_hi[8];
 
+// !jcc_fold_active: a folded not-taken Jcc terminates at 065 — its JNcond
+// jump (to Jcond_DONE) must not fire, or it would steal uaddr from the
+// entry-point load of the next instruction.
 wire uc_reljump_taken = uc_exec && !repeat_active && is_reljump_taken(uc_aluop) &&
-                        !desc_accessed_writeback && !prot_redirect_prev;
+                        !desc_accessed_writeback && !prot_redirect_prev &&
+                        !jcc_fold_active;
 
 wire uc_cond_jump_taken = (uc_reljump_taken &&
     uc_aluop != ALUJMP_JMP &&
@@ -1503,12 +2146,12 @@ always_ff @(posedge clk) begin
         set_rpl_redirect_s1 <= uc_exec && pe &&
             (uc_aluop == ALUJMP_PTGEN) && (uc_alu_src == 6'h2D) &&
             (seg_cache[SEG_CS].DPL != cpl) &&
-            !seg_cache[SEG_CS].conforming;
+            !(seg_cache[SEG_CS].seg_type[3] && seg_cache[SEG_CS].seg_type[2]);
         set_rpl_redirect_s2 <= set_rpl_redirect_s1;
         // Conforming code: set seg_cache[SEG_CS].DPL = CPL (no privilege change)
         conform_dpl_s1 <= uc_exec && pe &&
             (uc_aluop == ALUJMP_PTGEN) && (uc_alu_src == 6'h2D) &&
-            seg_cache[SEG_CS].conforming;
+            seg_cache[SEG_CS].seg_type[3] && seg_cache[SEG_CS].seg_type[2];
         conform_dpl_s2 <= conform_dpl_s1;
         conform_dpl_value_s1 <= CS[1:0];
         conform_dpl_value_s2 <= conform_dpl_value_s1;
@@ -1559,7 +2202,10 @@ always_comb begin
         uaddr_now = uaddr + 12'd1;
 
     if (i_entry_raw)
-        uaddr_now = i_bus.entry_point;
+        // fold_entry: the head is landing this edge; its entry_point is the
+        // skel REGISTER's field read DIRECTLY (capture_literal never touches
+        // entry_point - do not route it through the d2_final capture muxes).
+        uaddr_now = decq_empty ? skel_entry_point : i_bus.entry_point;
 
     if (uc_exec) begin
         if (uc_reljump_taken)
@@ -1607,10 +2253,14 @@ always_comb begin
             uaddr_now = 12'h5BE;
     end
 
+    // z386x chained entry: load the next instruction's address one
+    if (fast_issue)
+        uaddr_now = fast_issue1 ? i_bus2.entry_point : i_bus.entry_point;
+
     if (gp_fault_r)
         uaddr_now = ss_fault_r ? UADDR_STACK_FAULT : UADDR_GENERAL_FAULT1;
 
-    if (i_rni_delay && !stall && !page_fault) begin
+    if (i_rni_delay && !stall && !page_fault) begin // interrupt dispatch
         if (nmi_request_active && !single_step)
             uaddr_now = UADDR_NMI;
         else if (intr_pending && EFLAGS[9] && !single_step && !inhibit_interrupts)
@@ -1686,7 +2336,10 @@ always_ff @(posedge clk) begin
 
             // Track RNI/RnI for delay slot handling and capture EIP at termination
             if (i_rni && uc_active && !instr_eip_written && !any_fault) begin
-                i_rni_delay <= 1'b1;
+                // z386x: i_pop coinciding with RNI means the next instruction
+                // was chain-entered and executes in the slot — no delay slot.
+                if (!i_pop)
+                    i_rni_delay <= 1'b1;
                 if (uc_dest == DEST_EIP || uc_dest == DEST_eIP)
                     debug_ip <= is_dword ? alu_result : {EIP[31:16], alu_result[15:0]};
                 else
@@ -1716,6 +2369,12 @@ always_ff @(posedge clk) begin
         // Suppress delay slot execution after fault triggers (must be outside if(uc_exec))
         fault_suppress_delay_slot <= any_fault || any_fault_r || (fault_suppress_delay_slot && stall);
 
+        // z386x: a fault must dissolve a chain-armed entry (e.g. a store that
+        // chained out at i_pop and then faulted at its WR issue) so the next
+        // instruction is not popped into the fault redirect.
+        if (any_fault)
+            init_cycle <= 1'b0;
+
         // i_entry: set init_cycle for next instruction (queue NOT popped yet)
         if (i_entry)
             init_cycle <= 1'b1;  // Next cycle: pop queue and load instruction registers
@@ -1731,9 +2390,14 @@ always_ff @(posedge clk) begin
             gate_in_progress <= 1'b0;
         end
 
+        // z386x chained entry: the next decq entry pops in the next cycle
+        // (init_cycle stays up through a FAST->FAST chain).
+        if (fast_issue)
+            init_cycle <= 1'b1;
+
         if (!stall) begin
-            if (stack_init_pending) stack_init_pending <= 1'b0;
-            if (i_first) i_first <= 1'b0;
+            if (stack_init_pending && !i_pop) stack_init_pending <= 1'b0;
+            if (i_first && !i_pop) i_first <= 1'b0;  // chained i_pop re-arms i_first
         end
 
         // Queue flush: init_cycle<=0 wins over i_entry's init_cycle<=1
@@ -1822,8 +2486,19 @@ always_ff @(posedge clk) begin
         instr_cf <= 1'b0;
         instr_ind_is_ea <= 1'b0;
         jcc_active <= 1'b0;
+        fast_i_r <= 1'b0;
+        fast_multi_r <= 1'b0;
+        fast_jcc_r <= 1'b0;
+        fast_commit_sel_r <= FAST_COMMIT_NONE;
+        fast_keep_slot_r <= 1'b0;
     end else if (i_pop) begin
         i <= i_bus;
+        fast_i_r <= fast_pop_fast;
+        fast_multi_r <= fast_pop_fast && fast_pop_fc.multi_word;
+        fast_jcc_r <= fast_pop_fast && fast_pop_fc.jcc;
+        fast_wf_r <= fast_pop_fc.writes_flags;
+        fast_commit_sel_r <= fast_pop_fc.commit_sel;
+        fast_keep_slot_r <= fast_pop_fc.keep_slot;
         // LSS/LFS/LGS (0F B2/B4/B5): put opcode in i.immediate for microcode XOR trick
         if (i_bus.has_0f && (i_bus.opcode == 8'hB2 || i_bus.opcode == 8'hB4 || i_bus.opcode == 8'hB5))
             i.immediate <= {24'h0, i_bus.opcode};
@@ -1849,10 +2524,222 @@ always_ff @(posedge clk) begin
     end
     if (interrupt_entry)
         jcc_active <= 1'b0;  // Clear on interrupt — prevent is_jcc from using stale displacement
+    // z386x: fault/interrupt redirects run handler microcode while the popped
+    // instruction's FAST state is stale — the handler's own RNI word must not
+    // fire fast_last (sideband commit) or chain. Dissolve it.
+    if (any_fault || any_fault_r || interrupt_entry) begin
+        fast_i_r <= 1'b0;
+        fast_multi_r <= 1'b0;
+        fast_jcc_r <= 1'b0;
+        fast_commit_sel_r <= FAST_COMMIT_NONE;
+    end
 end
 
+// z386x fast path phases
+assign fast_active = i_first && fast_i_r;
+assign fast_last   = fast_i_r && uc_active && i_rni;
+
+// synthesis translate_off
+// Shape check: the RNI word a FAST class retires on must match its commit kind.
+always @(posedge clk)
+    if (reset_n && fast_last && uc_exec) begin
+        automatic logic ok;
+        case (fast_commit_sel_r)
+            FAST_COMMIT_ALU:    ok = (uc[17:11] == ALUJMP_ALU) || (uc[17:11] == ALUJMP_INCDEC) ||
+                                     (uc[17:11] == ALUJMP_PASS);
+            FAST_COMMIT_SHIFT:  ok = (uc[17:11] == ALUJMP_SHIFT2);
+            FAST_COMMIT_MEM:    ok = uc[38];                    // load/POP: the RNI word is bus/DLY
+            FAST_COMMIT_SIGSRC: ok = (uc[17:11] == ALUJMP_BITS16) || (uc[17:11] == ALUJMP_BITS32);
+            FAST_COMMIT_ESP:    ok = uc[40];                    // PUSH: the RNI word issues the WR
+            default:            ok = 1'b1;                      // NONE: CMPTST/LEA/store shapes vary
+        endcase
+        if (!ok)
+            $display("%0t FAST-CLASS MISMATCH: commit=%0d vs uc_addr=%03x aluop=%02x opcode=%02x modrm=%02x",
+                     $time, fast_commit_sel_r, uc_addr, uc[17:11], i.opcode, i.modrm);
+        if ((fast_commit_sel_r == FAST_COMMIT_ALU) &&
+            (uc_dest != DEST_USTEP_ALU))
+            $display("%0t USTEP-DEST MISMATCH: dest=%02x uc_addr=%03x opcode=%02x",
+                     $time, uc_dest, uc_addr, i.opcode);
+    end
+// synthesis translate_on
+
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        fast_dead_slot <= 1'b0;
+        fast_memc_pending <= 1'b0;
+        fast_shc_pending <= 1'b0;
+    end else if (!stall) begin
+        // Memory classes keep their slot: the OPR_R writeback / write-DLY is
+        // real work when unchained. Only chained-away slots are replaced.
+        fast_dead_slot <= fast_last && uc_exec && !i_pop && !fast_keep_slot_r;
+        // Deferred MEM commit: the load's slot was chained away; hardware
+        // writes the (settled) OPR_R to the destination in that cycle.
+        fast_memc_pending <= fast_last && uc_exec && i_pop && !any_fault &&
+                             (fast_commit_sel_r == FAST_COMMIT_MEM);
+        if (fast_last && uc_exec && i_pop && (fast_commit_sel_r == FAST_COMMIT_MEM)) begin
+            fast_memc_dst  <= i.dst_reg_sel;
+            fast_memc_size <= op_size;
+        end
+        // Deferred SHIFT commit: ALWAYS deferred (not just when chained) so
+        // the barrel -> commit-mux -> GPR write arc disappears entirely; the
+        // barrel output only reaches this data register at fast_last.
+        fast_shc_pending <= fast_last && uc_exec && !any_fault &&
+                            (fast_commit_sel_r == FAST_COMMIT_SHIFT);
+        if (fast_last && uc_exec && (fast_commit_sel_r == FAST_COMMIT_SHIFT)) begin
+            fast_shc_dst  <= i.dst_reg_sel;
+            fast_shc_size <= op_size;
+            fast_shc_data <= shift_result;
+        end
+    end
+end
+
+// synthesis translate_off
+// Dead-slot cause breakdown (unchained fast_last cycles = reclaimable slot
+// candidates). Classified by the state of the would-be successor (queue head)
+// at the fast_last cycle. Printed at $finish via the final block.
+int unsigned ds_total, ds_empty, ds_seq, ds_flags, ds_ea, ds_memc, ds_intr, ds_other, ds_other_1w, ds_keepslot;
+always @(posedge clk) begin
+    if (reset_n && !stall && fast_last && uc_exec && !i_pop && fast_keep_slot_r)
+        ds_keepslot++;   // unchained store/RMW/POP boundary (slot is real work)
+    if (reset_n && !stall && fast_last && uc_exec && !i_pop && !fast_keep_slot_r) begin
+        ds_total++;
+        if (decq_empty)                                        ds_empty++;
+        else if (!fast_pop_fc.fast || fast_off)                ds_seq++;
+        else if (interrupt_pending || single_step)             ds_intr++;
+        else if (fast_pop_fc.reads_flags && fast_wf_r && !fast_pop_fc.jcc) ds_flags++;
+        else if (fast_pop_fc.uses_ea && fast_ea2_conflict)     ds_ea++;
+        else if (fast_memc_confN)                              ds_memc++;
+        else if (!fast_multi_r)                                ds_other_1w++;  // chain1 missed at pop (decq_has2 lookahead?)
+        else                                                   ds_other++;
+    end
+end
+final begin
+    if (ds_total > 0)
+        $display("z386x dead-slot breakdown: total=%0d empty=%0d seq=%0d flags=%0d ea=%0d memc=%0d intr=%0d other1w=%0d other=%0d keepslot=%0d",
+                 ds_total, ds_empty, ds_seq, ds_flags, ds_ea, ds_memc, ds_intr, ds_other_1w, ds_other, ds_keepslot);
+end
+// synthesis translate_on
+
+
 //=============================================================================
-// Data Unit
+// Unit 8: Write-back - deferred commits that retire one cycle after their producer:
+//         the two-cycle ALU flag retirement and the two-cycle shift.
+//=============================================================================
+
+// Two-cycle ALU flag retirement
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-z386-sv-2735
+reg        flag2_eflags_p;     // commit to EFLAGS this cycle (producer had uc[37])
+reg        flag2_ucflags_p;    // commit to uc_flags this cycle
+reg [31:0] flag2_result_r;     // raw ALU result of the producer
+reg        flag2_cf_r, flag2_af_r, flag2_of_r, flag2_zsp_r;
+reg [1:0]  flag2_size_r;
+wire flag2_class_uc = (uc_aluop == ALUJMP_ALU)    || (uc_aluop == ALUJMP_INCDEC) ||
+                      (uc_aluop == ALUJMP_CMPTST) || (uc_aluop == ALUJMP_AND)    ||
+                      (uc_aluop == ALUJMP_OR)     || (uc_aluop == ALUJMP_XOR)    ||
+                      (uc_aluop == ALUJMP_ADD)    || (uc_aluop == ALUJMP_ADC)    ||
+                      (uc_aluop == ALUJMP_SUB)    || (uc_aluop == ALUJMP_CMP)    ||
+                      (uc_aluop == ALUJMP_AAAAAS) || (uc_aluop == ALUJMP_DAADAS);
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        flag2_eflags_p  <= 1'b0;
+        flag2_ucflags_p <= 1'b0;
+    end else begin
+        flag2_eflags_p  <= uc_exec && alu_update_flags;
+        flag2_ucflags_p <= uc_exec && flag2_class_uc;
+        if (uc_exec && flag2_class_uc) begin
+            flag2_result_r <= alu_result;
+            flag2_cf_r     <= alu_flags[0];
+            flag2_af_r     <= alu_flags[4];
+            flag2_of_r     <= alu_flags[11];
+            flag2_zsp_r    <= alu_zsp_update;
+            flag2_size_r   <= op_size;
+        end
+    end
+end
+wire flag2_zf = (flag2_size_r == 2'd0) ? (flag2_result_r[7:0]  == 8'h0)  :
+                (flag2_size_r == 2'd1) ? (flag2_result_r[15:0] == 16'h0) :
+                                         (flag2_result_r       == 32'h0);
+wire flag2_sf = (flag2_size_r == 2'd0) ? flag2_result_r[7]  :
+                (flag2_size_r == 2'd1) ? flag2_result_r[15] :
+                                         flag2_result_r[31];
+wire flag2_pf = ~^flag2_result_r[7:0];
+
+// Two-cycle shifter flag retirement
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-z386-sv-2777
+reg sh2_commit_p, sh2_we_zsp, sh2_we_of;
+reg sh2_cf, sh2_of, sh2_zf, sh2_sf, sh2_pf;
+always_ff @(posedge clk) begin
+    if (!reset_n)
+        sh2_commit_p <= 1'b0;
+    else begin
+        sh2_commit_p <= uc_exec && (uc_aluop == ALUJMP_SHIFT2) && (shift_size != 5'd0);
+        if (uc_exec && (uc_aluop == ALUJMP_SHIFT2) && (shift_size != 5'd0)) begin
+            sh2_we_zsp <= shift_SET_Nzs;
+            sh2_pf <= shift_pf;
+            sh2_zf <= shift_zf;
+            sh2_sf <= shift_sf;
+            sh2_we_of <= 1'b0;
+            if (instr_is_shxd) begin
+                sh2_cf <= i.opcode[3] ? shift_last_out_lsb : shift_last_out_msb;
+                if (shift_size == 5'd1) begin
+                    sh2_we_of <= 1'b1;
+                    sh2_of <= i.opcode[3] ? (shift_result[width-1] ^ shift_result[width-2]) :
+                                            (shift_result[width-1] ^ shift_last_out_msb);
+                end
+            end else begin
+                case (shift_op)
+                    SHL,SAL: sh2_cf <= shift_overflow ? (shift_eq_width ? shift_eq_cf : 1'b0) : shift_last_out_msb;
+                    RCL:     sh2_cf <= shift_last_out_msb;
+                    SHR:     sh2_cf <= shift_overflow ? (shift_eq_width ? shift_eq_cf : 1'b0) : shift_last_out_lsb;
+                    SAR:     sh2_cf <= shift_overflow ? shift_result[width-1] : shift_last_out_lsb;
+                    RCR:     sh2_cf <= shift_last_out_lsb;
+                    ROL:     sh2_cf <= shift_result[0];
+                    ROR:     sh2_cf <= shift_result[width-1];
+                endcase
+                if (shift_size == 5'd1) begin
+                    case (shift_op)
+                        SHL:     begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_last_out_msb; end
+                        SHR:     begin sh2_we_of <= 1'b1; sh2_of <= shift_lo[width-1]; end
+                        SAR:     begin sh2_we_of <= 1'b1; sh2_of <= 1'b0; end
+                        ROR,RCR: begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_result[width-2]; end
+                        default: ;
+                    endcase
+                end
+                // ROL/RCL: OF computed for ALL counts (real 386 behavior)
+                if (shift_op == ROL) begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_result[0]; end
+                if (shift_op == RCL) begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_last_out_msb; end
+            end
+        end
+    end
+end
+
+// EFLAGS as it will be after this cycle's pending two-cycle flag commit
+wire [31:0] eflags_fwd =
+    sh2_commit_p ? { EFLAGS[31:12],
+                     sh2_we_of  ? sh2_of : EFLAGS[11],
+                     EFLAGS[10:8],
+                     sh2_we_zsp ? sh2_sf : EFLAGS[7],
+                     sh2_we_zsp ? sh2_zf : EFLAGS[6],
+                     EFLAGS[5:3],
+                     sh2_we_zsp ? sh2_pf : EFLAGS[2],
+                     EFLAGS[1],
+                     sh2_cf } :
+    flag2_eflags_p ? { EFLAGS[31:12],
+                       flag2_of_r,
+                       EFLAGS[10:8],
+                       flag2_zsp_r ? flag2_sf : EFLAGS[7],
+                       flag2_zsp_r ? flag2_zf : EFLAGS[6],
+                       EFLAGS[5],
+                       flag2_af_r,
+                       EFLAGS[3],
+                       flag2_zsp_r ? flag2_pf : EFLAGS[2],
+                       EFLAGS[1],
+                       flag2_cf_r } :
+    EFLAGS;
+
+
+//=============================================================================
+// Unit 9: Data Unit (ALU, register file, barrel shifter)
 //=============================================================================
 
 // SIGMA Update (ALU Accumulator)
@@ -1937,27 +2824,27 @@ always_ff @(posedge clk) begin
             ALUJMP_DIV5: begin
                 // DIV5 final correction: if remainder was negative, add divisor
                 if (!div_r_nonneg) begin
-                    SIGMA <= div_mask_to_size(SIGMA + div_divisor_masked, op_size);
+                    SIGMA <= div_op_by_size(DIV_OP_MASK, SIGMA + div_divisor_masked, op_size);
                 end
             end
             ALUJMP_PREDIV: begin
                 // PREDIV: Save signs, compute absolute value, and do first DIV7 iteration
-                SIGMA <= prediv_r_next;
+                SIGMA <= div_iter_r_next;
             end
             ALUJMP_IDIV1: begin
                 // IDIV1: Correct remainder sign (same sign as original dividend)
                 if (idiv_dividend_neg)
-                    SIGMA <= div_negate_to_size(SIGMA, op_size);
+                    SIGMA <= div_op_by_size(DIV_OP_NEGATE, SIGMA, op_size);
             end
             ALUJMP_IDIV2: begin
                 // IDIV2: Correct quotient sign (negative if signs differed)
                 SIGMA <= (idiv_dividend_neg ^ idiv_divisor_neg) ?
-                         div_negate_to_size(RESULT, op_size) :
-                         div_mask_to_size(RESULT, op_size);
+                         div_op_by_size(DIV_OP_NEGATE, RESULT, op_size) :
+                         div_op_by_size(DIV_OP_MASK, RESULT, op_size);
             end
             ALUJMP_DIV7: begin
                 // DIV7: one non-restoring iteration
-                SIGMA <= div7_r_next;
+                SIGMA <= div_iter_r_next;
             end
             default: begin
             end
@@ -2204,6 +3091,10 @@ always_ff @(posedge clk) begin
                 EFLAGS <= (dest_value & 32'h00037FD5) | 32'h00000002;
             end
         end
+        // RF (Resume Flag, bit 16): the 386 clears RF at the successfu -- doc/z386x/core_notes_v51.md #24
+        if ((i_rni_delay && i.opcode != 8'hCF && i.opcode != 8'h9D) ||
+            (fast_last && uc_exec))
+            EFLAGS[16] <= 1'b0;
     end
 end
 
@@ -2241,37 +3132,61 @@ always_ff @(posedge clk) begin
     end
 end
 
+// EIP destinations use only these four sources in the canonical ROM. Keep the
+// full microcode source mux off this architectural write path.
+function automatic [31:0] eip_source_mux(input [5:0] source);
+    case (source)
+        SRC_SIGMA:  eip_source_mux = SIGMA;
+        SRC_TMPG:   eip_source_mux = TMPG;
+        SRC_TMPeIP: eip_source_mux = TMPeIP;
+        SRC_OPR_R:  eip_source_mux = OPR_R;
+        default:    eip_source_mux = 32'h0;
+    endcase
+endfunction
+wire [31:0] eip_source_value = eip_source_mux(uc_source_shift);
+
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && uc_exec &&
+        (uc_dest == DEST_EIP || uc_dest == DEST_eIP || uc_dest == DEST_IP) &&
+        (eip_source_value !== alu_result))
+        $fatal(1, "EIP SOURCE MUX MISMATCH: uc_addr=%03x src=%02x narrow=%08x alu=%08x",
+               uc_addr, uc_source, eip_source_value, alu_result);
+// synthesis translate_on
+
 // EIP (Instruction Pointer)
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         EIP <= 32'h0000FFF0;  // 386 reset vector offset
     end else if (i_pop && !halted /*&& (~uc_active || i_rni_delay)*/) begin
-        // Instruction start: increment EIP by instruction length
-        // In 16-bit code segment (D=0), truncate to 16 bits
-        if (D)
+        // z386x: a chained i_pop can land on a control transfer's fina -- doc/z386x/core_notes_v51.md #25
+        if (uc_exec && fast_last && (uc_dest == DEST_eIP)) begin
+            automatic logic [31:0] tgt = is_dword
+                                       ? eip_source_value
+                                       : {16'h0, eip_source_value[15:0]};
+            if (D)
+                EIP <= tgt + {27'b0, i_bus.length};
+            else
+                EIP <= {16'h0, tgt[15:0] + {11'b0, i_bus.length}};
+        end else if (D)
             EIP <= EIP + {27'b0, i_bus.length};
         else
             EIP <= {16'h0, EIP[15:0] + {11'b0, i_bus.length}};
     end else if (uc_exec && (uc_dest == DEST_EIP || uc_dest == DEST_eIP || uc_dest == DEST_IP)) begin
-        // Microcode destination write to EIP
-        // DEST_EIP: uses CS.D bit — for microcode EIP restores (REP string ops, etc.)
-        //   where EIP width depends on code segment size, not operand size
-        // DEST_eIP: uses is_dword (operand size) — for IRET/RET/CALL where
-        //   operand size prefix (0x66) controls whether 16-bit or 32-bit EIP is popped
-        // DEST_IP: always 16-bit (V86 IRETD)
+        // Microcode destination write to EIP -- doc/z386x/core_notes_v51.md #26
         if (uc_dest == DEST_EIP) begin
             if (D)
-                EIP <= alu_result;
+                EIP <= eip_source_value;
             else
-                EIP <= {16'h0, alu_result[15:0]};
+                EIP <= {16'h0, eip_source_value[15:0]};
         end else if (uc_dest == DEST_eIP) begin
             if (is_dword)
-                EIP <= alu_result;
+                EIP <= eip_source_value;
             else
-                EIP <= {16'h0, alu_result[15:0]};
+                EIP <= {16'h0, eip_source_value[15:0]};
         end else begin
             // DEST_IP: always 16-bit
-            EIP <= {16'h0, alu_result[15:0]};
+            EIP <= {16'h0, eip_source_value[15:0]};
         end
     end
 end
@@ -2376,6 +3291,9 @@ always_ff @(posedge clk) begin
         TR <= 16'h0000;
         SLCTR <= 32'h0;
 
+        CR0 <= 32'h0;       // CR0 must clear PE and PG at reset
+        CR2 <= 32'h0;
+
         TMPB <= 32'h0;
         TMPC <= 32'h0;
         TMPD <= 32'h0;
@@ -2389,14 +3307,26 @@ always_ff @(posedge clk) begin
         idiv_dividend_neg <= 1'b0;
         idiv_divisor_neg <= 1'b0;
         div_first_cycle <= 1'b0;
-    end else if (uc_exec) begin
+    end else begin
+        // Deferred SHIFT commit
+        if (fast_shc_pending)
+            write_gpr(fast_shc_dst, fast_shc_data, fast_shc_size);
+        if (uc_exec) begin
         if (uc_source == SRC_IRF2) dest_value = IND;  // use combinational IRF2
 
+        // z386x deferred MEM commit: a chained-away load slot's
+        // OPR_R -> DSTREG write, executed in parallel with the successor's
+        // first cycle. Placed before the case so any same-register write by
+        // the (younger) current word wins.
+        if (fast_memc_pending)
+            write_gpr(fast_memc_dst, OPR_R, fast_memc_size);
+
+        // Dead legs removed : the microcode never emits direct named-GPR dest codes
+        // other than EAX/EDX/ESP/EBP/eSP/AX/BP/AL/AH (writes go via
+        // DSTREG/SRCREG/IRF).  Restore a leg if the ROM ever changes.
         case (uc_dest)
             DEST_EAX: EAX <= dest_value;
-            DEST_ECX: ECX <= dest_value;
             DEST_EDX: EDX <= dest_value;
-            DEST_EBX: EBX <= dest_value;
             DEST_ESP: ESP <= dest_value;
             // eSP: stack-pointer-aware write. B bit (SS descriptor) controls
             // whether ESP (32-bit, B=1) or SP (16-bit, B=0) is the stack pointer.
@@ -2405,55 +3335,27 @@ always_ff @(posedge clk) begin
                       else
                           ESP[15:0] <= dest_value[15:0];
             DEST_EBP: EBP <= dest_value;
-            DEST_ESI: ESI <= dest_value;
-            DEST_EDI: EDI <= dest_value;
 
             DEST_DSTREG: write_gpr(i.dst_reg_sel, dest_value, op_size);
             DEST_SRCREG: write_gpr(i.src_reg_sel, dest_value, op_size);
 
-            DEST_AX: EAX[15:0] <= dest_value[15:0];
-            DEST_CX: ECX[15:0] <= dest_value[15:0];
-            DEST_DX: EDX[15:0] <= dest_value[15:0];
-            DEST_BX: EBX[15:0] <= dest_value[15:0];
-            DEST_SP: ESP[15:0] <= dest_value[15:0];
-            DEST_BP: EBP[15:0] <= dest_value[15:0];
-            DEST_SI: ESI[15:0] <= dest_value[15:0];
-            DEST_DI: EDI[15:0] <= dest_value[15:0];
+            DEST_AX:     write_gpr(3'd0, dest_value, 2'd1);
+            DEST_BP:     write_gpr(3'd5, dest_value, 2'd1);
+            DEST_eAX_AL: write_gpr(3'd0, dest_value, op_size);
+            DEST_eDX_AH: write_gpr(op_size == 2'd0 ? 3'd4 : 3'd2,
+                                    dest_value, op_size);
+            DEST_eCX:    write_gpr(3'd1, dest_value, i.addr32 ? 2'd2 : 2'd1);
+            DEST_eSI:    write_gpr(3'd6, dest_value, i.addr32 ? 2'd2 : 2'd1);
+            DEST_eDI:    write_gpr(3'd7, dest_value, i.addr32 ? 2'd2 : 2'd1);
+            DEST_AL:     write_gpr(3'd0, dest_value, 2'd0);
+            DEST_AH:     write_gpr(3'd4, dest_value, 2'd0);
 
-            // eAX_AL: Size-aware accumulator write for LODS/SCAS/CWD/CDQ/MUL
-            DEST_eAX_AL: begin
-                case (op_size)
-                    2'd0: EAX[7:0] <= dest_value[7:0];    // AL for byte ops
-                    2'd1: EAX[15:0] <= dest_value[15:0];  // AX for word ops
-                    default: EAX <= dest_value;           // EAX for dword ops
-                endcase
+            // Optimizer-owned FAST retire word. SEQ/fast_off ignores this
+            // destination and reaches the original slot writeback unchanged.
+            DEST_USTEP_ALU: begin
+                if (fast_i_r && !fast_off && !any_fault)
+                    write_gpr(i.dst_reg_sel, alu_result, op_size);
             end
-
-            // eDX_AH: Size-aware write for MUL high part, DIV/IDIV remainder, and CWD/CDQ
-            DEST_eDX_AH: begin
-                case (op_size)
-                    // For byte MUL, skip AH write - MULFIX already wrote full 16-bit result to AX
-                    2'd0: EAX[15:8] <= dest_value[7:0];   // AH for byte ops
-                    2'd1: EDX[15:0] <= dest_value[15:0];  // DX for word ops
-                    default: EDX <= dest_value;           // EDX for dword ops
-                endcase
-            end
-
-            // String counter/index register writes (0x31, 0x36, 0x37)
-            // These are address-size aware (16 vs 32 bit based on i.addr32)
-            DEST_eCX: if (i.addr32) ECX <= dest_value; else ECX[15:0] <= dest_value[15:0];
-            DEST_eSI: if (i.addr32) ESI <= dest_value; else ESI[15:0] <= dest_value[15:0];
-            DEST_eDI: if (i.addr32) EDI <= dest_value; else EDI[15:0] <= dest_value[15:0];
-
-            DEST_AL: EAX[7:0] <= dest_value[7:0];
-            DEST_CL: ECX[7:0] <= dest_value[7:0];
-            DEST_DL: EDX[7:0] <= dest_value[7:0];
-            DEST_BL: EBX[7:0] <= dest_value[7:0];
-
-            DEST_AH: EAX[15:8] <= dest_value[7:0];
-            DEST_CH: ECX[15:8] <= dest_value[7:0];
-            DEST_DH: EDX[15:8] <= dest_value[7:0];
-            DEST_BH: EBX[15:8] <= dest_value[7:0];
 
             DEST_TMPB: TMPB <= dest_value;
             DEST_TMPC: TMPC <= dest_value;
@@ -2462,10 +3364,10 @@ always_ff @(posedge clk) begin
             DEST_TMPF: TMPF <= dest_value;
             DEST_TMPG: TMPG <= dest_value;  // Used by far CALL/JMP to store IP
             DEST_TMPH: begin
-                TMPH <= dest_value;      // encoding 0x11
+                TMPH <= dest_value;         // encoding 0x11
             end
             DEST_TMP_TR: begin
-                SLCTR <= dest_value;  // encoding 0x13 = SLCTR2, same register as SLCTR
+                SLCTR <= dest_value;        // encoding 0x13 = SLCTR2, same register as SLCTR
             end
             DEST_TMPeIP: TMPeIP <= dest_value;
             DEST_TMPeSP: TMPeSP <= dest_value;
@@ -2544,6 +3446,14 @@ always_ff @(posedge clk) begin
             default: ; // No write
         endcase
 
+        // SHIFT commits are DEFERRED one cycle (fast_shc_*)
+        if (fast_last && !any_fault && fast_commit_sel_r == FAST_COMMIT_SIGSRC)
+            write_gpr(i.src_reg_sel, SIGMA,
+                      (uc_aluop == ALUJMP_BITS32) ? 2'd2 : 2'd1);
+        // PUSH
+        if (fast_last && !any_fault && fast_commit_sel_r == FAST_COMMIT_ESP)
+            ESP <= SIGMA;
+
         if (uc_aluop == ALUJMP_PTSELE && !gate_detect_now) begin
             TMPH <= alu_dst;
         end
@@ -2552,7 +3462,7 @@ always_ff @(posedge clk) begin
         if (gate_detect_now) begin
             TMPB <= desc_raw_hi;                          // raw high DWORD for CALLGATE386
             TMPH <= {16'h0, TMPC[31:16]};                 // target CS selector (from gate low DWORD)
-            TMPG <= {desc_raw_hi[31:16], TMPC[15:0]};      // target offset: hi DWORD[31:16] | lo DWORD[15:0]
+            TMPG <= {desc_raw_hi[31:16], TMPC[15:0]};     // target offset: hi DWORD[31:16] | lo DWORD[15:0]
         end
 
 
@@ -2564,13 +3474,13 @@ always_ff @(posedge clk) begin
         end
 
         if (uc_aluop == ALUJMP_DIV7) begin
-            DIVTMP <= div7_q_next;
-            div_r_nonneg <= div7_r_nonneg_next;
+            DIVTMP <= div_iter_q_next;
+            div_r_nonneg <= div_iter_r_nonneg_next;
             div_first_cycle <= 1'b0;  // Clear after first DIV7 cycle
         end else if (uc_aluop == ALUJMP_PREDIV) begin
-            DIVTMP <= prediv_q_next;
+            DIVTMP <= div_iter_q_next;
             TMPB <= div_divisor_abs;
-            div_r_nonneg <= prediv_r_nonneg_next;
+            div_r_nonneg <= div_iter_r_nonneg_next;
             idiv_dividend_neg <= div_dividend_neg;
             idiv_divisor_neg <= div_divisor_neg;
             div_first_cycle <= 1'b0;  // Clear - PREDIV includes first division iteration
@@ -2578,8 +3488,8 @@ always_ff @(posedge clk) begin
             div_r_nonneg <= 1'b1;
         end
 
-        // CLZF (BSR/BSF): Copy TMPC to SRCREG as the final bit position result
-        if (uc_aluop == ALUJMP_CLZF && i.has_0f && (i.opcode == 8'hBC || i.opcode == 8'hBD)) begin
+        // CLZF (BSR only): commit the accumulated bit position (TMPC)
+        if (uc_aluop == ALUJMP_CLZF && i.has_0f && i.opcode == 8'hBD) begin
             write_gpr(i.src_reg_sel, TMPC, op_size);
         end
 
@@ -2591,6 +3501,7 @@ always_ff @(posedge clk) begin
         if (write_rpl_s2)
             SLCTR[1:0] <= desc_raw_hi[14:13];
 
+        end
     end
 
     // TMPeIP/TMPeSP: save EIP/ESP at instruction start and fault entry
@@ -2600,9 +3511,15 @@ always_ff @(posedge clk) begin
         // TMPeSP <= forwarded_esp;
     end
     if (i_first)
-        TMPeSP <= ESP;  // there's no TMPeSP read use at entry points
-    if (any_fault_r)    // Deferred fault save: capture ESP one cycle after fault fires.
-        TMPeSP <= ESP;
+        TMPeSP <= ESP;  // instruction-start ESP; fault frame (SRC_TMPeSP) is restartable,
+                        // so it must use the START ESP even if the instruction already
+                        // committed a stack push before faulting (e.g. ENTER's PUSH EBP).
+
+    // Chained-store fault attribution: capture the restart IP at every demand WRITE issue
+    if (mem_req_to_paging && mem_write_now && mem_accepted)
+        wr_restart_eip <= TMPeIP;
+    if (page_fault && pg_fault_code[1])
+        TMPeIP <= wr_restart_eip;
 end
 
 // COUNTR
@@ -2638,25 +3555,25 @@ always_ff @(posedge clk) begin
     end
 end
 
-// Condition code check for Jcc/SETcc/CMovcc
-function automatic logic check_condition(input [3:0] cond);
+// Condition code check for Jcc/SETcc/CMovcc -- doc/z386x/core_notes_v51.md #32
+function automatic logic check_condition(input [3:0] cond, input [31:0] f);
     case (cond)
-        4'b0000: check_condition = EFLAGS[11];          // JO (OF=1)
-        4'b0001: check_condition = !EFLAGS[11];         // JNO (OF=0)
-        4'b0010: check_condition = EFLAGS[0];           // JB/JC/JNAE (CF=1)
-        4'b0011: check_condition = !EFLAGS[0];          // JNB/JNC/JAE (CF=0)
-        4'b0100: check_condition = EFLAGS[6];           // JE/JZ (ZF=1)
-        4'b0101: check_condition = !EFLAGS[6];          // JNE/JNZ (ZF=0)
-        4'b0110: check_condition = EFLAGS[0] | EFLAGS[6]; // JBE/JNA (CF=1 or ZF=1)
-        4'b0111: check_condition = !EFLAGS[0] & !EFLAGS[6]; // JNBE/JA (CF=0 and ZF=0)
-        4'b1000: check_condition = EFLAGS[7];           // JS (SF=1)
-        4'b1001: check_condition = !EFLAGS[7];          // JNS (SF=0)
-        4'b1010: check_condition = EFLAGS[2];           // JP/JPE (PF=1)
-        4'b1011: check_condition = !EFLAGS[2];          // JNP/JPO (PF=0)
-        4'b1100: check_condition = EFLAGS[7] != EFLAGS[11]; // JL/JNGE (SF!=OF)
-        4'b1101: check_condition = EFLAGS[7] == EFLAGS[11]; // JNL/JGE (SF=OF)
-        4'b1110: check_condition = EFLAGS[6] | (EFLAGS[7] != EFLAGS[11]); // JLE/JNG (ZF=1 or SF!=OF)
-        4'b1111: check_condition = !EFLAGS[6] & (EFLAGS[7] == EFLAGS[11]); // JNLE/JG (ZF=0 and SF=OF)
+        4'b0000: check_condition = f[11];          // JO (OF=1)
+        4'b0001: check_condition = !f[11];         // JNO (OF=0)
+        4'b0010: check_condition = f[0];           // JB/JC/JNAE (CF=1)
+        4'b0011: check_condition = !f[0];          // JNB/JNC/JAE (CF=0)
+        4'b0100: check_condition = f[6];           // JE/JZ (ZF=1)
+        4'b0101: check_condition = !f[6];          // JNE/JNZ (ZF=0)
+        4'b0110: check_condition = f[0] | f[6];    // JBE/JNA (CF=1 or ZF=1)
+        4'b0111: check_condition = !f[0] & !f[6];  // JNBE/JA (CF=0 and ZF=0)
+        4'b1000: check_condition = f[7];           // JS (SF=1)
+        4'b1001: check_condition = !f[7];          // JNS (SF=0)
+        4'b1010: check_condition = f[2];           // JP/JPE (PF=1)
+        4'b1011: check_condition = !f[2];          // JNP/JPO (PF=0)
+        4'b1100: check_condition = f[7] != f[11];  // JL/JNGE (SF!=OF)
+        4'b1101: check_condition = f[7] == f[11];  // JNL/JGE (SF=OF)
+        4'b1110: check_condition = f[6] | (f[7] != f[11]);   // JLE/JNG (ZF=1 or SF!=OF)
+        4'b1111: check_condition = !f[6] & (f[7] == f[11]);  // JNLE/JG (ZF=0 and SF=OF)
     endcase
 endfunction
 
@@ -2696,7 +3613,7 @@ always_ff @(posedge clk) begin
                 ind_linear_valid <= 1'b1;
             end else if (i_bus.has_modrm) begin
                 IND <= ea_early;
-                ind_linear <= reloc(ea_early);
+                ind_linear <= pop_ind_linear;  // fused CSA+ternary (== reloc(ea_early))
                 ind_linear_valid <= 1'b1;
             end
         end
@@ -2802,13 +3719,7 @@ always_ff @(posedge clk) begin
     end
 end
 
-//=============================================================================
 // Multiplier and division
-//=============================================================================
-// DSP-based multiplication using four 16x16 multipliers
-// Computes 32x32->64 bit in 4 cycles instead of 32 cycles (shift-and-add)
-// For 8/16-bit operands, completes in 1 cycle
-
 reg [31:0] DIVTMP;
 reg [31:0] MULTMP;
 reg [31:0] RESULT;
@@ -2821,12 +3732,9 @@ wire [63:0] mul_acc;             // DSP multiplier result
 wire [31:0] mul_upper = op_size == 2'b00 ? {24'h0, mul_acc[39:32]} :
                         op_size == 2'b01 ? {16'h0, mul_acc[47:32]} :
                         mul_acc[63:32];
-logic [31:0] div7_q_next;
-logic [31:0] div7_r_next;
-logic        div7_r_nonneg_next;
-logic [31:0] prediv_q_next;
-logic [31:0] prediv_r_next;
-logic        prediv_r_nonneg_next;
+logic [31:0] div_iter_q_next;
+logic [31:0] div_iter_r_next;
+logic        div_iter_r_nonneg_next;
 logic [31:0] div_divisor_masked;
 logic [31:0] div_divisor_abs;
 logic        div_dividend_neg;
@@ -2885,11 +3793,11 @@ always_comb begin
 
     div_dividend_neg = div_get_sign_bit(SIGMA, op_size);
     div_divisor_neg = div_get_sign_bit(TMPB, op_size);
-    div_divisor_masked = div_mask_to_size(TMPB, op_size);
-    div_divisor_abs = div_divisor_neg ? div_negate_to_size(TMPB, op_size) : div_divisor_masked;
+    div_divisor_masked = div_op_by_size(DIV_OP_MASK, TMPB, op_size);
+    div_divisor_abs = div_divisor_neg ? div_op_by_size(DIV_OP_NEGATE, TMPB, op_size) : div_divisor_masked;
 
-    prediv_q_in = div_mask_to_size(DIVTMP, op_size);
-    prediv_r_in = div_mask_to_size(SIGMA, op_size);
+    prediv_q_in = div_op_by_size(DIV_OP_MASK, DIVTMP, op_size);
+    prediv_r_in = div_op_by_size(DIV_OP_MASK, SIGMA, op_size);
 
     case (op_size)
         2'd0: begin
@@ -2916,12 +3824,19 @@ always_comb begin
     endcase
 end
 
-// DIV7 and PREDIV iterations (one step)
+// DIV7 and PREDIV are mutually exclusive microcode operations.  Select their
+// inputs before the shared non-restoring iteration instead of synthesizing two
+// 35-bit iteration datapaths.
+wire div_iter_prediv = (uc_aluop == ALUJMP_PREDIV);
+wire [31:0] div_iter_q_in = div_iter_prediv ? prediv_q_in : DIVTMP;
+wire [31:0] div_iter_r_in = div_iter_prediv ? prediv_r_in : SIGMA;
+wire [31:0] div_iter_d_in = div_iter_prediv ? div_divisor_abs : div_divisor_masked;
+wire        div_iter_r_nonneg_in = div_iter_prediv ? 1'b1 : div_r_nonneg;
+
 always_comb begin
-    div7_calc(DIVTMP, SIGMA, div_divisor_masked, div_r_nonneg, op_size,
-              div7_q_next, div7_r_next, div7_r_nonneg_next);
-    div7_calc(prediv_q_in, prediv_r_in, div_divisor_abs, 1'b1, op_size,
-              prediv_q_next, prediv_r_next, prediv_r_nonneg_next);
+    div7_calc(div_iter_q_in, div_iter_r_in, div_iter_d_in,
+              div_iter_r_nonneg_in, op_size,
+              div_iter_q_next, div_iter_r_next, div_iter_r_nonneg_next);
 end
 
 always_ff @(posedge clk) begin
@@ -2930,17 +3845,17 @@ always_ff @(posedge clk) begin
                   op_size == 2'b01 ? mul_acc[31:16] :
                   mul_acc[31:0];
     end else if (uc_exec_result && uc_aluop == ALUJMP_DIV7) begin
-        RESULT <= div7_q_next;
+        RESULT <= div_iter_q_next;
     end else if (uc_exec_result && uc_aluop == ALUJMP_PREDIV) begin
-        RESULT <= prediv_q_next;
+        RESULT <= div_iter_q_next;
     end else if (uc_exec_result && uc_dest == DEST_MDTMP4) begin
         RESULT <= dest_value;
     end
 end
 
-//=============================================================================
+//
 // ALU
-//=============================================================================
+//
 wire [31:0] alu_flags;
 wire        alu_zsp_update;
 
@@ -3004,139 +3919,18 @@ alu u_alu (
     .src(alu_src),
     .dst(alu_dst),
     .op_size(op_size),
-    .flags(EFLAGS),
+    // eflags_fwd, not EFLAGS: under a FAST chain the ALU word runs
+    .flags(eflags_fwd),
     .update_carry(alu_update_carry),
     .result(alu_result),
     .flags_out(alu_flags),
+    .zsp_ahead(alu_zsp_ahead),
     .zsp_update(alu_zsp_update)
 );
 
-//=============================================================================
-// Two-cycle ALU flag retirement
-//=============================================================================
-// Flags are timing critical in x86, so pipelining them over two cycles.
-// Cycle 1: registers the raw result and the cheap carry-chain flags (CF/AF/OF)
-// Cycle 2: derives ZF/SF/PF and commits to EFLAGS and uc_flags
-reg        flag2_eflags_p;     // commit to EFLAGS this cycle (producer had uc[37])
-reg        flag2_ucflags_p;    // commit to uc_flags this cycle
-reg [31:0] flag2_result_r;     // raw ALU result of the producer
-reg        flag2_cf_r, flag2_af_r, flag2_of_r, flag2_zsp_r;
-reg [1:0]  flag2_size_r;
-wire flag2_class_uc = (uc_aluop == ALUJMP_ALU)    || (uc_aluop == ALUJMP_INCDEC) ||
-                      (uc_aluop == ALUJMP_CMPTST) || (uc_aluop == ALUJMP_AND)    ||
-                      (uc_aluop == ALUJMP_OR)     || (uc_aluop == ALUJMP_XOR)    ||
-                      (uc_aluop == ALUJMP_ADD)    || (uc_aluop == ALUJMP_ADC)    ||
-                      (uc_aluop == ALUJMP_SUB)    || (uc_aluop == ALUJMP_CMP)    ||
-                      (uc_aluop == ALUJMP_AAAAAS) || (uc_aluop == ALUJMP_DAADAS);
-always_ff @(posedge clk) begin
-    if (!reset_n) begin
-        flag2_eflags_p  <= 1'b0;
-        flag2_ucflags_p <= 1'b0;
-    end else begin
-        flag2_eflags_p  <= uc_exec && alu_update_flags;
-        flag2_ucflags_p <= uc_exec && flag2_class_uc;
-        if (uc_exec && flag2_class_uc) begin
-            flag2_result_r <= alu_result;
-            flag2_cf_r     <= alu_flags[0];
-            flag2_af_r     <= alu_flags[4];
-            flag2_of_r     <= alu_flags[11];
-            flag2_zsp_r    <= alu_zsp_update;
-            flag2_size_r   <= op_size;
-        end
-    end
-end
-wire flag2_zf = (flag2_size_r == 2'd0) ? (flag2_result_r[7:0]  == 8'h0)  :
-                (flag2_size_r == 2'd1) ? (flag2_result_r[15:0] == 16'h0) :
-                                         (flag2_result_r       == 32'h0);
-wire flag2_sf = (flag2_size_r == 2'd0) ? flag2_result_r[7]  :
-                (flag2_size_r == 2'd1) ? flag2_result_r[15] :
-                                         flag2_result_r[31];
-wire flag2_pf = ~^flag2_result_r[7:0];
-
-//=============================================================================
-// Two-cycle shifter flag retirement
-//=============================================================================
-// SHIFT2 registers the final CF/OF/ZF/SF/PF values here, the EFLAGS/uc_flags 
-// commit applies them next cycle.
-reg sh2_commit_p, sh2_we_zsp, sh2_we_of;
-reg sh2_cf, sh2_of, sh2_zf, sh2_sf, sh2_pf;
-always_ff @(posedge clk) begin
-    if (!reset_n)
-        sh2_commit_p <= 1'b0;
-    else begin
-        sh2_commit_p <= uc_exec && (uc_aluop == ALUJMP_SHIFT2) && (shift_size != 5'd0);
-        if (uc_exec && (uc_aluop == ALUJMP_SHIFT2) && (shift_size != 5'd0)) begin
-            sh2_we_zsp <= shift_SET_Nzs;
-            sh2_pf <= shift_pf;
-            sh2_zf <= shift_zf;
-            sh2_sf <= shift_sf;
-            sh2_we_of <= 1'b0;
-            if (instr_is_shxd) begin
-                sh2_cf <= i.opcode[3] ? shift_last_out_lsb : shift_last_out_msb;
-                if (shift_size == 5'd1) begin
-                    sh2_we_of <= 1'b1;
-                    sh2_of <= i.opcode[3] ? (shift_result[width-1] ^ shift_result[width-2]) :
-                                            (shift_result[width-1] ^ shift_last_out_msb);
-                end
-            end else begin
-                case (shift_op)
-                    SHL,SAL: sh2_cf <= shift_overflow ? (shift_eq_width ? shift_eq_cf : 1'b0) : shift_last_out_msb;
-                    RCL:     sh2_cf <= shift_last_out_msb;
-                    SHR:     sh2_cf <= shift_overflow ? (shift_eq_width ? shift_eq_cf : 1'b0) : shift_last_out_lsb;
-                    SAR:     sh2_cf <= shift_overflow ? shift_result[width-1] : shift_last_out_lsb;
-                    RCR:     sh2_cf <= shift_last_out_lsb;
-                    ROL:     sh2_cf <= shift_result[0];
-                    ROR:     sh2_cf <= shift_result[width-1];
-                endcase
-                if (shift_size == 5'd1) begin
-                    case (shift_op)
-                        SHL:     begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_last_out_msb; end
-                        SHR:     begin sh2_we_of <= 1'b1; sh2_of <= shift_lo[width-1]; end
-                        SAR:     begin sh2_we_of <= 1'b1; sh2_of <= 1'b0; end
-                        ROR,RCR: begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_result[width-2]; end
-                        default: ;
-                    endcase
-                end
-                // ROL/RCL: OF computed for ALL counts (real 386 behavior)
-                if (shift_op == ROL) begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_result[0]; end
-                if (shift_op == RCL) begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_last_out_msb; end
-            end
-        end
-    end
-end
-
-// EFLAGS as it will be after this cycle's pending two-cycle flag commit
-wire [31:0] eflags_fwd =
-    sh2_commit_p ? { EFLAGS[31:12],
-                     sh2_we_of  ? sh2_of : EFLAGS[11],
-                     EFLAGS[10:8],
-                     sh2_we_zsp ? sh2_sf : EFLAGS[7],
-                     sh2_we_zsp ? sh2_zf : EFLAGS[6],
-                     EFLAGS[5:3],
-                     sh2_we_zsp ? sh2_pf : EFLAGS[2],
-                     EFLAGS[1],
-                     sh2_cf } :
-    flag2_eflags_p ? { EFLAGS[31:12],
-                       flag2_of_r,
-                       EFLAGS[10:8],
-                       flag2_zsp_r ? flag2_sf : EFLAGS[7],
-                       flag2_zsp_r ? flag2_zf : EFLAGS[6],
-                       EFLAGS[5],
-                       flag2_af_r,
-                       EFLAGS[3],
-                       flag2_zsp_r ? flag2_pf : EFLAGS[2],
-                       EFLAGS[1],
-                       flag2_cf_r } :
-    EFLAGS;
-
-//=============================================================================
+//
 // Barrel Shifter Unit
-//=============================================================================
-// Two-pass shift mechanism as used by the original 386 microcode:
-//   First pass (0x02 <<>>?): capture count
-//   Second pass (0x12 >><<?): execute shift/rotate
-//   Execute mode (0x10 SHIFT): use stored count with current inputs
-
+//
 logic        shift_swap;
 logic [5:0]  shift_count;    // 64-bit shift count (6 bits: needs to hold value 32 for LDBSLU with count=0)
 logic [4:0]  shift_size;     // original shift amount
@@ -3148,21 +3942,33 @@ logic        shift_eq_cf;    // saved CF for count==width case
 logic [31:0] shift_src_value;
 logic [31:0] shift_alu_value;
 always_comb begin
-    case (uc_source_shift)
-        SRC_SIGMA:   shift_src_value = SIGMA;
-        SRC_DSTREG:  shift_src_value = read_gpr(i_reg_dst_reg_sel, srcreg_size);
-        SRC_SRCREG:  shift_src_value = read_gpr(i_reg_src_reg_sel, op_size);
-        SRC_IMM:     shift_src_value = i_reg_immediate;
-        SRC_TMPB:    shift_src_value = TMPB;
-        SRC_TMPC:    shift_src_value = TMPC;
-        SRC_TMPD:    shift_src_value = TMPD;
-        SRC_TMPE:    shift_src_value = TMPE;
-        SRC_OPR_R:   shift_src_value = OPR_R;
-        SRC_COUNTR:  shift_src_value = COUNTR;
-        SRC_ZERO:    shift_src_value = 32'd0;
-        SRC_NEG1:    shift_src_value = 32'hFFFF_FFFF;
-        default:     shift_src_value = 32'd0;
-    endcase
+    if (uc_aluop_shift == ALUJMP_SHIFT2) begin
+        // The immutable ROM uses only these four sources for SHIFT2. Keeping
+        // this timing-critical path separate avoids the general shift mux.
+        case ({uc_source_shift[1], uc_source_shift[5:4]})
+            3'b000:  shift_src_value = TMPC;  // SRC_TMPC
+            3'b100:  shift_src_value = TMPE;  // SRC_TMPE
+            3'b101:  shift_src_value = SIGMA; // SRC_SIGMA
+            3'b111:  shift_src_value = read_gpr(i_reg_src_reg_sel, op_size); // SRC_SRCREG
+            default: shift_src_value = 32'd0;
+        endcase
+    end else begin
+        case (uc_source_shift)
+            SRC_SIGMA:   shift_src_value = SIGMA;
+            SRC_DSTREG:  shift_src_value = read_gpr(i_reg_dst_reg_sel, srcreg_size);
+            SRC_SRCREG:  shift_src_value = read_gpr(i_reg_src_reg_sel, op_size);
+            SRC_IMM:     shift_src_value = i_reg_immediate;
+            SRC_TMPB:    shift_src_value = TMPB;
+            SRC_TMPC:    shift_src_value = TMPC;
+            SRC_TMPD:    shift_src_value = TMPD;
+            SRC_TMPE:    shift_src_value = TMPE;
+            SRC_OPR_R:   shift_src_value = OPR_R;
+            SRC_COUNTR:  shift_src_value = COUNTR;
+            SRC_ZERO:    shift_src_value = 32'd0;
+            SRC_NEG1:    shift_src_value = 32'hFFFF_FFFF;
+            default:     shift_src_value = 32'd0;
+        endcase
+    end
 end
 
 always_comb begin
@@ -3410,7 +4216,6 @@ function automatic [31:0] read_protun_source_fast(input [5:0] src_field);
         SRC_TMPH:    read_protun_source_fast = TMPH;
         SRC_TMP_TR:  read_protun_source_fast = SLCTR;
         SRC_COUNTR,
-        SRC_COUNTR2: read_protun_source_fast = COUNTR;
         SRC_PROTUN:  read_protun_source_fast = PROTUN;
         SRC_SIGMA:   read_protun_source_fast = SIGMA;
         SRC_CS:      read_protun_source_fast = {16'h0, CS};
@@ -3450,6 +4255,7 @@ function automatic [31:0] read_uc_alu_source(input [5:0] src_field);
         ALUSRC_TMPB: read_uc_alu_source = TMPB;
         ALUSRC_TMPC: read_uc_alu_source = TMPC;
         ALUSRC_TMPD: read_uc_alu_source = TMPD;
+        ALUSRC_OPR_R: read_uc_alu_source = OPR_R;  // z386x F-ALUM fold (patched 029/02E)
         ALUSRC_TMPG: read_uc_alu_source = TMPG;  // Used by far CALL/JMP
         ALUSRC_TMPH: read_uc_alu_source = SLCTR;  // ALU source 0x13 = SLCTR2 = SLCTR
         ALUSRC_PROTUN: read_uc_alu_source = PROTUN;
@@ -3512,7 +4318,6 @@ function automatic [31:0] read_uc_source(input [5:0] src_field);
         SRC_EAX: read_uc_source = EAX;
         SRC_ECX: read_uc_source = ECX;
         SRC_EDX: read_uc_source = EDX;
-        SRC_EBX: read_uc_source = EBX;
         SRC_ESP: read_uc_source = ESP;  // Always full 32-bit; truncation at dest (eSP) or segmentation unit
         SRC_EBP: read_uc_source = EBP;
         SRC_ESI: read_uc_source = ESI;
@@ -3549,26 +4354,16 @@ function automatic [31:0] read_uc_source(input [5:0] src_field);
         SRC_GS: read_uc_source = GS;
         SRC_LDTR: read_uc_source = {16'h0, LDTR};
         SRC_TR: read_uc_source = {16'h0, TR};
-        // SRC_SLCTR (0x35) is used ONLY by the DESSDT descriptor-address micro-ops,
-        // so it reads the selector as a table byte-offset: index*8 = SLCTR & 0xFFF8
-        // (TI bit [2] and RPL bits [1:0] cleared).  The TI bit is applied separately
-        // by the seg unit (seg_base_for(SEG_GDT) keyed on the raw SLCTR[2]).  Full
-        // selector reads use SLCTR2 (0x13) instead.  Do NOT reuse 0x35 for a raw read.
+        // SRC_SLCTR (0x35) is used ONLY by DESSDT
         SRC_SLCTR: read_uc_source = {16'h0, SLCTR[15:3], 3'b000};
-        SRC_eAX_AL: // Size-aware accumulator for string ops (STOS/LODS/SCAS)
-            read_uc_source = op_size_src == 2'd0 ? {24'h0, EAX[7:0]} :   // AL
-                             op_size_src == 2'd1 ? {16'h0, EAX[15:0]} :  // AX
-                                                       EAX;               // EAX
-        SRC_eDX_AH: // Size-aware upper dividend/accumulator for DIV/MUL/CWD/CDQ
-            read_uc_source = op_size_src == 2'd0 ? {24'h0, EAX[15:8]} :   // AH
-                             op_size_src == 2'd1 ? {16'h0, EDX[15:0]} :   // DX
-                                                       EDX;                // EDX
+        SRC_eAX_AL: read_uc_source = read_gpr(3'd0, op_size_src);
+        SRC_eDX_AH: read_uc_source = read_gpr(
+            op_size_src == 2'd0 ? 3'd4 : 3'd2, op_size_src);
         SRC_OPR_R: read_uc_source = OPR_R;
         SRC_IRF2: read_uc_source = IND;          // IRF2 is IND
         SRC_EA: read_uc_source = ea_reg;         // i_pop EA; valid all instruction (next pop is in the RNI delay slot, after all SRC_EA reads)
 
-        SRC_eCX: read_uc_source = ECX; // i.addr32 ? ECX : {16'h0, ECX[15:0]};  // Address-size-aware for LOOP/REP
-        SRC_COUNTR2: read_uc_source = COUNTR;
+        SRC_eCX: read_uc_source = ECX; // i.addr32 ? ECX : {16'h0, ECX[15:0]}; Address-size-aware for LOOP/REP
         SRC_IRF: begin  // Indirect Register File read (PUSHA/PUSHAD)
             // COUNTR indexes: 7=EDI, 6=ESI, 5=EBP, 4=ESP, 3=EBX, 2=EDX, 1=ECX, 0=EAX
             // Uses is_dword_src so BITS16/BITS32 affects register width without
@@ -3605,34 +4400,34 @@ endfunction
 function automatic [4:0] map_alu_op(input [6:0] uc_op);
 begin
     casez (uc_op)
-        ALUJMP_ALU:    map_alu_op = alu_grp_op;  // Pre-decoded at i_pop from opcode/modrm
-        ALUJMP_INCDEC: map_alu_op = i.opcode[7] ? {3'b110, alu_grp_op[1:0]}    // F6/F7/FE/FF: INC/DEC/NOT/NEG
+        ALUJMP_ALU:    map_alu_op = alu_grp_op; // Pre-decoded at i_pop from opcode/modrm
+        ALUJMP_INCDEC: map_alu_op = i.opcode[7] ? {3'b110, alu_grp_op[1:0]}     // F6/F7/FE/FF: INC/DEC/NOT/NEG
                                                  : {4'b1100, alu_grp_op[0]};    // 40-4F: INC/DEC
-        ALUJMP_SHIFT1: map_alu_op = ALU_PASS;  // <<>>? First pass - PASS Source to SIGMA
+        ALUJMP_SHIFT1: map_alu_op = ALU_PASS;   // <<>>? First pass - PASS Source to SIGMA
         ALUJMP_CMPTST: map_alu_op = instr_is_cmp ? ALU_CMP : ALU_AND;
         ALUJMP_SZ_EXT: map_alu_op = instr_szext_op;  // Pre-decoded at i_pop
         ALUJMP_AND: map_alu_op = ALU_AND;
         ALUJMP_OR:  map_alu_op = ALU_OR;
         ALUJMP_XOR: map_alu_op = ALU_XOR;
-        ALUJMP_SIGN: map_alu_op = ALU_SIGN;                    // Sign extension
+        ALUJMP_SIGN: map_alu_op = ALU_SIGN;     // Sign extension
         ALUJMP_ADD: map_alu_op = ALU_ADD;
         ALUJMP_ADC: map_alu_op = ALU_ADC;
         ALUJMP_SUB: map_alu_op = ALU_SUBT;
         ALUJMP_CMP: map_alu_op = ALU_CMP;
-        ALUJMP_SHIFT:  map_alu_op = ALU_PASS;  // Shifter handles this
-        ALUJMP_SHIFT2: map_alu_op = ALU_PASS;  // >><<? acts as PASS for shift result
-        ALUJMP_PASS2:  map_alu_op = ALU_PASS2; // Returns ABCDEF (alu_src)
+        ALUJMP_SHIFT:  map_alu_op = ALU_PASS;   // Shifter handles this
+        ALUJMP_SHIFT2: map_alu_op = ALU_PASS;   // >><<? acts as PASS for shift result
+        ALUJMP_PASS2:  map_alu_op = ALU_PASS2;  // Returns ABCDEF (alu_src)
         ALUJMP_AAAAAS: map_alu_op = i.opcode[3] ? ALU_AAS : ALU_AAA;
-        ALUJMP_BITS16: map_alu_op = ALU_PASS;  // SIGMA update skipped
+        ALUJMP_BITS16: map_alu_op = ALU_PASS;   // SIGMA update skipped
         ALUJMP_DAADAS: map_alu_op = i.opcode[3] ? ALU_DAS : ALU_DAA;
         ALUJMP_PASS, ALUJMP_JMP, ALUJMP_NOPMOVE: map_alu_op = ALU_PASS;
-        ALUJMP_SERECO: begin  // Set/Reset/Complement for BT/BTS/BTR/BTC
+        ALUJMP_SERECO: begin                    // Set/Reset/Complement for BT/BTS/BTR/BTC
             // instr_bt_sel pre-decoded at i_pop: register forms use opcode[4:3], immediate (BA) uses modrm[4:3]
             case (instr_bt_sel)
-                2'b00: map_alu_op = ALU_PASS;  // BT: just pass through (test only)
-                2'b01: map_alu_op = ALU_OR;    // BTS: set bits (dst | src)
-                2'b10: map_alu_op = ALU_ANDN;  // BTR: reset bits (dst & ~src)
-                2'b11: map_alu_op = ALU_XOR;   // BTC: complement bits (dst ^ src)
+                2'b00: map_alu_op = ALU_PASS;   // BT: just pass through (test only)
+                2'b01: map_alu_op = ALU_OR;     // BTS: set bits (dst | src)
+                2'b10: map_alu_op = ALU_ANDN;   // BTR: reset bits (dst & ~src)
+                2'b11: map_alu_op = ALU_XOR;    // BTC: complement bits (dst ^ src)
             endcase
         end
         default: map_alu_op = ALU_PASS;
@@ -3648,19 +4443,18 @@ function automatic logic div_get_sign_bit(input [31:0] val, input [1:0] sz);
     endcase
 endfunction
 
-function automatic logic [31:0] div_mask_to_size(input [31:0] val, input [1:0] sz);
+function automatic logic [31:0] div_op_by_size(
+    input logic op,
+    input logic [31:0] val,
+    input logic [1:0] sz
+);
     case (sz)
-        2'd0: return {24'h0, val[7:0]};
-        2'd1: return {16'h0, val[15:0]};
-        default: return val;
-    endcase
-endfunction
-
-function automatic logic [31:0] div_negate_to_size(input [31:0] val, input [1:0] sz);
-    case (sz)
-        2'd0: return {24'h0, (~val[7:0]) + 8'h1};
-        2'd1: return {16'h0, (~val[15:0]) + 16'h1};
-        default: return (~val) + 32'h1;
+        2'd0: div_op_by_size = op == DIV_OP_NEGATE ?
+            {24'h0, (~val[7:0]) + 8'h1} : {24'h0, val[7:0]};
+        2'd1: div_op_by_size = op == DIV_OP_NEGATE ?
+            {16'h0, (~val[15:0]) + 16'h1} : {16'h0, val[15:0]};
+        default: div_op_by_size = op == DIV_OP_NEGATE ?
+            (~val) + 32'h1 : val;
     endcase
 endfunction
 
@@ -3694,9 +4488,9 @@ task automatic div7_calc(
         default: width = 32;
     endcase
 
-    q = div_mask_to_size(q_in, op_size_in);
-    r = div_mask_to_size(r_in, op_size_in);
-    d = div_mask_to_size(d_in, op_size_in);
+    q = div_op_by_size(DIV_OP_MASK, q_in, op_size_in);
+    r = div_op_by_size(DIV_OP_MASK, r_in, op_size_in);
+    d = div_op_by_size(DIV_OP_MASK, d_in, op_size_in);
     q_msb = q[width - 1];
 
     width_mask = (35'd1 << width) - 35'd1;
@@ -3716,84 +4510,10 @@ task automatic div7_calc(
     q_next = q << 1;
     q_next[0] = r_nonneg;
 
-    q_out = div_mask_to_size(q_next, op_size_in);
-    r_out = div_mask_to_size(r_next_full[31:0], op_size_in);
+    q_out = div_op_by_size(DIV_OP_MASK, q_next, op_size_in);
+    r_out = div_op_by_size(DIV_OP_MASK, r_next_full[31:0], op_size_in);
     r_nonneg_out = r_nonneg;
 endtask
-
-
-// EA predecode: cecode which base register is used in 32-bit addressing (returns one-hot)
-function automatic [7:0] decode_base_register_32(input [7:0] modrm_byte, input [7:0] sib_byte, input has_sib);
-    reg [1:0] mod;
-    reg [2:0] rm;
-
-    mod = modrm_byte[7:6];
-    rm = modrm_byte[2:0];
-
-    if (has_sib && rm == 3'b100) begin
-        // SIB byte addressing - decode base from i.sib[2:0]
-        case (sib_byte[2:0])
-            3'b000: decode_base_register_32 = 8'b0000_0001;  // EAX
-            3'b001: decode_base_register_32 = 8'b0000_0010;  // ECX
-            3'b010: decode_base_register_32 = 8'b0000_0100;  // EDX
-            3'b011: decode_base_register_32 = 8'b0000_1000;  // EBX
-            3'b100: decode_base_register_32 = 8'b0001_0000;  // ESP
-            3'b101: decode_base_register_32 = (mod == 2'b00) ? 8'b0000_0000 : 8'b0010_0000;  // None or EBP
-            3'b110: decode_base_register_32 = 8'b0100_0000;  // ESI
-            3'b111: decode_base_register_32 = 8'b1000_0000;  // EDI
-        endcase
-    end else begin
-        // Non-SIB addressing - decode base from rm
-        case (rm)
-            3'b000: decode_base_register_32 = 8'b0000_0001;  // EAX
-            3'b001: decode_base_register_32 = 8'b0000_0010;  // ECX
-            3'b010: decode_base_register_32 = 8'b0000_0100;  // EDX
-            3'b011: decode_base_register_32 = 8'b0000_1000;  // EBX
-            3'b100: decode_base_register_32 = 8'b0001_0000;  // ESP
-            3'b101: decode_base_register_32 = (mod == 2'b00) ? 8'b0000_0000 : 8'b0010_0000;  // None or EBP
-            3'b110: decode_base_register_32 = 8'b0100_0000;  // ESI
-            3'b111: decode_base_register_32 = 8'b1000_0000;  // EDI
-        endcase
-    end
-endfunction
-
-// Decode which index register is used in 32-bit SIB addressing (returns one-hot)
-function automatic [7:0] decode_index_register_32(input [7:0] sib_byte, input has_sib);
-    if (!has_sib) begin
-        decode_index_register_32 = 8'b0000_0000;  // No index
-    end else begin
-        case (sib_byte[5:3])
-            3'b000: decode_index_register_32 = 8'b0000_0001;  // EAX
-            3'b001: decode_index_register_32 = 8'b0000_0010;  // ECX
-            3'b010: decode_index_register_32 = 8'b0000_0100;  // EDX
-            3'b011: decode_index_register_32 = 8'b0000_1000;  // EBX
-            3'b100: decode_index_register_32 = 8'b0000_0000;  // No index
-            3'b101: decode_index_register_32 = 8'b0010_0000;  // EBP
-            3'b110: decode_index_register_32 = 8'b0100_0000;  // ESI
-            3'b111: decode_index_register_32 = 8'b1000_0000;  // EDI
-        endcase
-    end
-endfunction
-
-// Decode base registers for 16-bit addressing mode (returns 2 one-hot: [15:8]=second reg, [7:0]=first reg)
-function automatic [15:0] decode_base_register_16(input [7:0] modrm_byte);
-    reg [1:0] mod;
-    reg [2:0] rm;
-
-    mod = modrm_byte[7:6];
-    rm = modrm_byte[2:0];
-
-    case (rm)
-        3'b000: decode_base_register_16 = {8'b0100_0000, 8'b0000_1000};  // BX + SI
-        3'b001: decode_base_register_16 = {8'b1000_0000, 8'b0000_1000};  // BX + DI
-        3'b010: decode_base_register_16 = {8'b0100_0000, 8'b0010_0000};  // BP + SI
-        3'b011: decode_base_register_16 = {8'b1000_0000, 8'b0010_0000};  // BP + DI
-        3'b100: decode_base_register_16 = {8'b0000_0000, 8'b0100_0000};  // SI only
-        3'b101: decode_base_register_16 = {8'b0000_0000, 8'b1000_0000};  // DI only
-        3'b110: decode_base_register_16 = (mod == 2'b00) ? 16'h0000 : {8'b0000_0000, 8'b0010_0000};  // None or BP
-        3'b111: decode_base_register_16 = {8'b0000_0000, 8'b0000_1000};  // BX only
-    endcase
-endfunction
 
 // One-hot GPR mux: select register value from one-hot encoded selector
 function automatic [31:0] onehot_gpr_mux(input [7:0] sel);
@@ -3810,63 +4530,73 @@ function automatic [31:0] onehot_gpr_mux(input [7:0] sel);
     endcase
 endfunction
 
-// One-hot GPR read with delay-slot write bypass for the early EA.  When the
-// in-flight delay-slot uop writes the selected GPR, overlay dest_value per the
-// write width (dly_gpr_*), reproducing the value that lands at i_first.
-function automatic [31:0] fwd_onehot_gpr(input [7:0] onehot);
-    reg [31:0] cur;
-    reg [2:0]  idx;
-    cur = onehot_gpr_mux(onehot);
-    idx = onehot[1] ? 3'd1 : onehot[2] ? 3'd2 : onehot[3] ? 3'd3 :
-          onehot[4] ? 3'd4 : onehot[5] ? 3'd5 : onehot[6] ? 3'd6 :
-          onehot[7] ? 3'd7 : 3'd0;
-    if (dly_gpr_we && (onehot != 8'h00) && (dly_gpr_sel == idx))
-        case (dly_gpr_mode)
-            FWD_BLO: fwd_onehot_gpr = {cur[31:8],  dest_value[7:0]};
-            FWD_BHI: fwd_onehot_gpr = {cur[31:16], dest_value[7:0], cur[7:0]};
-            FWD_W:   fwd_onehot_gpr = {cur[31:16], dest_value[15:0]};
-            default: fwd_onehot_gpr = dest_value;  // FWD_D
+// Indexed GPR read with delay-slot write bypass for the early EA. The retained
+// one-hot selectors are used by hazard logic, not decoded again on this path.
+function automatic [31:0] fwd_ea_gpr(input sel_valid, input [2:0] idx);
+    reg [31:0] cur, ovl_data;
+    reg [1:0]  ovl_mode;
+    reg        hit_dly, hit_shc, ovl_we;
+    case (idx)
+        3'd0: cur = EAX;
+        3'd1: cur = ECX;
+        3'd2: cur = EDX;
+        3'd3: cur = EBX;
+        3'd4: cur = ESP;
+        3'd5: cur = EBP;
+        3'd6: cur = ESI;
+        default: cur = EDI;
+    endcase
+    if (!sel_valid)
+        cur = 32'h0;
+    hit_dly = dly_gpr_we && sel_valid && (dly_gpr_sel == idx);
+    hit_shc = fast_shc_pending && sel_valid &&
+              ((fast_shc_size != 2'd0 && fast_shc_dst == idx) ||
+               (fast_shc_size == 2'd0 && {1'b0, fast_shc_dst[1:0]} == idx));
+    ovl_we   = hit_dly || hit_shc;
+    // dly_fwd_value, not dest_value: the dedicated 19-leaf register mux
+    // (see its definition) keeps read_uc_source out of the EA adders.
+    ovl_data = hit_dly ? dly_fwd_value : fast_shc_data;
+    ovl_mode = hit_dly ? dly_gpr_mode :
+               (fast_shc_size == 2'd0) ? (fast_shc_dst[2] ? FWD_BHI : FWD_BLO) :
+               (fast_shc_size == 2'd1) ? FWD_W : FWD_D;
+    if (ovl_we)
+        case (ovl_mode)
+            FWD_BLO: fwd_ea_gpr = {cur[31:8],  ovl_data[7:0]};
+            FWD_BHI: fwd_ea_gpr = {cur[31:16], ovl_data[7:0], cur[7:0]};
+            FWD_W:   fwd_ea_gpr = {cur[31:16], ovl_data[15:0]};
+            default: fwd_ea_gpr = ovl_data;  // FWD_D
         endcase
     else
-        fwd_onehot_gpr = cur;
+        fwd_ea_gpr = cur;
 endfunction
 
-function automatic [31:0] calc_ea_core(
+// Operand prep shared by the i_pop offset and fused linear adders:
+// returns {base_val, scaled_val} after scale / scale_to_base resolution.
+function automatic [63:0] calc_ea_prep(
     input [31:0] base_in, input [31:0] index_in,
-    input [1:0] scale, input [31:0] disp, input is_16bit, input scale_to_base);
-
-    reg [31:0] base_val;
-    reg [31:0] index_val;
-    reg [31:0] scaled_val;
-
-    base_val = base_in;
-    index_val = index_in;
-
-    // Apply scale (to index normally, to base if scale_to_base)
-    if (scale_to_base) begin
-        case (scale)
-            2'b00: scaled_val = base_val;
-            2'b01: scaled_val = base_val << 1;
-            2'b10: scaled_val = base_val << 2;
-            2'b11: scaled_val = base_val << 3;
-        endcase
-        base_val = scaled_val;
-        scaled_val = 32'h0;  // Scale consumed into base_val; prevent double-count
-        index_val = 32'h0;   // Index is consumed by scale_to_base
-    end else begin
-        case (scale)
-            2'b00: scaled_val = index_val;
-            2'b01: scaled_val = index_val << 1;
-            2'b10: scaled_val = index_val << 2;
-            2'b11: scaled_val = index_val << 3;
-        endcase
+    input [1:0] scale, input scale_to_base);
+    reg [31:0] base_val, scaled_val;
+    begin
+        if (scale_to_base) begin
+            case (scale)
+                2'b00: base_val = base_in;
+                2'b01: base_val = base_in << 1;
+                2'b10: base_val = base_in << 2;
+                2'b11: base_val = base_in << 3;
+            endcase
+            scaled_val = 32'h0;   // Scale consumed into base; index consumed by s2b
+        end else begin
+            base_val = base_in;
+            case (scale)
+                2'b00: scaled_val = index_in;
+                2'b01: scaled_val = index_in << 1;
+                2'b10: scaled_val = index_in << 2;
+                2'b11: scaled_val = index_in << 3;
+            endcase
+        end
+        calc_ea_prep = {base_val, scaled_val};
     end
-
-    // This is timing-safe. Cyclone V ALM can do 3-input adder with a single level of logic.
-    // So we can take advantage of this and don't need the 386-style 2-cycle "complex EA" design.
-    calc_ea_core = base_val + scaled_val + disp;
-    if (is_16bit)
-        calc_ea_core = {16'h0, calc_ea_core[15:0]};
 endfunction
+
 
 endmodule

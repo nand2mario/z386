@@ -54,6 +54,7 @@ module tb_z386;
         .inta(inta),
         .snoop_addr(32'h0),
         .snoop_valid(1'b0),
+        .a20_enable(1'b1),
         .single_step(1'b1), // Halt after each instruction for single-step tests
         .dbg_CS(),
         .dbg_EIP(),
@@ -183,11 +184,6 @@ module tb_z386;
         desc.D_B        = flags[7];
         desc.G          = flags[6];
         desc.A          = flags[5];
-        desc.executable = flags[15];
-        desc.expand_down= ~flags[15] & flags[14];
-        desc.conforming = flags[15] & flags[14];
-        desc.writable   = ~flags[15] & flags[13];
-        desc.readable   = flags[15] & flags[13];
         return desc;
     endfunction
 
@@ -437,10 +433,10 @@ module tb_z386;
                          dut.uc_addr, dut.uc_aluop, dut.uc_source, dut.uc_alu_src,
                          dut.uc_dest, dut.uc_opcode, dut.uc_buscode, dut.alu_result, dut.SIGMA, dut.use_shifter_result);
             end
-            if ($test$plusargs("trace_decode") && dut.decoder_inst.decq_count != 0) begin
-                $display("DECODE opcode=%02x entry=%03x modrm=%02x has_modrm=%0d dec_state=%0d 0f=%0d rep=%0d",
+            if ($test$plusargs("trace_decode") && dut.decoder_inst.head_v) begin
+                $display("DECODE opcode=%02x entry=%03x modrm=%02x has_modrm=%0d skel_v=%0d 0f=%0d rep=%0d",
                          dut.i_bus.opcode, dut.i_bus.entry_point, dut.i_bus.modrm, dut.i_bus.has_modrm,
-                         dut.decoder_inst.dec_state,
+                         dut.decoder_inst.skel_v,
                          dut.i_bus.has_0f, dut.i_bus.has_rep);
             end
 
@@ -554,12 +550,7 @@ module tb_z386;
         end
     end
 
-    // Waveform dump
-    // initial begin
-    //     if ($test$plusargs("trace")) begin
-    //         $dumpfile("trace.vcd");
-    //         $dumpvars(0, tb_z386);
-    //     end
-    // end
+    // Waveform dump initial begin if ($test$plusargs("trace")) begin $dumpfile("trace.vcd"); $dumpvars(0, tb_z386); end end
+    // Details: doc/z386x/implementation_notes.md#src-24-z386x-tests-tb-z386-sv-553
 
 endmodule

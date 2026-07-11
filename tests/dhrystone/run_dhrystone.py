@@ -14,8 +14,8 @@ from pathlib import Path
 
 THIS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = THIS_DIR.parents[2]
-DEFAULT_Z386_01_DIR = REPO_ROOT / "z386_MiSTer/src/z386"
-DEFAULT_Z386_CURRENT_DIR = REPO_ROOT / "21.z386"
+DEFAULT_Z386_RELEASE_DIR = REPO_ROOT / "z386_MiSTer/src/z386"
+DEFAULT_Z386_CURRENT_DIR = THIS_DIR.parents[1]  # the core dir containing this tests/ tree (24.z386x)
 DEFAULT_Z386_CACHE = REPO_ROOT / "z386_MiSTer/src/memory/l1_cache.sv"
 BUILD_DIR = THIS_DIR / "build"
 BIN_FILE = BUILD_DIR / "dhrystone.bin"
@@ -171,6 +171,11 @@ def build_core(
         copy_ucode_files(core_dir, core_build_dir)
         return exe
 
+    if rebuild:
+        # Verilator's generated precompiled headers depend on the exact RTL
+        # source set and defines.  Reusing them across core revisions can make
+        # a forced comparison rebuild fail before the simulation starts.
+        shutil.rmtree(core_build_dir / "obj_dir", ignore_errors=True)
     core_build_dir.mkdir(parents=True, exist_ok=True)
     copy_ucode_files(core_dir, core_build_dir)
 
@@ -208,6 +213,8 @@ def build_core(
         if not cache_src.exists():
             raise FileNotFoundError(f"missing external L1 cache source: {cache_src}")
         sources.append(cache_src)
+    if label == "z386_release":
+        cmd.insert(cmd.index("--top-module"), "+define+Z386_LEGACY_SEG_DESC")
     cmd.extend(str(path) for path in sources)
     run_checked(cmd, cwd=core_build_dir, verbose=verbose)
     return exe
@@ -283,14 +290,14 @@ def print_results(iters: int, results: list[RunResult]) -> None:
         print(f"{result.core:<12} | {status:<7} | {cycles:>7} | {instructions:>7} | {cpi:>5}")
 
     by_core = {result.core: result for result in results}
-    if "z386_0_1" in by_core and "z386_current" in by_core:
-        z386_0_1 = by_core["z386_0_1"]
+    if "z386_release" in by_core and "z386_current" in by_core:
+        z386_release = by_core["z386_release"]
         z386_current = by_core["z386_current"]
-        if z386_0_1.cycles and z386_current.cycles:
+        if z386_release.cycles and z386_current.cycles:
             print()
             print(
-                "z386 current cycle speedup vs z386 0.1: "
-                f"{z386_0_1.cycles / z386_current.cycles:.3f}x"
+                "z386 current cycle speedup vs release: "
+                f"{z386_release.cycles / z386_current.cycles:.3f}x"
             )
 
 
@@ -304,15 +311,15 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=120, help="host timeout in seconds")
     parser.add_argument(
         "--core",
-        choices=("both", "z386_0_1", "z386_current"),
+        choices=("both", "z386_release", "z386_current"),
         default="both",
         help="core revision(s) to run",
     )
     parser.add_argument(
-        "--z386-0-1-dir",
+        "--z386-release-dir",
         type=Path,
-        default=DEFAULT_Z386_01_DIR,
-        help="z386 0.1 core source directory",
+        default=DEFAULT_Z386_RELEASE_DIR,
+        help="released z386 core source directory",
     )
     parser.add_argument(
         "--z386-current-dir",
@@ -343,9 +350,9 @@ def main() -> int:
         build_benchmark_binary(args.iters, verbose=args.verbose)
     build_memory_image()
 
-    cores = ["z386_0_1", "z386_current"] if args.core == "both" else [args.core]
+    cores = ["z386_release", "z386_current"] if args.core == "both" else [args.core]
     core_dirs = {
-        "z386_0_1": args.z386_0_1_dir,
+        "z386_release": args.z386_release_dir,
         "z386_current": args.z386_current_dir,
     }
 

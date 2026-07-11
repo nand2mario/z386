@@ -1,11 +1,5 @@
-//
-// TLB (Translation Lookaside Buffer) for 80386 Paging Unit
-// 32-entry 4-way set-associative cache with PLRU replacement per set
-//
-// 8 sets × 4 ways = 32 entries
-// Set index: VPN[2:0] (linear_addr[14:12])
-// Tag: VPN[19:3] (linear_addr[31:15]), 17 bits
-//
+// TLB (Translation Lookaside Buffer) for 80386 Paging Unit 32-entry 4-way set-associative cache with PLRU replacement per set 8 sets × 4...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-tlb-sv-1
 `timescale 1ns/1ns
 
 module paging_tlb
@@ -47,12 +41,8 @@ module paging_tlb
 // 8 sets × 4 ways
 tlb_entry_t tlb [7:0][3:0];
 
-// PLRU bits per set: 3 bits each for 4-way replacement
-//        [B0]           B0: 0=left subtree, 1=right subtree
-//       /    \
-//    [B1]    [B2]       B1: 0=way0, 1=way1
-//    /  \    /  \       B2: 0=way2, 1=way3
-//   W0  W1  W2  W3
+// PLRU bits per set: 3 bits each for 4-way replacement [B0] B0: 0=left subtree, 1=right subtree / \ [B1] [B2] B1: 0=way0, 1=way1 / \ / \...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-tlb-sv-50
 reg [2:0] plru [7:0];
 
 localparam bit TRACE_PAGING_EN = 1'b0;
@@ -74,13 +64,8 @@ wire [1:0] hit_way = hit0 ? 2'd0 :
                      hit2 ? 2'd2 :
                      hit3 ? 2'd3 : 2'd0;
 
-// Live demand lookup address decomposition.
-// linear_addr_live (z386 paging_live_linear) is a very high-fanout net: its set
-// bits drive the 8:1 set-mux of the 4-way register-array CAM (valid/vpn/pfn/perm
-// for every way), ~329 loads on bit 14.  It was the top setup path
-// (-> live_hit -> dcache_req_valid -> dcache_req_wdata_r).  Replicate it once per
-// way -- kept distinct so the fitter cannot CSE-merge the copies -- so each way's
-// CAM compare and physical/permission select sees its own lower-fanout copy.
+// Live demand lookup address decomposition. linear_addr_live (z386 paging_live_linear) is a very high-fanout net: its set bits drive the...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-tlb-sv-77
 (* keep *) wire [31:0] lal_w0 = linear_addr_live;
 (* keep *) wire [31:0] lal_w1 = linear_addr_live;
 (* keep *) wire [31:0] lal_w2 = linear_addr_live;
@@ -184,11 +169,8 @@ end
 wire [2:0]  update_set = update_vpn[2:0];
 wire [2:0]  update_plru = plru[update_set];
 
-// If the VPN is already present in the set, update that way in place.
-// Blind PLRU allocation creates duplicate entries, and the hit priority
-// mux then keeps returning the stale duplicate — e.g. a dirty=0 entry
-// inserted by a code-fetch walk shadows the dirty=1 entry from a write
-// walk, forcing a page walk on every subsequent write to the page.
+// If the VPN is already present in the set, update that way in place. Blind PLRU allocation creates duplicate entries, and the hit...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-tlb-sv-187
 wire match0 = tlb[update_set][0].valid && (tlb[update_set][0].vpn == update_vpn);
 wire match1 = tlb[update_set][1].valid && (tlb[update_set][1].vpn == update_vpn);
 wire match2 = tlb[update_set][2].valid && (tlb[update_set][2].vpn == update_vpn);

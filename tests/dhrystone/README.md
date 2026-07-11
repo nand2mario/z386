@@ -2,7 +2,7 @@
 
 This directory contains a freestanding Dhrystone 2.1 build for the
 local protected-mode Verilator harness. It can build and run both the
-`z386` 0.1 core and the current `21.z386` core side-by-side.
+released `z386` core and the current `24.z386x` core side-by-side.
 
 The imported Dhrystone sources are `dhry.h`, `dhry_1.c`, and `dhry_2.c`.
 They are based on the public Dhrystone 2.1 C sources from the SiFive
@@ -40,11 +40,11 @@ functionality.
 By default the runner compares these source directories:
 
 ```text
-z386_0_1     -> ../../../z386_MiSTer/src/z386
+z386_release -> ../../../z386_MiSTer/src/z386
 z386_current -> ../..
 ```
 
-Override them with `--z386-0-1-dir` and `--z386-current-dir` when comparing
+Override them with `--z386-release-dir` and `--z386-current-dir` when comparing
 different trees. The Verilator binaries and memory image are kept under
 `dhrystone/build/`, with separate build directories for each core.
 

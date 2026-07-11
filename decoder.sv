@@ -1,21 +1,4 @@
-//=============================================================================
-// Z386 Instruction Decoder Module
-//=============================================================================
-// Structural decoder for the z386 0.4 frontend.
-//
-// The public interface is intentionally unchanged: the decoder still pushes a
-// completed dec_entry_t into the existing decoded-instruction queue.  Internally
-// it follows the new frontend model: consume prefixes/0F in DEC_STRUCT,
-// decode opcode-only and opcode+ModR/M forms in one structural cycle, use a
-// second structural cycle only for the rare opcode+ModR/M+SIB case, then
-// capture one or two literal fields.
-//
-// Frontend entry-point lookup: when defined, the opcode->microcode-entry PLA is
-// served from a 4096x16 M10K ROM addressed one cycle early (shortens the
-// q_window->decq.entry_point critical path); when undefined, the original
-// combinational pla_entry_lookup is used.  Toggle for Quartus timing A/B.
-
-//`define USE_ENTRY_ROM
+// Z386 Instruction Decoder
 
 module decoder
     import z386_pkg::*;
@@ -23,12 +6,17 @@ module decoder
     input               clk,
     input               reset_n,
 
-    // Prefetch queue interface
-    input        [31:0] q_window,       // 4-byte window at current queue head
-    input        [31:0] q_window_next,  // next-cycle window (== q_window one cycle early)
-    input        [5:0]  pf_count,       // Buffered prefetch bytes available
-    input               pf_empty,       // Prefetch queue empty
-    output       [2:0]  q_pop_bytes,    // Pop 1/2/3/4 bytes from prefetch queue
+    // Prefetch queue interface (two-cursor protocol)
+    input        [31:0] win_d1,         // registered window at the D1 cursor
+    input        [5:0]  d1_avail,       // bytes fetched beyond the D1 cursor
+    output       [3:0]  d1_adv,         // D1 cursor advance (0-11 bytes: a prefix,
+                                        //   or the whole rest of the instruction
+                                        //   at handoff - struct AND literal bytes)
+    input        [31:0] win_lit,        // 4 bytes at pop_cursor + lit_off
+    input        [5:0]  lit_avail,      // bytes fetched beyond that point
+    output       [4:0]  lit_off,        // literal offset from the pop cursor
+    output              pop_now,        // instruction completed D2: pop its bytes
+    output       [4:0]  pop_len,        //   (registered length from the skeleton)
 
     // Mode signals
     input               D,              // Default operand/address size (CS.D bit)
@@ -41,15 +29,22 @@ module decoder
     // Decoded instruction output
     output dec_entry_t  i_bus,          // Decoded instruction
     output              decq_empty,     // Instruction queue empty
-    output              decq_has_jmp_call  // decode queue holds a JMP/CALL rel (halt speculative prefetch)
-);
+    output dec_entry_t  i_bus2,         // Second queue entry (issue lookahead)
+    output              decq_has2,      // i_bus2 is valid
+    output              decq_has_jmp_call, // JMP/CALL rel in flight (halt speculative prefetch)
 
-typedef enum logic [1:0] {
-    DEC_STRUCT = 2'd0,                  // prefix/0F or opcode+ModR/M
-    DEC_SIB    = 2'd1,                  // SIB byte for 32-bit ModR/M r/m=100
-    DEC_LIT1   = 2'd2,                  // first literal field
-    DEC_LIT2   = 2'd3                   // second literal field
-} dec_state_t;
+    // D2-AGU sidecar
+    output dec_entry_t  d2_entry,       // the completing entry (= push_entry)
+    output              d2_push,        // it lands this cycle (= i_push)
+    output       [11:0] skel_entry_point, // skel.entry.entry_point, a PURE register
+                                        //   field for the fold-entry uaddr leg
+    input        [31:0] d2_ea_lin,      // AGU result for the completing entry
+    input               d2_ea_v,        // eligible + no same-cycle conflict
+    input        [7:0]  ea_inval_gpr,   // GPR writes committing this cycle (onehot)
+    input               ea_inval_all,   // seg-base load / mode change / rare events
+    output       [31:0] head_ea_lin,    // head's sidecar linear
+    output              head_ea_v       //   (valid => equals the pop-time compute)
+);
 
 typedef enum logic [1:0] {
     LIT_NONE = 2'd0,
@@ -57,6 +52,8 @@ typedef enum logic [1:0] {
     LIT_DISP = 2'd2
 } lit_kind_t;
 
+// The skeleton: a structurally-complete entry plus the literal plan.
+// Literal fields (immediate/displacement) and the entry point are pending.
 typedef struct packed {
     dec_entry_t entry;
     lit_kind_t  lit1_kind;
@@ -75,12 +72,60 @@ typedef struct packed {
 `include "pla_control.svh"
 `include "pla_entry.svh"
 
-localparam DECQ_DEPTH = 2;
-localparam DECQ_PTR_W = (DECQ_DEPTH <= 2) ? 1 : 2;
-localparam [2:0] DECQ_DEPTH_COUNT = DECQ_DEPTH[2:0];
+dec_entry_t head_reg;
+dec_entry_t ela_reg;
+dec_entry_t ela2_reg;   // second elasticity slot: banking depth, not rate -
+                        // lets D1/D2 run ahead through multi-cycle EX
+                        // instructions and feed issue bursts (the 4-deep
+                        // decq provided this; A/B measured on Dhrystone)
+reg         head_v;
+reg         ela_v;
+reg         ela2_v;
 
-dec_state_t dec_state;
-decoder_work_t work;
+assign i_bus = head_reg;
+assign decq_empty = !head_v;
+reg    ela2_off = 1'b0;   // sim chicken bit: +ela2_off = 2-deep elasticity A/B
+// Registered occupancy ONLY - no i_pop bypass (L1).
+wire   out_full = head_v && ela_v && (ela2_v || ela2_off);
+// synthesis translate_off
+initial if ($test$plusargs("ela2_off")) ela2_off = 1'b1;
+longint ela_c0, ela_c1, ela_c2, ela_cblk;
+always @(posedge clk) if (reset_n) begin
+    ela_c0 <= ela_c0 + 1;
+    if (ela_v)  ela_c1 <= ela_c1 + 1;
+    if (ela2_v) ela_c2 <= ela_c2 + 1;
+    if (d2_done_blocked) ela_cblk <= ela_cblk + 1;
+end
+final if ($test$plusargs("ela_stats"))
+    $display("ela: cycles=%0d ela_v=%0d (%.1f%%) ela2_v=%0d (%.1f%%) d2_blocked_by_full=%0d (%.1f%%)",
+             ela_c0, ela_c1, 100.0*ela_c1/ela_c0, ela_c2, 100.0*ela_c2/ela_c0,
+             ela_cblk, 100.0*ela_cblk/ela_c0);
+// synthesis translate_on
+
+assign i_bus2 = ela_v ? ela_reg : push_entry;
+assign decq_has2 = head_v && (ela_v || d2_done);
+
+assign d2_entry = push_entry;
+assign d2_push  = d2_done;
+
+// D2-AGU sidecar: one {linear, valid} per slot, shifting with the promotes.
+reg [31:0] head_ea_r, ela_ea_r, ela2_ea_r;
+reg        head_eav, ela_eav, ela2_eav;
+// synthesis translate_off
+reg [31:0] head_ea_tag, ela_ea_tag, ela2_ea_tag;  // entry displacement at land (desync detector)
+// synthesis translate_on
+assign head_ea_lin = head_ea_r;
+assign head_ea_v   = head_eav;
+
+// A stored sidecar survives only while nothing that fed it changes.
+function automatic logic ea_keep(input dec_entry_t e, input logic v);
+    ea_keep = v && !ea_inval_all &&
+              (((e.ea_base_onehot | e.ea_index_onehot) & ea_inval_gpr) == 8'h00);
+endfunction
+
+//=============================================================================
+// D1 - structural decode
+//=============================================================================
 
 // Prefix state is not part of dec_entry_t until a non-prefix opcode is decoded.
 logic        prefix_66;
@@ -91,192 +136,75 @@ logic [3:0]  prefix_count;
 logic [1:0]  prefix_rep_lock;
 logic [2:0]  prefix_seg;
 
-// Queue
-reg [DECQ_PTR_W-1:0] decq_rptr;
-reg [DECQ_PTR_W-1:0] decq_wptr;
-reg [2:0]            decq_count;
-(* ramstyle = "logic" *) dec_entry_t decq [0:DECQ_DEPTH-1];
+reg            d1_sib;      // SIB sub-cycle pending (cursor held)
+decoder_work_t pend_work;   // struct_work parked across the SIB sub-cycle
 
-assign i_bus = decq[decq_rptr];
-assign decq_empty = (decq_count == 3'd0);
-wire   decq_full  = (decq_count == DECQ_DEPTH_COUNT);   // internal (demoted from output: queue full)
-
-// Current byte window aliases.
-wire [7:0] opcode = q_window[7:0];
-wire [7:0] modrm  = q_window[15:8];
-wire [7:0] sib    = q_window[23:16];
+// Byte aliases at the D1 cursor.  The cursor does not advance until the
+// skeleton handoff, so during the SIB sub-cycle the sib byte is byte 2.
+wire [7:0] opcode = win_d1[7:0];
+wire [7:0] modrm  = win_d1[15:8];
+wire [7:0] sib_b  = win_d1[23:16];
 wire       data32 = D ^ prefix_66;
 wire       addr32 = D ^ prefix_67;
 
-wire consume_prefix = !prefix_0f && is_prefix(opcode);
-wire consume_0f = !prefix_0f && (opcode == 8'h0f);
+wire consume_prefix = !d1_sib && !prefix_0f && is_prefix(opcode) &&
+                      (d1_avail >= 6'd1);
+wire consume_0f     = !d1_sib && !prefix_0f && (opcode == 8'h0f) &&
+                      (d1_avail >= 6'd1);
 
-// One-cycle structural decode candidate.
 decoder_work_t struct_work;
-logic          struct_valid;
 logic [2:0]    struct_len;
-logic          struct_complete;
-logic          sib_ready;
-logic          lit1_ready;
-logic          lit2_ready;
-decoder_work_t sib_work;
-decoder_work_t lit1_work;
-decoder_work_t lit2_work;
+always_comb build_struct_work(struct_work, struct_len);
 
+wire struct_bytes_ok = !d1_sib && (d1_avail >= {3'b000, struct_len});
+wire sib_bytes_ok    = d1_sib && (d1_avail >= 6'd3);   // opcode+modrm+sib in view
+
+// skel_free: d2_done's terms are lit_avail / out_full / phase - all
+// register-derived, never i_pop (L1) - so the same-edge free is legal.
+wire d2_done;
+wire skel_free = !skel_v || d2_done;
+
+wire d1_to_sib  = !consume_prefix && !consume_0f &&
+                  struct_bytes_ok && struct_work.need_sib;
+wire d1_handoff = !consume_prefix && !consume_0f && skel_free &&
+                  ((struct_bytes_ok && !struct_work.need_sib) || sib_bytes_ok);
+
+decoder_work_t handoff_work;
 always_comb begin
-    build_struct_work(struct_work, struct_len);
-    struct_valid = !pf_empty && !decq_full && !q_flush &&
-                   (pf_count >= {3'b000, struct_len});
-    struct_complete = struct_valid && !struct_work.need_sib &&
-                      (struct_work.lit1_kind == LIT_NONE);
-    sib_ready = !pf_empty && !decq_full && !q_flush && (pf_count >= 6'd1);
-    lit1_ready = !pf_empty && !decq_full && !q_flush &&
-                 (pf_count >= {3'b000, work.lit1_size});
-    lit2_ready = !pf_empty && !decq_full && !q_flush &&
-                 (pf_count >= {3'b000, work.lit2_size});
-
-    sib_work = capture_sib(work);
-    lit1_work = capture_literal(work, work.lit1_kind, work.lit1_size,
-                                work.lit1_sign_extend, work.lit1_mirror_disp);
-    lit2_work = capture_literal(work, work.lit2_kind, work.lit2_size,
-                                work.lit2_sign_extend, work.lit2_mirror_disp);
+    handoff_work = d1_sib ? capture_sib(pend_work, sib_b) : struct_work;
 end
+// First literal byte, as an offset from the POP cursor (prefix bytes are
+// not popped until D2 completes): total length minus the literal bytes.
+wire [4:0] handoff_lit_off = handoff_work.entry.length -
+                             ({2'b00, handoff_work.lit1_size} +
+                              {2'b00, handoff_work.lit2_size});
+// D1 cursor advance at handoff: the whole REST of the instruction (struct
+// bytes AND the literal bytes D2 will capture), so the cursor lands on the
+// next instruction's first byte.  It may pass not-yet-fetched literal
+// bytes; d1_avail clamps to 0 in that case and D1 waits for the fill.
+wire [4:0] handoff_adv = handoff_work.entry.length -
+                         {1'b0, prefix_count} - (prefix_0f ? 5'd1 : 5'd0);
 
-assign q_pop_bytes =
-    (dec_state == DEC_STRUCT) ? ((consume_prefix || consume_0f) && !pf_empty && !q_flush ? 3'd1 :
-                                 struct_valid ? struct_len : 3'd0) :
-    (dec_state == DEC_SIB)    ? (sib_ready ? 3'd1 : 3'd0) :
-    (dec_state == DEC_LIT1)   ? (lit1_ready ? work.lit1_size : 3'd0) :
-    (dec_state == DEC_LIT2)   ? (lit2_ready ? work.lit2_size : 3'd0) :
-                                3'd0;
-
-wire i_push =
-    (dec_state == DEC_STRUCT && struct_complete) ||
-    (dec_state == DEC_SIB && sib_ready && sib_work.lit1_kind == LIT_NONE) ||
-    (dec_state == DEC_LIT1 && lit1_ready && lit1_work.lit2_kind == LIT_NONE) ||
-    (dec_state == DEC_LIT2 && lit2_ready);
-
-wire [DECQ_PTR_W-1:0] decq_wptr_next = decq_wptr + 1'b1;
-wire [DECQ_PTR_W-1:0] decq_rptr_next = decq_rptr + 1'b1;
-
-dec_entry_t push_entry;
-always_comb begin
-    if (dec_state == DEC_STRUCT)
-        push_entry = struct_work.entry;
-    else if (dec_state == DEC_SIB)
-        push_entry = sib_work.entry;
-    else if (dec_state == DEC_LIT1)
-        push_entry = lit1_work.entry;
-    else
-        push_entry = lit2_work.entry;
-end
-
-// 386-style advance warning: a JMP/CALL rel is unconditionally taken, so its
-// speculative fall-through prefetch is always wasted.  Assert while such an
-// entry is in (or being pushed into) the decode queue so the prefetch halts
-// fetching past it.  (Backward Jcc is excluded -- its fall-through is the loop
-// exit, which is needed often enough on short loops to lose net.)
-function automatic logic entry_jmp_call(input dec_entry_t e);
-    entry_jmp_call = !e.has_0f && (e.opcode == 8'hEB || e.opcode == 8'hE9 ||
-                                   e.opcode == 8'hE8);
-endfunction
-
-assign decq_has_jmp_call =
-    (decq_count >= 3'd1 && entry_jmp_call(decq[decq_rptr])) ||
-    (decq_count >= 3'd2 && entry_jmp_call(decq[decq_rptr ^ 1'b1])) ||
-    (i_push && entry_jmp_call(push_entry));
+// TIMING: no !q_flush in the advance/pop legs. q_flush carries the deep uc_exec/mem-block cone
+assign d1_adv = (consume_prefix || consume_0f) ? 4'd1 :
+                d1_handoff ? handoff_adv[3:0] :
+                4'd0;
 
 //=============================================================================
-// Entry-PLA ROM (M10K) -- registered replacement for pla_entry_lookup
+// The skeleton register (D1 -> D2 pipeline boundary; Step 2's lookahead)
 //=============================================================================
-// pla_entry_lookup is the deep (~6-level) opcode->microcode-entry PLA and the
-// frontend critical path (q_window -> decq.entry_point).  A 1024x64 M10K ROM
-// (pla_entry_rom.hex, exhaustively proven == the function) replaces it.
-//
-// M10K reads are synchronous (1-cycle latency), so the read address must be
-// available one cycle EARLY.  The PLA input bits split by who can supply them:
-//   * opcode, prefix_rep, prefix_0f are prefetch/decoder NEXT-state, available
-//     a cycle early; q_window_r@(N+1)==q_window_next@N (prefetch, unconditional)
-//     and prefix_state@(N+1)==prefix_*_n@N (mirror below).  -> ROM ADDRESS.
-//   * data32 (=D^prefix_66) and pe_enable are external mode bits that change
-//     ASYNCHRONOUSLY on a mode switch (e.g. MOV Sreg differs real vs protected);
-//     early-latching them is wrong.  -> applied at the OUTPUT via a 4:1 select
-//     on the CURRENT {data32, pe} this cycle.
-// So each address holds the 4 {data32,pe} entries and entry_first picks the live
-// lane -- correct across mode switches, still one M10K read + a 4:1 mux.
-`ifdef USE_ENTRY_ROM
-// Next-state mirror of the two prefix bits in the ROM ADDRESS; MUST track the
-// prefix-register updates in the always_ff below exactly (prefix_66 is not here
-// -- it folds into data32, applied live at the output select).
-logic prefix_0f_n, prefix_rep_n;
-always_comb begin
-    prefix_0f_n  = prefix_0f;
-    prefix_rep_n = prefix_rep;
-    if (q_flush) begin
-        prefix_0f_n = 1'b0; prefix_rep_n = 1'b0;
-    end else begin
-        unique case (dec_state)
-            DEC_STRUCT:
-                if ((q_pop_bytes != 3'd0) && (consume_prefix || consume_0f)) begin
-                    if (consume_0f)            prefix_0f_n  = 1'b1;
-                    else if (opcode == 8'hf2 ||
-                             opcode == 8'hf3)  prefix_rep_n = 1'b1;
-                end else if (struct_complete) begin
-                    prefix_0f_n = 1'b0; prefix_rep_n = 1'b0;
-                end
-            DEC_SIB:
-                if (sib_ready && sib_work.lit1_kind == LIT_NONE) begin
-                    prefix_0f_n = 1'b0; prefix_rep_n = 1'b0;
-                end
-            DEC_LIT1:
-                if (lit1_ready && lit1_work.lit2_kind == LIT_NONE) begin
-                    prefix_0f_n = 1'b0; prefix_rep_n = 1'b0;
-                end
-            DEC_LIT2:
-                if (lit2_ready) begin
-                    prefix_0f_n = 1'b0; prefix_rep_n = 1'b0;
-                end
-            default: ;
-        endcase
-    end
-end
 
-// 10-bit early address {opcode, rep, 0f} (matches gen_pla_entry_rom.sv).
-wire [9:0] entry_rom_addr = {q_window_next[7:0], prefix_rep_n, prefix_0f_n};
-
-(* ramstyle = "M10K" *) reg [63:0] entry_rom [0:1023];
-initial $readmemh("pla_entry_rom.hex", entry_rom);
-reg [63:0] entry_rom_q;
-always_ff @(posedge clk) entry_rom_q <= entry_rom[entry_rom_addr];
-
-// Live 4:1 select on the current mode bits {data32, pe} (lane order matches
-// the generator's pack: {e(1,1),e(1,0),e(0,1),e(0,0)}).
-wire [15:0] entry_rom_sel = entry_rom_q[{data32, pe_enable}*16 +: 16];
-
-// synthesis translate_off
-// Hard-prove the ROM tracks the live PLA every valid decode cycle.  X-guarded
-// to skip the sim-only startup transient before the first ROM read resolves
-// (in hardware the ROM holds real init data; the transient is never pushed
-// because pf_empty=1 during refill).
-wire [15:0] pla_entry_now =
-    pla_entry_lookup({data32, opcode, prefix_rep, pe_enable, 1'b1, prefix_0f});
-always_ff @(posedge clk) begin
-    if (reset_n && !pf_empty && !q_flush &&
-        (^{entry_rom_sel, pla_entry_now} !== 1'bx) &&
-        (entry_rom_sel !== pla_entry_now)) begin
-        $display("[%0t] ENTRY_ROM MISMATCH op=%02x d32=%b rep=%b 0f=%b pe=%b  rom=%04x pla=%04x",
-                 $time, opcode, data32, prefix_rep, prefix_0f, pe_enable,
-                 entry_rom_sel, pla_entry_now);
-        $fatal(1, "entry_rom != pla_entry_lookup");
-    end
-end
-// synthesis translate_on
-`endif // USE_ENTRY_ROM
+decoder_work_t skel;
+// Member-select port assign lives BELOW the struct declaration (Quartus
+// rejects field selects on identifiers declared later in the file).
+assign skel_entry_point = skel.entry.entry_point;
+reg            skel_v;
+reg [4:0]      skel_lit_off;
 
 always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
-        dec_state <= DEC_STRUCT;
-        work <= '0;
+        skel_v <= 1'b0;
+        d1_sib <= 1'b0;
         prefix_66 <= 1'b0;
         prefix_67 <= 1'b0;
         prefix_0f <= 1'b0;
@@ -285,8 +213,8 @@ always_ff @(posedge clk or negedge reset_n) begin
         prefix_rep_lock <= PREFIX_NOREPLOCK;
         prefix_seg <= PREFIX_NOSEG;
     end else if (q_flush) begin
-        dec_state <= DEC_STRUCT;
-        work <= '0;
+        skel_v <= 1'b0;
+        d1_sib <= 1'b0;
         prefix_66 <= 1'b0;
         prefix_67 <= 1'b0;
         prefix_0f <= 1'b0;
@@ -295,135 +223,342 @@ always_ff @(posedge clk or negedge reset_n) begin
         prefix_rep_lock <= PREFIX_NOREPLOCK;
         prefix_seg <= PREFIX_NOSEG;
     end else begin
-        unique case (dec_state)
-            DEC_STRUCT: begin
-                if ((q_pop_bytes != 3'd0) && (consume_prefix || consume_0f)) begin
-                    if (consume_0f) begin
-                        prefix_0f <= 1'b1;
-                    end else begin
-                        prefix_count <= prefix_count + 4'd1;
-                        unique case (opcode)
-                            8'h66: prefix_66 <= 1'b1;
-                            8'h67: prefix_67 <= 1'b1;
-                            8'hf0: prefix_rep_lock <= PREFIX_LOCK;
-                            8'hf2: begin
-                                prefix_rep_lock <= PREFIX_REPNE;
-                                prefix_rep <= 1'b1;
-                            end
-                            8'hf3: begin
-                                prefix_rep_lock <= PREFIX_REP;
-                                prefix_rep <= 1'b1;
-                            end
-                            8'h26, 8'h2e, 8'h36, 8'h3e, 8'h64, 8'h65:
-                                prefix_seg <= prefix_seg_code(opcode);
-                            default: ;
-                        endcase
+        if (consume_prefix || consume_0f) begin
+            if (consume_0f) begin
+                prefix_0f <= 1'b1;
+            end else begin
+                prefix_count <= prefix_count + 4'd1;
+                unique case (opcode)
+                    8'h66: prefix_66 <= 1'b1;
+                    8'h67: prefix_67 <= 1'b1;
+                    8'hf0: prefix_rep_lock <= PREFIX_LOCK;
+                    8'hf2: begin
+                        prefix_rep_lock <= PREFIX_REPNE;
+                        prefix_rep <= 1'b1;
                     end
-                end else if (struct_valid) begin
-                    if (struct_work.need_sib) begin
-                        work <= struct_work;
-                        dec_state <= DEC_SIB;
-                    end else if (!struct_complete) begin
-                        work <= struct_work;
-                        dec_state <= DEC_LIT1;
+                    8'hf3: begin
+                        prefix_rep_lock <= PREFIX_REP;
+                        prefix_rep <= 1'b1;
                     end
-                    if (struct_complete) begin
-                        prefix_66 <= 1'b0;
-                        prefix_67 <= 1'b0;
-                        prefix_0f <= 1'b0;
-                        prefix_rep <= 1'b0;
-                        prefix_count <= 4'd0;
-                        prefix_rep_lock <= PREFIX_NOREPLOCK;
-                        prefix_seg <= PREFIX_NOSEG;
-                    end
-                end
+                    8'h26, 8'h2e, 8'h36, 8'h3e, 8'h64, 8'h65:
+                        prefix_seg <= prefix_seg_code(opcode);
+                    default: ;
+                endcase
             end
+        end
 
-            DEC_SIB: begin
-                if (sib_ready) begin
-                    if (sib_work.lit1_kind != LIT_NONE) begin
-                        work <= sib_work;
-                        dec_state <= DEC_LIT1;
-                    end else begin
-                        dec_state <= DEC_STRUCT;
-                        work <= sib_work;
-                        prefix_66 <= 1'b0;
-                        prefix_67 <= 1'b0;
-                        prefix_0f <= 1'b0;
-                        prefix_rep <= 1'b0;
-                        prefix_count <= 4'd0;
-                        prefix_rep_lock <= PREFIX_NOREPLOCK;
-                        prefix_seg <= PREFIX_NOSEG;
-                    end
-                end
-            end
+        if (d1_to_sib) begin
+            pend_work <= struct_work;
+            d1_sib <= 1'b1;
+        end
 
-            DEC_LIT1: begin
-                if (lit1_ready) begin
-                    work <= lit1_work;
-                    if (lit1_work.lit2_kind != LIT_NONE) begin
-                        dec_state <= DEC_LIT2;
-                    end else begin
-                        dec_state <= DEC_STRUCT;
-                        prefix_66 <= 1'b0;
-                        prefix_67 <= 1'b0;
-                        prefix_0f <= 1'b0;
-                        prefix_rep <= 1'b0;
-                        prefix_count <= 4'd0;
-                        prefix_rep_lock <= PREFIX_NOREPLOCK;
-                        prefix_seg <= PREFIX_NOSEG;
-                    end
-                end
-            end
-
-            DEC_LIT2: begin
-                if (lit2_ready) begin
-                    dec_state <= DEC_STRUCT;
-                    work <= lit2_work;
-                    prefix_66 <= 1'b0;
-                    prefix_67 <= 1'b0;
-                    prefix_0f <= 1'b0;
-                    prefix_rep <= 1'b0;
-                    prefix_count <= 4'd0;
-                    prefix_rep_lock <= PREFIX_NOREPLOCK;
-                    prefix_seg <= PREFIX_NOSEG;
-                end
-            end
-
-            default: dec_state <= DEC_STRUCT;
-        endcase
+        if (d1_handoff) begin
+            skel <= handoff_work;
+            skel_v <= 1'b1;
+            skel_lit_off <= handoff_lit_off;
+            d1_sib <= 1'b0;
+            // The skeleton carries the prefix state; clear for the next one.
+            prefix_66 <= 1'b0;
+            prefix_67 <= 1'b0;
+            prefix_0f <= 1'b0;
+            prefix_rep <= 1'b0;
+            prefix_count <= 4'd0;
+            prefix_rep_lock <= PREFIX_NOREPLOCK;
+            prefix_seg <= PREFIX_NOSEG;
+        end else if (d2_done) begin
+            skel_v <= 1'b0;
+        end
     end
 end
 
 //=============================================================================
-// Instruction Queue Management
+// D2 - literal capture + entry resolution
 //=============================================================================
 
+// Phase A = fields as handed off; phase B = field A captured (workB holds
+// the merged entry), literal window advanced by lit1_size.
+reg            d2_phaseB;
+decoder_work_t workB;
+
+wire [2:0] sizeA    = skel.lit1_size;
+wire [2:0] sizeB    = skel.lit2_size;
+wire       has_litA = (skel.lit1_kind != LIT_NONE);
+wire       has_litB = (skel.lit2_kind != LIT_NONE);
+wire [3:0] sizeAB   = {1'b0, sizeA} + {1'b0, sizeB};
+wire       ab_fit   = (sizeAB <= 4'd4);   // both fields inside one window
+
+assign lit_off = skel_lit_off + (d2_phaseB ? {2'b00, sizeA} : 5'd0);
+
+// Captures reproduce the old DEC_LIT1/DEC_LIT2 semantics exactly: same
+// capture_literal function, same field-merge behavior, and the second
+// field always sees its bytes at offset 0 of its view (winB pre-shifts
+// when both fields capture in one cycle).
+decoder_work_t capA;
+decoder_work_t capAB;
+decoder_work_t capB;
+wire [31:0] winB = (sizeA == 3'd1) ? { 8'h00, win_lit[31:8]}  :
+                   (sizeA == 3'd2) ? {16'h0,  win_lit[31:16]} :
+                   (sizeA == 3'd3) ? {24'h0,  win_lit[31:24]} : 32'h0;
+always_comb begin
+    capA  = capture_literal(skel, win_lit, skel.lit1_kind, skel.lit1_size,
+                            skel.lit1_sign_extend, skel.lit1_mirror_disp);
+    capAB = capture_literal(capA, winB, capA.lit2_kind, capA.lit2_size,
+                            capA.lit2_sign_extend, capA.lit2_mirror_disp);
+    capB  = capture_literal(workB, win_lit, workB.lit2_kind, workB.lit2_size,
+                            workB.lit2_sign_extend, workB.lit2_mirror_disp);
+end
+
+wire       finishing = d2_phaseB || !has_litB || ab_fit;
+wire [3:0] need_now  = d2_phaseB ? {1'b0, sizeB} :
+                       !has_litA ? 4'd0 :
+                       (has_litB && ab_fit) ? sizeAB : {1'b0, sizeA};
+wire       bytes_ok  = (lit_avail >= {2'b00, need_now});
+wire       d2_can    = skel_v && bytes_ok;
+assign     d2_done   = d2_can && finishing && !out_full;
+`ifndef SYNTHESIS
+wire       d2_done_blocked = d2_can && finishing && out_full;  // census only
+`endif
+// Field A may capture while the output side is full (no push happens here).
+wire       d2_stepA  = d2_can && !finishing;
+
+decoder_work_t d2_final;
+always_comb begin
+    d2_final = d2_phaseB ? capB :
+               !has_litA ? skel :
+               (has_litB && ab_fit) ? capAB : capA;
+end
+
+always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+        d2_phaseB <= 1'b0;
+    end else if (q_flush) begin
+        d2_phaseB <= 1'b0;
+    end else if (d2_stepA) begin
+        workB <= capA;
+        d2_phaseB <= 1'b1;
+    end else if (d2_done) begin
+        d2_phaseB <= 1'b0;
+    end
+end
+
+// Entry-point resolution moved BACK to D1
+dec_entry_t push_entry;
+always_comb begin
+    push_entry = d2_final.entry;
+    {push_entry.ea_index_onehot, push_entry.ea_base_onehot} = dec_ea_onehots(push_entry);
+end
+
+wire i_push = d2_done;
+assign pop_now = d2_done;
+assign pop_len = skel.entry.length;
+
+// synthesis translate_off
+// V52 A2 equivalence oracle. Recipe metadata and live FAST control come from
+// the optimized microcode inventory; the legacy opcode classifier remains in
+// simulation to prove every decoded instruction produces identical control.
+wire [2:0] push_recipe_early = recipe_early_kind(push_entry.entry_point);
+fast_class_t push_legacy_fc, push_recipe_fc;
+assign push_legacy_fc = dec_fast_class(push_entry);
+assign push_recipe_fc = recipe_fast_class(push_entry);
+always @(posedge clk) begin
+    if (reset_n && d2_done) begin
+        if (push_recipe_fc !== push_legacy_fc)
+            $fatal(1, "FAST recipe classifier mismatch: entry=%03x opcode=%02x modrm=%02x old=%04x new=%04x",
+                   push_entry.entry_point, push_entry.opcode, push_entry.modrm,
+                   push_legacy_fc, push_recipe_fc);
+    end
+    if (reset_n && d2_done && push_legacy_fc.fast) begin
+        if (push_recipe_early == RECIPE_EARLY_SEQ)
+            $fatal(1, "FAST recipe missing: entry=%03x opcode=%02x modrm=%02x 0f=%b",
+                   push_entry.entry_point, push_entry.opcode, push_entry.modrm,
+                   push_entry.has_0f);
+        unique case (push_recipe_early)
+            RECIPE_EARLY_NONE:
+                if (push_legacy_fc.uses_ea || push_legacy_fc.br_rel)
+                    $fatal(1, "FAST recipe NONE role mismatch: entry=%03x fc=%04x",
+                           push_entry.entry_point, push_legacy_fc);
+            RECIPE_EARLY_EA, RECIPE_EARLY_LOAD, RECIPE_EARLY_STORE,
+            RECIPE_EARLY_RMW, RECIPE_EARLY_STACK:
+                if (!push_legacy_fc.uses_ea)
+                    $fatal(1, "FAST recipe address role mismatch: entry=%03x kind=%0d fc=%04x",
+                           push_entry.entry_point, push_recipe_early, push_legacy_fc);
+            RECIPE_EARLY_BRANCH:
+                if (!push_legacy_fc.br_rel)
+                    $fatal(1, "FAST recipe branch role mismatch: entry=%03x fc=%04x",
+                           push_entry.entry_point, push_legacy_fc);
+            default:
+                $fatal(1, "FAST recipe invalid early kind: entry=%03x kind=%0d",
+                       push_entry.entry_point, push_recipe_early);
+        endcase
+        if ($test$plusargs("recipe_cov"))
+            $display("RECIPE_COV entry=%03x kind=%0d opcode=%02x modrm=%02x fc=%04x",
+                     push_entry.entry_point, push_recipe_early,
+                     push_entry.opcode, push_entry.modrm, push_legacy_fc);
+    end
+end
+
+reg D1_EVT = 1'b0;
+initial if ($test$plusargs("pf_cur")) D1_EVT = 1'b1;
+always @(posedge clk) begin
+    if (D1_EVT && d1_handoff)
+        $display("%0t D1HO op=%02x modrm=%02x len=%0d adv=%0d(sib=%b slen=%0d) litoff=%0d A=%0d/%0d B=%0d/%0d pcnt=%0d 0f=%b",
+                 $time, handoff_work.entry.opcode, handoff_work.entry.modrm,
+                 handoff_work.entry.length, d1_adv, d1_sib, struct_len,
+                 handoff_lit_off, handoff_work.lit1_kind, handoff_work.lit1_size,
+                 handoff_work.lit2_kind, handoff_work.lit2_size,
+                 prefix_count, prefix_0f);
+    if (D1_EVT && d2_done)
+        $display("%0t D2DN op=%02x len=%0d imm=%08x disp=%08x phB=%b",
+                 $time, push_entry.opcode, push_entry.length,
+                 push_entry.immediate, push_entry.displacement, d2_phaseB);
+end
+always @(posedge clk) begin
+    // The literal plan must tile the instruction exactly: pop_len bytes =
+    // struct bytes (lit_off) + literal bytes.
+    if (reset_n && skel_v &&
+        ({1'b0, skel.entry.length} !==
+         {1'b0, skel_lit_off} + {3'b000, skel.lit1_size} + {3'b000, skel.lit2_size}))
+        $fatal(1, "D2: literal plan does not tile: len=%0d lit_off=%0d A=%0d B=%0d",
+               skel.entry.length, skel_lit_off, skel.lit1_size, skel.lit2_size);
+    if (reset_n && d2_phaseB && !skel_v)
+        $fatal(1, "D2: phase B with no skeleton");
+end
+// synthesis translate_on
+
+// EX-side registers: head + elasticity (the decq replacement)
 always_ff @(posedge clk) begin
     if (!reset_n || q_flush) begin
-        decq_rptr <= {DECQ_PTR_W{1'b0}};
-        decq_wptr <= {DECQ_PTR_W{1'b0}};
-        decq_count <= 3'd0;
+        head_v <= 1'b0;
+        ela_v  <= 1'b0;
+        ela2_v <= 1'b0;
     end else begin
-        unique case ({i_push, i_pop})
-            2'b10: begin
-                decq[decq_wptr] <= push_entry;
-                decq_wptr <= decq_wptr_next;
-                decq_count <= decq_count + 3'd1;
+        if (i_pop) begin
+            head_reg <= ela_reg;
+            head_v   <= ela_v;
+            ela_reg  <= ela2_reg;
+            ela_v    <= ela2_v;
+            ela2_v   <= 1'b0;
+            if (i_push) begin
+                // Land at the pre-pop tail (the later assignment overrides
+                // the promote of that slot); occupancy 3 is unreachable
+                // here (out_full gate).
+                if (ela_v) begin
+                    ela_reg <= push_entry;
+                    ela_v   <= 1'b1;
+                end else begin
+                    head_reg <= push_entry;
+                    head_v   <= 1'b1;
+                end
             end
-            2'b01: begin
-                decq_rptr <= decq_rptr_next;
-                decq_count <= decq_count - 3'd1;
+        end else if (i_push) begin
+            if (!head_v) begin
+                head_reg <= push_entry;
+                head_v   <= 1'b1;
+            end else if (!ela_v) begin
+                ela_reg <= push_entry;
+                ela_v   <= 1'b1;
+            end else begin
+                ela2_reg <= push_entry;
+                ela2_v   <= 1'b1;
             end
-            2'b11: begin
-                decq[decq_wptr] <= push_entry;
-                decq_wptr <= decq_wptr_next;
-                decq_rptr <= decq_rptr_next;
-            end
-            default: ;
-        endcase
+        end
     end
 end
+
+// synthesis translate_off
+always @(posedge clk) begin
+    if (reset_n && i_pop && !head_v)
+        $fatal(1, "EXQ: pop with empty head register");
+    if (reset_n && i_push && i_pop && ela_v && ela2_v)
+        $fatal(1, "EXQ: push at full occupancy (gate must block this)");
+    if (reset_n && ((ela_v && !head_v) || (ela2_v && !ela_v)))
+        $fatal(1, "EXQ: occupancy not contiguous (h=%b e=%b e2=%b)",
+               head_v, ela_v, ela2_v);
+end
+// synthesis translate_on
+
+// Sidecar shift: mirrors the entry block above; valids additionally pass
+// through the invalidation snoop each cycle (a captured sidecar is checked
+// against writes committing in ITS OWN landing cycle by the core-side
+// d2_ea_v, and against later writes here).
+wire d2_ea_land_v = d2_ea_v && !ea_inval_all;
+always_ff @(posedge clk) begin
+    if (!reset_n || q_flush) begin
+        head_eav <= 1'b0;
+        ela_eav  <= 1'b0;
+        ela2_eav <= 1'b0;
+    end else begin
+        if (i_pop) begin
+            head_ea_r <= ela_ea_r;
+            head_eav  <= ea_keep(ela_reg, ela_v ? ela_eav : 1'b0);
+            ela_ea_r  <= ela2_ea_r;
+            ela_eav   <= ea_keep(ela2_reg, ela2_v ? ela2_eav : 1'b0);
+            ela2_eav  <= 1'b0;
+            // synthesis translate_off
+            head_ea_tag <= ela_ea_tag; ela_ea_tag <= ela2_ea_tag;
+            // synthesis translate_on
+            if (i_push) begin
+                if (ela_v) begin
+                    ela_ea_r <= d2_ea_lin;
+                    ela_eav  <= d2_ea_land_v;
+                    // synthesis translate_off
+                    ela_ea_tag <= d2_entry.displacement;
+                    // synthesis translate_on
+                end else begin
+                    head_ea_r <= d2_ea_lin;
+                    head_eav  <= d2_ea_land_v;
+                    // synthesis translate_off
+                    head_ea_tag <= d2_entry.displacement;
+                    // synthesis translate_on
+                end
+            end
+        end else begin
+            head_eav <= ea_keep(head_reg, head_v ? head_eav : 1'b0);
+            ela_eav  <= ea_keep(ela_reg,  ela_v  ? ela_eav  : 1'b0);
+            ela2_eav <= ea_keep(ela2_reg, ela2_v ? ela2_eav : 1'b0);
+            if (i_push) begin
+                if (!head_v) begin
+                    head_ea_r <= d2_ea_lin;
+                    head_eav  <= d2_ea_land_v;
+                    // synthesis translate_off
+                    head_ea_tag <= d2_entry.displacement;
+                    // synthesis translate_on
+                end else if (!ela_v) begin
+                    ela_ea_r <= d2_ea_lin;
+                    ela_eav  <= d2_ea_land_v;
+                    // synthesis translate_off
+                    ela_ea_tag <= d2_entry.displacement;
+                    // synthesis translate_on
+                end else begin
+                    ela2_ea_r <= d2_ea_lin;
+                    ela2_eav  <= d2_ea_land_v;
+                    // synthesis translate_off
+                    ela2_ea_tag <= d2_entry.displacement;
+                    // synthesis translate_on
+                end
+            end
+        end
+    end
+end
+
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && i_pop && head_eav && (head_ea_tag !== head_reg.displacement))
+        $fatal(1, "EXQ: sidecar/entry DESYNC at pop: tag=%08x entry.disp=%08x op=%02x",
+               head_ea_tag, head_reg.displacement, head_reg.opcode);
+// synthesis translate_on
+
+// JMP/CALL rel is unconditionally taken, so its speculative fall-through prefetch is always wasted.
+function automatic logic entry_jmp_call(input dec_entry_t e);
+    entry_jmp_call = !e.has_0f && (e.opcode == 8'hEB || e.opcode == 8'hE9 ||
+                                   e.opcode == 8'hE8);
+endfunction
+
+assign decq_has_jmp_call =
+    (head_v && entry_jmp_call(head_reg)) ||
+    (ela_v  && entry_jmp_call(ela_reg)) ||
+    (ela2_v && entry_jmp_call(ela2_reg)) ||
+    (i_push && entry_jmp_call(push_entry));
 
 //=============================================================================
 // Structural Decode
@@ -470,16 +605,25 @@ task automatic build_struct_work(
         imm_total_size = 3'd0;
         imm_first_size = 3'd0;
 
-`ifdef USE_ENTRY_ROM
-        entry_first = entry_rom_sel;        // M10K ROM (addr early) + live {data32,pe} select
-`else
+        // Fold step 1: entry resolution back in D1 (pe read live; a PE/D
+        // change always flushes the frontend, so a skeleton is never
+        // consumed across a mode switch).
         entry_first = pla_entry_lookup({data32, opcode, prefix_rep, pe_enable,
                                         1'b1, prefix_0f});
-`endif
         entry_group = ~(|entry_first[11:6]) && has_modrm;
         // Parallel copy of entry_first[5:0] for group rows, so the
-        // second-level lookup below does not chain behind the first.
+        // second-level lookup does not chain behind the first.
         group_code = pla_group_lookup({data32, opcode, pe_enable, prefix_0f});
+        entry_final = entry_group ?
+            pla_group_entry_lookup({data32, group_code[5:4], modrm[5:3],
+                                    group_code[3:0], (modrm[7:6] != 2'b11),
+                                    1'b0, prefix_0f}) :
+            entry_first;
+        invalid_lock = check_lock_invalid(prefix_rep_lock, prefix_0f, opcode,
+                                          has_modrm, modrm);
+        w.entry.entry_point = invalid_lock ? 12'h82B : entry_final[11:0];
+        w.entry.stack_op = invalid_lock ? 1'b0 : entry_final[13];
+        w.entry.stack_dir = invalid_lock ? 1'b0 : entry_final[12];
 
         if (has_modrm) begin
             has_sib = addr32 && (modrm[7:6] != 2'b11) && (modrm[2:0] == 3'b100);
@@ -498,12 +642,6 @@ task automatic build_struct_work(
 
             if ((opcode[7:1] == 7'b1111011) && (modrm[5:3] >= 3'd2))
                 imm_total_size = 3'd0;
-
-            entry_final = entry_group ?
-                pla_group_entry_lookup({data32, group_code[5:4], modrm[5:3],
-                                  group_code[3:0], (modrm[7:6] != 2'b11),
-                                  1'b0, prefix_0f}) :
-                entry_first;
 
             w.entry.has_modrm = 1'b1;
             w.entry.modrm = modrm;
@@ -536,7 +674,6 @@ task automatic build_struct_work(
         end else begin
             has_sib = 1'b0;
             disp_size = 3'd0;
-            entry_final = entry_first;
             select_register_fields(prefix_0f, opcode, 1'b0, 8'h00,
                                    w.entry.src_reg_sel, w.entry.dst_reg_sel);
 
@@ -595,24 +732,18 @@ task automatic build_struct_work(
             end
         end
 
-        invalid_lock = check_lock_invalid(prefix_rep_lock, prefix_0f, opcode,
-                                          has_modrm, modrm);
-        w.entry.entry_point = invalid_lock ? 12'h82B : entry_final[11:0];
-        w.entry.stack_op = invalid_lock ? 1'b0 : entry_final[13];
-        w.entry.stack_dir = invalid_lock ? 1'b0 : entry_final[12];
         w.entry.length = {1'b0, prefix_count} + (prefix_0f ? 5'd1 : 5'd0) +
                          {2'b00, s_len} + {2'b00, disp_size} +
                          {2'b00, imm_total_size};
     end
 endtask
 
-function automatic decoder_work_t capture_sib(input decoder_work_t in);
+function automatic decoder_work_t capture_sib(input decoder_work_t in,
+                                              input logic [7:0]   sib_byte);
     decoder_work_t out;
-    logic [7:0] sib_byte;
     logic [2:0] disp_size;
     begin
         out = in;
-        sib_byte = q_window[7:0];
         disp_size = modrm_disp_size(in.entry.addr32, in.entry.modrm,
                                     sib_byte, in.entry.has_sib);
 
@@ -645,6 +776,7 @@ endfunction
 
 function automatic decoder_work_t capture_literal(
     input decoder_work_t in,
+    input logic [31:0]   win,    // literal bytes at offset 0 of this view
     input lit_kind_t     kind,
     input logic [2:0]    size,
     input logic          sign_extend,
@@ -654,7 +786,7 @@ function automatic decoder_work_t capture_literal(
     logic [31:0] value;
     begin
         out = in;
-        value = literal_value(q_window, size, sign_extend);
+        value = literal_value(win, size, sign_extend);
         if (kind == LIT_IMM) begin
             out.entry.immediate = value;
             if (mirror_disp)

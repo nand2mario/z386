@@ -1,12 +1,5 @@
-// Read-only physically indexed, physically tagged L1 instruction cache.
-//
-// CPU-side contract:
-//   * cpu_addr is a physical byte address.
-//   * A cache-hit read accepted in cycle N returns cpu_resp_valid in N+1.
-//   * Miss/refill and uncached accesses use the memory-side burst interface.
-//
-// This is the instruction-cache half of l1_cache.sv with the store buffer and
-// write datapath removed.
+// Read-only physically indexed, physically tagged L1 instruction cache. CPU-side contract: * cpu_addr is a physical byte address. * A...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-l1-icache-sv-1
 module l1_icache #(
     parameter integer SET_BITS = 8   // 16KB icache (256 sets x 4 ways x 16 B); =7 was 8KB
 ) (
@@ -488,12 +481,8 @@ always_ff @(posedge clk) begin
                         write_cache_tag(fill_way, fill_set, fill_tag);
                         line_r <= fill_line_next;
                         resp_valid_r <= 1'b1;
-                        // Only write_cache_tag (above) sets valid for fill_way.
-                        // Do NOT restore the other ways' valid bits from the
-                        // fill-START snapshot: a snoop invalidation that landed
-                        // DURING this fill (self-modifying code) must survive.
-                        // Restoring fill_validN_r clobbered it -> stale instruction
-                        // line -> crash (FastDoom SMC, frequent at 8KB fill rate).
+                        // Only write_cache_tag (above) sets valid for fill_way. Do NOT restore the other ways' valid bits from the fill-START snapshot: a snoop...
+                        // Details: doc/z386x/implementation_notes.md#src-24-z386x-l1-icache-sv-491
                         plru_set[fill_set] <= plru_update(fill_plru_r, fill_way);
                         state <= S_IDLE;
                         ready_r <= 1'b1;

@@ -85,6 +85,7 @@ def build_if_needed():
         # Include header files
         ROOT / 'pla_entry.svh',
         ROOT / 'pla_control.svh',
+        ROOT / 'ucode_recipes.svh',
     ]
 
     if not TB.exists():

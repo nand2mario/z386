@@ -1,12 +1,5 @@
-//
-// Segmentation Unit for z386
-//
-// This contains:
-//   - Descriptor Cache array (ES/CS/SS/DS/FS/GS/IDT/TR/LDT/GDT)
-//   - Segment selection and address generation (seg_sel, mem_seg_base, mem_linear_addr)
-//   - Limit Checker (GP/SS fault detection)
-//
-//
+// Segmentation Unit for z386 This contains: - Descriptor Cache array (ES/CS/SS/DS/FS/GS/IDT/TR/LDT/GDT) - Segment selection and address...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-segmentation-unit-sv-1
 module segmentation_unit
     import z386_pkg::*;
 (
@@ -80,11 +73,8 @@ wire [31:0] GS_base = seg_cache[SEG_GS].base;
 
 wire [31:0] eff_offset = (addr_size || is_dtable) ? offset : {16'h0, offset[15:0]};
 
-// Pending base: the value seg_base_r will hold next cycle.  Mirrors exactly the
-// seg_base_r next-state in the always_ff below (same precedence: stssaf override,
-// then the case wins for INIT/UPDATE/DESCSW).  Lets z386 pre-register
-// linear_address = seg_base_pending + ind_next at the IND-setting busop, taking
-// the seg-adder off the live-TLB cone.
+// Pending base: the value seg_base_r will hold next cycle. Mirrors exactly the seg_base_r next-state in the always_ff below (same...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-segmentation-unit-sv-83
 reg [31:0] seg_base_pending_c;
 reg        addr_size_pending_c;
 reg        is_dtable_pending_c;
@@ -135,18 +125,19 @@ wire [31:0] diff_res = base_diff[31:0];
 wire size_fault = (diff_res[31:3] == 29'd0) && (diff_res[2:0] < access_size);
 wire limit_violated = start_out_of_bounds | size_fault;
 
-// Real mode: stack ops with 16-bit addressing wrap instead of faulting
-wire rm_limit_fault = !pe && limit_violated &&
-                      !(is_stack_fault && !addr_size);
+// Real mode: a boundary-crossing access always faults (even SS -> #SS, e.g.
+// POPAD at SP=0xFFFE); only start-out-of-bounds keeps the 16-bit-stack wrap.
+wire rm_limit_fault = !pe && (size_fault ||
+                      (start_out_of_bounds && !(is_stack_fault && !addr_size)));
 
 wire pm_limit_fault = pe && limit_violated && !is_dtable;
 
-wire seg_writable = (seg_sel == SEG_ES) ? seg_cache[SEG_ES].writable :
+wire seg_writable = (seg_sel == SEG_ES) ? (!seg_cache[SEG_ES].seg_type[3] && seg_cache[SEG_ES].seg_type[1]) :
                     (seg_sel == SEG_CS) ? vm :
                     (seg_sel == SEG_SS) ? 1'b1 :
-                    (seg_sel == SEG_DS) ? seg_cache[SEG_DS].writable :
-                    (seg_sel == SEG_FS) ? seg_cache[SEG_FS].writable :
-                    (seg_sel == SEG_GS) ? seg_cache[SEG_GS].writable :
+                    (seg_sel == SEG_DS) ? (!seg_cache[SEG_DS].seg_type[3] && seg_cache[SEG_DS].seg_type[1]) :
+                    (seg_sel == SEG_FS) ? (!seg_cache[SEG_FS].seg_type[3] && seg_cache[SEG_FS].seg_type[1]) :
+                    (seg_sel == SEG_GS) ? (!seg_cache[SEG_GS].seg_type[3] && seg_cache[SEG_GS].seg_type[1]) :
                     1'b1;  // TR/IDT/GDT/IO: no write check
 wire write_fault = pe && is_write && !seg_writable && !is_dtable;
 
@@ -174,15 +165,24 @@ function automatic [31:0] seg_base_for(input [3:0] sel, input dsw);
     endcase
 endfunction
 
+// Effective limits expanded ONCE per segment and shared by every consumer
+// (seg_limit_for's case used to inline the G-bit expansion at each of its
+// call sites; the array guarantees the dedup - doc/z386x/area.md 2.3).
+wire [31:0] seg_eff_lim [0:10];
+genvar gs;
+generate for (gs = 0; gs <= 10; gs = gs + 1) begin : gen_eff_lim
+    assign seg_eff_lim[gs] = seg_effective_limit(seg_cache[gs[3:0]]);
+end endgenerate
+
 function automatic [31:0] seg_limit_for(input [3:0] sel, input dsw);
     case (sel)
-        SEG_ES: seg_limit_for = seg_effective_limit(seg_cache[SEG_ES]);
-        SEG_CS: seg_limit_for = seg_effective_limit(seg_cache[SEG_CS]);
-        SEG_SS: seg_limit_for = seg_effective_limit(dsw ? seg_cache[SEG_CS] : seg_cache[SEG_SS]);
-        SEG_DS: seg_limit_for = seg_effective_limit(seg_cache[SEG_DS]);
-        SEG_FS: seg_limit_for = seg_effective_limit(seg_cache[SEG_FS]);
-        SEG_GS: seg_limit_for = seg_effective_limit(seg_cache[SEG_GS]);
-        SEG_TR: seg_limit_for = seg_effective_limit(seg_cache[SEG_TR]);
+        SEG_ES: seg_limit_for = seg_eff_lim[SEG_ES];
+        SEG_CS: seg_limit_for = seg_eff_lim[SEG_CS];
+        SEG_SS: seg_limit_for = dsw ? seg_eff_lim[SEG_CS] : seg_eff_lim[SEG_SS];
+        SEG_DS: seg_limit_for = seg_eff_lim[SEG_DS];
+        SEG_FS: seg_limit_for = seg_eff_lim[SEG_FS];
+        SEG_GS: seg_limit_for = seg_eff_lim[SEG_GS];
+        SEG_TR: seg_limit_for = seg_eff_lim[SEG_TR];
         default: seg_limit_for = 32'hFFFFFFFF;
     endcase
 endfunction
@@ -196,7 +196,7 @@ seg_desc_t lar_desc;
 wire [7:0] lar_ar_byte = {lar_desc.P, lar_desc.DPL, lar_desc.S, lar_desc.seg_type};
 assign lar_desc = (seg_target <= SEG_GDT) ? seg_cache[seg_target] : '0;
 assign lar_result = {16'h0, lar_ar_byte, 8'h0};
-assign llim_result = seg_effective_limit(lar_desc);
+assign llim_result = (seg_target <= SEG_GDT) ? seg_eff_lim[seg_target] : 32'h0;
 assign lbas_result = lar_desc.base;
 
 // Testbench can't force unpacked array struct elements, so use individual regs
@@ -371,11 +371,8 @@ always_ff @(posedge clk) begin
         i_addr32_r <= 1'b0;
         i_stack_op_r <= 1'b0;
     end else if (seg_cmd_valid) begin
-        // seg_base_r / addr_size / is_dtable next-state is computed ONCE in the
-        // always_comb above (seg_base_pending_c / addr_size_pending_c /
-        // is_dtable_pending_c, also exposed as seg_base_pending/eff_mask_pending).
-        // Register it here instead of re-deriving seg_base_for() a 2nd time per
-        // case below -- the mirror already captures the stssaf-then-case precedence.
+        // seg_base_r / addr_size / is_dtable next-state is computed ONCE in the always_comb above (seg_base_pending_c / addr_size_pending_c /...
+        // Details: doc/z386x/implementation_notes.md#src-24-z386x-segmentation-unit-sv-384
         seg_base_r <= seg_base_pending_c;
         addr_size  <= addr_size_pending_c;
         is_dtable  <= is_dtable_pending_c;
@@ -388,7 +385,7 @@ always_ff @(posedge clk) begin
             descsw_mode <= 1'b0;
             tss_access_flag <= 1'b1;
             if (seg_sel == SEG_SS)
-                seg_limit_r <= seg_effective_limit(seg_cache[SEG_SS]);
+                seg_limit_r <= seg_eff_lim[SEG_SS];
         end
         if (ctssaf_pulse)
             tss_access_flag <= 1'b0;
@@ -423,7 +420,7 @@ always_ff @(posedge clk) begin
                 seg_sel <= SEG_SS;
                 seg_is_io <= 1'b0;
                 descsw_mode <= 1'b1;
-                seg_limit_r <= seg_effective_limit(seg_cache[SEG_CS]);
+                seg_limit_r <= seg_eff_lim[SEG_CS];
             end
 
             default: ;

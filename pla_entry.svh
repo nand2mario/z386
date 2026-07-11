@@ -1,15 +1,5 @@
-// PLA Entry - opcode → microcode entry point
-// Generated from doc/microcode/decoder23.txt
-//
-// Output[15:0]
-//   [11:0]: microcode entry point
-//   [15:12]: control bits
-// Active 21.z386/22.z386_MiSTer decoder usage:
-//   [11:0]  entry point
-//   [13:12] stack operation flags
-//   [15:14] currently unused, preserved to keep the table visibly tied to
-//           doc/microcode/decoder23.txt.
-//
+// Generated opcode-to-microcode-entry PLA from doc/microcode/decoder23.txt.
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-pla-entry-svh-1
 function automatic logic [15:0] pla_entry_lookup(
     input [12:0] addr_in
 );
@@ -558,17 +548,8 @@ function automatic logic [15:0] pla_entry_lookup(
     endcase
 endfunction
 
-// ---- begin generated: pla_group_lookup (scripts/gen_pla_group.py) ----
-// Opcode -> second-level entry PLA row, derived from
-// pla_entry_lookup above and pla_control.svh.  DO NOT EDIT BY HAND.
-//
-// Returns entry_first[5:0] for opcodes whose first-level entry lookup
-// yields a group row (entry[11:6]==0 with modrm).  Lets the decoder run
-// the second-level lookup in parallel with the first instead of chained
-// behind it.  Result is don't-care (0) for non-group opcodes; the
-// entry_group select still comes from the real first-level result.
-//
-// Input format: {data32, opcode[7:0], pe_enable, has_0f}
+// Generated second-level group PLA; do not edit by hand.
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-pla-entry-svh-561
 function automatic logic [5:0] pla_group_lookup(
     input [10:0] addr_in
 );

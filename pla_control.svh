@@ -1,20 +1,5 @@
-// PLA Control - instruction layout pattern matching
-// Generated from doc/microcode/microcode_rom1_260103.txt
-//
-// Input format:
-//   state[6:0]       - bits mnopqrs
-//   instruction[7:0] - bits 76543210
-//   mode[4:0]        - bits tuvwx
-//
-// Output format:
-//   [11:0] - bits abcdefghijkl
-//
-// Reduced active frontend view.
-// Source data: doc/microcode/microcode_rom1_260103.txt, filtered to the
-// initial opcode/prefix state used by 21.z386/22.z386_MiSTer:
-//   state = 7'b0000000
-//   mode  = {has_0f, 4'b0000}
-// The full ROM1-shaped `pla_control_lookup` table remains below for reference.
+// Generated instruction-layout PLA from doc/microcode/microcode_rom1_260103.txt.
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-pla-control-svh-1
 function automatic logic [11:0] pla_control_opcode_lookup(
     input        has_0f,
     input [7:0] instruction

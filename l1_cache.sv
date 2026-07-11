@@ -1,13 +1,5 @@
-// Physically indexed, physically tagged L1 cache for z386 0.3.
-//
-// CPU-side contract:
-//   * cpu_addr is a physical byte address.
-//   * A cache-hit read accepted in cycle N returns cpu_resp_valid in N+1.
-//   * A write accepted in cycle N is posted to the write-through store queue.
-//   * Miss/refill and uncached accesses use the memory-side burst interface.
-//
-// This deliberately avoids the old VIPT preread/finalize split.  The paging
-// unit owns translation and only sends physical requests to this module.
+// Physically indexed, physically tagged L1 cache for z386 0.3. CPU-side contract: * cpu_addr is a physical byte address. * A cache-hit...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-l1-cache-sv-1
 module l1_cache #(
     // Four ways, 16 bytes per line. SET_BITS=8 gives a 16KB data cache
     // (256 sets x 4 ways x 16 B); =7 was 8KB.
@@ -277,11 +269,8 @@ wire lookup_read_hit_now = (state == S_LOOKUP) && req_valid_r &&
 assign cpu_dout = lookup_read_hit_now ? lookup_forward_data : dout_r;
 assign cpu_resp_valid = lookup_read_hit_now || resp_valid_r;
 
-// Store-queue drain issue, decoupled from the FSM: drains may launch while the
-// FSM is accepting or patching, so back-to-back writes are not serialized
-// behind accept/S_LOOKUP cycles.  Blocked in states that own the memory side
-// (fill/bypass) and in the S_LOOKUP cycle of a read miss or uncacheable read,
-// so demand-read memory launches are never delayed by a newly issued drain.
+// Store-queue drain issue, decoupled from the FSM: drains may launch while the FSM is accepting or patching, so back-to-back writes are...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-l1-cache-sv-280
 wire drain_block_state = (state == S_RESET_INIT) || (state == S_FILL) ||
                          (state == S_BYPASS_WAIT) ||
                          ((state == S_LOOKUP) && !req_protect_write_r && !req_write_r &&
@@ -289,16 +278,20 @@ wire drain_block_state = (state == S_RESET_INIT) || (state == S_FILL) ||
 wire drain_issue_now = !storeq_empty && !storeq_draining && !mem_valid_r &&
                        !mem_busy && !drain_block_state;
 
-// Coalesce a store (enqueued during its S_LOOKUP cycle, from registered
-// request state) into the most recent queue entry when it targets the same
-// DWORD.  Excluded: uncacheable writes (MMIO transaction boundaries must be
-// preserved) and entries that are draining (their data is already on the
-// memory command registers this cycle).
+// Coalesce a store (enqueued during its S_LOOKUP cycle, from registered request state) into the most recent queue entry when it targets...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-l1-cache-sv-292
 wire [STOREQ_IDX_BITS-1:0] storeq_prev = storeq_prev_idx(storeq_head);
+// TIMING: no drain_issue_now here. Its !mem_busy / drain_block_state / lookup_hit legs carried the TLB-and-arbiter cone into every...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-l1-cache-sv-298
 wire storeq_merge_lookup = !storeq_empty && storeq_valid[storeq_prev] &&
                            (storeq_addr[storeq_prev] == req_addr_r[31:2]) &&
                            !req_uncacheable_r &&
-                           !(storeq_prev == storeq_tail && (storeq_draining || drain_issue_now));
+                           !(storeq_prev == storeq_tail && storeq_draining);
+// The S_LOOKUP write merging into the very entry the drain is launching
+// this cycle: fold the incoming bytes into the launch latch too.
+wire storeq_merge_wr_now = (state == S_LOOKUP) && req_write_r &&
+                           !req_protect_write_r && storeq_merge_lookup;
+wire drain_merge_now = storeq_merge_wr_now && (storeq_prev == storeq_tail);
 // Store-queue count after this cycle's enqueue, including a simultaneously
 // completing drain.  Drives the post-write ready_r so a full queue is seen
 // immediately despite the one-cycle-late enqueue.
@@ -468,8 +461,14 @@ always_ff @(posedge clk) begin
             mem_valid_r <= 1'b1;
             mem_write_r <= 1'b1;
             mem_addr_r <= {storeq_addr[storeq_tail], 2'b00};
-            mem_din_r <= storeq_data[storeq_tail];
-            mem_be_r <= storeq_be[storeq_tail];
+            // A same-cycle merge into this very entry (drain_merge_now) must
+            // reach memory: latch the merged data/be, matching what the
+            // storeq entry itself is updated to this cycle.
+            mem_din_r <= drain_merge_now
+                       ? merge32(storeq_data[storeq_tail], req_din_r, req_be_r)
+                       : storeq_data[storeq_tail];
+            mem_be_r <= drain_merge_now ? (storeq_be[storeq_tail] | req_be_r)
+                                        : storeq_be[storeq_tail];
             mem_burstcount_r <= 8'd1;
             storeq_draining <= 1'b1;
         end

@@ -351,11 +351,15 @@ module tb_dhrystone;
         desc.D_B        = flags[7];
         desc.G          = flags[6];
         desc.A          = flags[5];
+`ifdef Z386_LEGACY_SEG_DESC
+        // z386_release keeps these fields redundantly in its descriptor cache.
+        // Current z386x derives them from seg_type instead.
         desc.executable = flags[15];
         desc.expand_down= ~flags[15] & flags[14];
         desc.conforming = flags[15] & flags[14];
         desc.writable   = ~flags[15] & flags[13];
         desc.readable   = flags[15] & flags[13];
+`endif
         return desc;
     endfunction
 

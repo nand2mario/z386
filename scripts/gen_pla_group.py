@@ -116,17 +116,8 @@ def main():
                               rows[key]))
 
     body = []
-    body.append("// ---- begin generated: pla_group_lookup (scripts/gen_pla_group.py) ----")
-    body.append("// Opcode -> second-level entry PLA row, derived from")
-    body.append("// pla_entry_lookup above and pla_control.svh.  DO NOT EDIT BY HAND.")
-    body.append("//")
-    body.append("// Returns entry_first[5:0] for opcodes whose first-level entry lookup")
-    body.append("// yields a group row (entry[11:6]==0 with modrm).  Lets the decoder run")
-    body.append("// the second-level lookup in parallel with the first instead of chained")
-    body.append("// behind it.  Result is don't-care (0) for non-group opcodes; the")
-    body.append("// entry_group select still comes from the real first-level result.")
-    body.append("//")
-    body.append("// Input format: {data32, opcode[7:0], pe_enable, has_0f}")
+    body.append("// Generated second-level group PLA; do not edit by hand.")
+    body.append("// Details: doc/z386x/implementation_notes.md#src-24-z386x-pla-entry-svh-561")
     body.append("function automatic logic [5:0] pla_group_lookup(")
     body.append("    input [10:0] addr_in")
     body.append(");")
@@ -161,7 +152,7 @@ def main():
 
     out = CORE / "pla_entry.svh"
     text = out.read_text()
-    begin_mark = "// ---- begin generated: pla_group_lookup"
+    begin_mark = "// Generated second-level group PLA"
     end_mark = "// ---- end generated: pla_group_lookup ----"
     block = "\n".join(body) + "\n"
     if begin_mark in text:

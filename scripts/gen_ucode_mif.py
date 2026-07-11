@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate ucode.mif (37-bit Quartus ROM init) from ucode.hex.
+"""Generate ucode.mif (40-bit Quartus ROM init) from ucode.hex.
 
-The microcode ROM stores the original 37-bit word; predecode bits 44:37 are
-computed in hardware in the ROM output register stage (see ucode_rom.sv), so
-no expanded image is needed.
+The microcode ROM stores the native 37-bit word in bits 36:0 and the v52 D2
+early kind in bits 39:37.  The 14 execution predecode bits remain computed in
+the ROM output register stage (see ucode_rom.sv).
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 ROM_DEPTH = 2560
-UCODE_BITS = 37
+UCODE_BITS = 40
 
 
 def read_words(path: Path) -> list[int]:
