@@ -678,7 +678,8 @@ localparam ALUJMP_CLI = 7'h2E;     // Clear IF (prime clear_if_pending flag)
 localparam ALUJMP_CLT = 7'h2F;    // Clear TF always, clear IF if primed by CLI
 localparam ALUJMP_SINTHW = 7'h32;  // SINTHW: Set interrupt_hw flag (HW IRQ/NMI/exception, not INT n)
 localparam ALUJMP_SMISC1 = 7'h33;  // Set MISC1 flag (INT handler sets this; JMISC1 tests it)
-localparam ALUJMP_SMISC2 = 7'h35;  // Set MISC2 flag (cross-privilege handler)
+localparam ALUJMP_SMISC2 = 7'h35;  // Set MISC2 microcode flag
+localparam ALUJMP_CMISC2 = 7'h3C;  // Clear MISC2 microcode flag
 localparam ALUJMP_SERRCF = 7'h36;  // Set error code flag (ERROR_CODE_FLAG = true)
 localparam ALUJMP_J16BIT = 7'h40;   // Jump if 286-format TSS in TR (16-bit stack switch / task save-load / IO map)
 localparam ALUJMP_JNBUSY = 7'h42;   // Jump if BUSY# inactive (always taken: no FPU)

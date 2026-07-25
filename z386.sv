@@ -3287,9 +3287,10 @@ always_ff @(posedge clk) begin
                     // SMISC1: Set MISC1 flag (used by INT handler to distinguish INT from call gate)
                     misc1_flag <= 1'b1;
                 end
-                ALUJMP_SMISC2: begin
-                    // SMISC2: Set MISC2 flag (used by cross-privilege handler)
-                    misc2_flag <= 1'b1;
+                ALUJMP_SMISC2: misc2_flag <= 1'b1;
+                ALUJMP_CMISC2: begin
+                    // 386 gate path: cancel the 16-bit-gate state set by SMISC2.
+                    misc2_flag <= 1'b0;
                 end
                 ALUJMP_SERRCF: begin
                     // SERRCF: Set error code flag (fault handlers set this before INT dispatch)

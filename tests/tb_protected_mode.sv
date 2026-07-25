@@ -71,6 +71,18 @@ module tb_protected_mode;
     reg prev_instruction_boundary = 0;
     longint instruction_count = 0;
 
+    // The 386-gate path clears the gate-width flag before common stack setup.
+    reg cmisc2_executed = 1'b0;
+    always @(posedge clk) begin
+        if (!reset_n) begin
+            cmisc2_executed <= 1'b0;
+        end else begin
+            if (cmisc2_executed && dut.misc2_flag)
+                $fatal(1, "CMISC2 failed to clear misc2_flag");
+            cmisc2_executed <= dut.uc_exec && (dut.uc_aluop == 7'h3C);
+        end
+    end
+
     // Test result tracking
     reg [7:0] test_status = 8'h00;  // 0x00=running, 0x01=pass, 0xFF=fail
     reg [31:0] test_data = 32'h0;
