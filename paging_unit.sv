@@ -16,6 +16,8 @@ module paging_unit
     // Memory/IO request from z386.sv
     //=========================================================================
     input               mem_req,           // Valid: memory/IO request pending
+    input               mem_inta_req,      // INTA request; kept out of the demand TLB/cache cone
+    input        [31:0] mem_inta_addr,
     input               mem_ea_read,       // This demand read uses the early-start EA (SET-read eligible)
     input               mem_req_precheck,  // mem_req before the GP/segment-fault gate; drives
                                            // speculative address capture + TLB-lookup-addr load
@@ -47,7 +49,6 @@ module paging_unit
     input               mem_check_only,    // CW: check write permission only, no actual bus write
     input        [1:0]  cpl,               // Current privilege level
     input               mem_is_io,         // This request is IO (skip translation)
-    input               mem_is_inta,       // IACK bus cycle (bypass paging, like IO)
     input        [3:0]  mem_be,            // Pre-computed byte enables (for IO and non-crossing mem)
 
     //=========================================================================
@@ -107,6 +108,7 @@ localparam bit TRACE_PAGING_EN = 1'b0;
 
 reg pf_ack_toggle_r;
 reg [127:0] pf_rdata_r;       // Registered read line for prefetch
+reg         pf_fast_pending;  // TLB-hit icache request, independent of demand FSM
 wire pf_ack_bypass;
 assign pf_ack_toggle = pf_ack_toggle_r ^ pf_ack_bypass;
 assign pf_rdata = pf_ack_bypass ? icache_rdata : pf_rdata_r;
@@ -165,11 +167,14 @@ reg  [31:0] tlb_lookup_addr_r;
 assign tlb_lookup_addr = tlb_lookup_addr_r;
 
 wire s_idle = (state == PG_IDLE);
-wire idle_mem_req = s_idle && mem_req && !mem_servicing;
+wire idle_data_req = s_idle && mem_req && !mem_servicing;
+wire idle_inta_req = s_idle && mem_inta_req && !mem_servicing;
+wire idle_mem_req = idle_data_req || idle_inta_req;
 wire idle_mem_precheck = s_idle && mem_req_precheck && !mem_servicing;
+wire idle_mem_capture = idle_mem_precheck || idle_inta_req;
 // P0/P1 prefetch timing: P0 prefetch toggles pf_req_toggle and presents pf_linear_addr. P1 paging translates the registered prefetch...
 // Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-unit-sv-189
-wire idle_pf_req = s_idle && pf_pending && !fast_path_pending && !mem_req_upcoming;
+wire idle_pf_req = s_idle && pf_pending && !fast_path_pending && !pf_fast_pending;
 
 paging_tlb tlb_inst (
     .clk            (clk),
@@ -313,10 +318,12 @@ reg        fast_path_pending; // A fast-path BIU request is in flight
 // Do not feed cache response/tag-compare timing back into the microsequencer.
 assign mem_complete_now = 1'b0;
 
-assign pf_ack_bypass = (state == PG_PF_BIU_WAIT) && icache_req_complete;
+assign pf_ack_bypass = ((state == PG_PF_BIU_WAIT) || pf_fast_pending) &&
+                       icache_req_complete;
 
 wire idle_mem_crossing = access_crosses_dword(mem_op_size, linear_addr[1:0]);
 wire idle_io_crossing = mem_is_io && idle_mem_crossing;
+wire [31:0] idle_request_linear = idle_inta_req ? mem_inta_addr : linear_addr;
 wire cache_lookup_granted = 1'b1;
 wire idle_mem_ready = s_idle && !mem_servicing;
 wire req_tlb_dirty_ok = !req_is_write || tlb_dirty;
@@ -335,7 +342,7 @@ wire req_mem_dcache_accept = req_mem_dcache_candidate && dcache_req_accepted;
 reg [19:0] live_pfn_pre;
 reg        live_hit_pre;
 always_ff @(posedge clk) begin
-    if (idle_mem_req && !mem_write && !mem_is_io && !mem_is_inta) begin
+    if (idle_data_req && !mem_write && !mem_is_io) begin
         live_pfn_pre <= live_tlb_physical[31:12];
         // Only trust the live lookup when linear_addr_live is the true linear;
         // for complex modrm it is a registered don't-care, so don't compare.
@@ -373,15 +380,13 @@ assign mem_accepted = mem_accepted_r || idle_mem_ready;
 wire        req_mem_present    = (state == PG_MEM_TLB);
 
 // Early read drives dcache at PG_IDLE / RD microcode time
-wire        early_rd_idx_drive = (state == PG_IDLE) && idle_mem_req &&
-                                 !mem_write && !mem_is_io && !mem_is_inta;
+wire        early_rd_idx_drive = idle_data_req && !mem_write && !mem_is_io;
 wire        early_rd_tlb_ok    = !pg_enable || (live_tlb_hit && live_user_ok);
 wire        early_rd_present   = early_rd_idx_drive && mem_ea_read && !idle_mem_crossing &&
                                  !mem_rd_ind && early_rd_tlb_ok;
 // Early write: post a cacheable, non-crossing, non-check-only write at PG_IDLE from the live TLB. Validated (zero EARLY-WRITE mismatches...
 // Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-unit-sv-415
-wire        early_wr_idx_drive = (state == PG_IDLE) && idle_mem_req &&
-                                 mem_write && !mem_is_io && !mem_is_inta;
+wire        early_wr_idx_drive = idle_data_req && mem_write && !mem_is_io;
 wire        early_wr_present   = early_wr_idx_drive && !idle_mem_crossing &&
                                  !mem_check_only && live_write_posts;
 wire        early_idx_drive    = early_rd_idx_drive || early_wr_idx_drive;
@@ -421,7 +426,7 @@ assign icache_req_valid = icache_req_valid_r || fast_pf_candidate;
 assign icache_req_phys_addr = icache_req_valid_r ? icache_req_phys_addr_r : fast_pf_phys;
 
 // Keep the registered TLB lookup address on a dedicated write-enable path.
-wire idle_mem_precheck_capture = idle_mem_precheck && !mem_is_io && !mem_is_inta;
+wire idle_mem_precheck_capture = idle_mem_precheck && !mem_is_io;
 wire idle_pf_lookup_capture = pg_enable && idle_pf_req && !pf_tlb_match;
 wire walk_cross_lookup_load = (state == PG_WALKING) &&
                               walk_done && !walk_fault &&
@@ -538,6 +543,7 @@ always_ff @(posedge clk or negedge reset_n) begin
         mem_accepted_r <= 1'b0;
         pf_ack_toggle_r <= 1'b0;
         pf_rdata_r <= 128'h0;
+        pf_fast_pending <= 1'b0;
         dcache_req_valid_r <= 1'b0;
         dcache_req_is_io_r <= 1'b0;
         dcache_req_is_inta_r <= 1'b0;
@@ -598,6 +604,17 @@ always_ff @(posedge clk or negedge reset_n) begin
         walk_request <= 1'b0;
         mem_accepted_r <= 1'b0;
 
+        // A translated icache request is independent of the demand-memory
+        // state machine. This allows a redirect fetch and a posted stack store
+        // (CALL) to launch together through the split I/D caches.
+        if (fast_pf_candidate && icache_req_accepted)
+            pf_fast_pending <= 1'b1;
+        if (pf_fast_pending && icache_req_complete) begin
+            pf_rdata_r <= icache_rdata;
+            pf_ack_toggle_r <= ~pf_ack_toggle_r;
+            pf_fast_pending <= 1'b0;
+        end
+
         // Clear walker pending on completion
         if (dcache_req_complete && walk_biu_pending)
             walk_biu_pending <= 1'b0;
@@ -632,19 +649,19 @@ always_ff @(posedge clk or negedge reset_n) begin
 
         case (state)
             PG_IDLE: begin
-                if (idle_mem_precheck) begin
-                    if (mem_is_io || mem_is_inta) begin
+                if (idle_mem_capture) begin
+                    if (mem_is_io || idle_inta_req) begin
                         if (!idle_io_crossing) begin
                             // IO/INTA fast path data (cannot segment-fault)
-                            dcache_req_phys_addr_r <= linear_addr;
+                            dcache_req_phys_addr_r <= idle_request_linear;
                             dcache_req_write_r <= mem_write;
                             dcache_req_be_r <= mem_be;
-                            dcache_req_wdata_r <= shift_write_data(mem_wdata, mem_op_size, linear_addr[1:0]);
+                            dcache_req_wdata_r <= shift_write_data(mem_wdata, mem_op_size, idle_request_linear[1:0]);
                             // First INTA cycle (addr=4) is dummy — suppress OPR_R update.
                             // Second INTA (addr=0) delivers the vector to OPR_R.
                             latch_biu_meta(2'd0, op_size_bytes_m1(mem_op_size), mem_write,
-                                           linear_addr[1:0],
-                                           mem_is_inta && (linear_addr[2:0] == 3'd4),
+                                           idle_request_linear[1:0],
+                                           idle_inta_req && (idle_request_linear[2:0] == 3'd4),
                                            1'b0);
                             rd_ind_active <= 1'b0;
                         end else begin
@@ -672,10 +689,10 @@ always_ff @(posedge clk or negedge reset_n) begin
                     end
                 end
 
-                if (idle_pf_req && !idle_mem_precheck) begin
+                if (idle_pf_req && !idle_mem_capture) begin
                     if (fast_pf_candidate) begin
-                        if (icache_req_accepted)
-                            state <= PG_PF_BIU_WAIT;
+                        // Completion is tracked by pf_fast_pending, allowing
+                        // demand translation to proceed in parallel.
                     end else if (pg_enable && pf_tlb_match && tlb_hit) begin
                         // Permission fail: silently fault, ack prefetch.
                         ack_prefetch_fault();
@@ -693,11 +710,11 @@ always_ff @(posedge clk or negedge reset_n) begin
                 if (idle_mem_req) begin
                     mem_accepted_r <= 1'b1;
                     mem_servicing <= 1'b1;
-                    if (mem_is_io || mem_is_inta) begin
+                    if (mem_is_io || idle_inta_req) begin
                         dcache_req_valid_r <= 1'b1;
                         if (!idle_io_crossing) begin
                             dcache_req_is_io_r <= mem_is_io;
-                            dcache_req_is_inta_r <= mem_is_inta;
+                            dcache_req_is_inta_r <= idle_inta_req;
                             fast_path_pending <= 1'b1;
                         end else begin
                             dcache_req_is_io_r <= 1'b1;

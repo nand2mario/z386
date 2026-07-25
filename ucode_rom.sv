@@ -6,19 +6,51 @@ module ucode_rom
     parameter INIT_HEX = "ucode.hex"
 ) (
     input              clk,
-    input              ce,
+    input              addr_ce,
+    input              q_ce,
     input       [11:0] addr,
     output      [50:0] q_early,
     output      [50:0] q,
     output      [2:0]  q_kind_early,
     output      [5:0]  q_shift_source,
+    output      [1:0]  q_shift2_source,
     output      [5:0]  q_shift_alu_src,
-    output      [6:0]  q_shift_aluop
+    output      [6:0]  q_shift_aluop,
+    output      [2:0]  q_dly_source,
+    output      [8:0]  q_mem_ctrl
 );
 
 (* preserve *) reg [5:0] q_shift_source_r;
+(* preserve *) reg [1:0] q_shift2_source_r;
 (* preserve *) reg [5:0] q_shift_alu_src_r;
 (* preserve *) reg [6:0] q_shift_aluop_r;
+reg [2:0] q_dly_source_r;
+(* preserve *) reg [8:0] q_mem_ctrl_r;
+
+// Source class for architectural GPR writes in an RNI delay slot. The Intel
+// ROM uses only these four sources; zero also covers non-forwarding uops.
+function automatic [2:0] dly_source_predecode(input [5:0] s);
+    case (s)
+        SRC_SIGMA:  dly_source_predecode = 3'd1;
+        SRC_OPR_R:  dly_source_predecode = 3'd2;
+        SRC_COUNTR: dly_source_predecode = 3'd3;
+        SRC_NEG1:   dly_source_predecode = 3'd4;
+        default:    dly_source_predecode = 3'd0;
+    endcase
+endfunction
+
+// SHIFT2 uses only four source fields in the immutable Intel ROM. Register a
+// compact selector beside q so the flag-critical barrel path avoids the
+// high-fanout general source decoder.
+function automatic [1:0] shift2_source_predecode(input [5:0] s);
+    case (s)
+        SRC_TMPC:   shift2_source_predecode = 2'd0;
+        SRC_TMPE:   shift2_source_predecode = 2'd1;
+        SRC_SIGMA:  shift2_source_predecode = 2'd2;
+        SRC_SRCREG: shift2_source_predecode = 2'd3;
+        default:    shift2_source_predecode = 2'd0;
+    endcase
+endfunction
 
 // Predecoded control bits 50:37, computed from the raw 37-bit word in the
 // ROM output register stage (one LUT level between RAM output and q_r).
@@ -78,6 +110,17 @@ function automatic [13:0] ucode_predecode(input [36:0] w);
     ucode_predecode[13] = (w[10:8] == 3'b110) && (subcode == 2'b10);
 endfunction
 
+// Dedicated copy of bits 47:39 for the paging request cone. Keeping these
+// controls beside q avoids routing the wide, high-fanout ucode bus into TLB
+// finalization and request selection.
+function automatic [8:0] mem_ctrl_predecode(input [36:0] w);
+    logic [13:0] p;
+    begin
+        p = ucode_predecode(w);
+        mem_ctrl_predecode = p[10:2];
+    end
+endfunction
+
 `ifdef Z386_QUARTUS_M10K_UCODE
 wire [39:0] q_mem;
 reg  [50:0] q_r;
@@ -97,7 +140,7 @@ altsyncram #(
 ) microcode_rom_altsyncram (
     .address_a(addr),
     .clock0(clk),
-    .clocken0(ce),
+    .clocken0(addr_ce),
     .q_a(q_mem),
     .aclr0(1'b0),
     .addressstall_a(1'b0),
@@ -109,11 +152,14 @@ altsyncram #(
 );
 
 always_ff @(posedge clk) begin
-    if (ce) begin
+    if (q_ce) begin
         q_r <= {ucode_predecode(q_mem[36:0]), q_mem[36:0]};
         q_shift_source_r <= q_mem[23:18];
+        q_shift2_source_r <= shift2_source_predecode(q_mem[23:18]);
         q_shift_alu_src_r <= q_mem[36:31];
         q_shift_aluop_r <= q_mem[17:11];
+        q_dly_source_r <= dly_source_predecode(q_mem[23:18]);
+        q_mem_ctrl_r <= mem_ctrl_predecode(q_mem[36:0]);
     end
 end
 
@@ -134,12 +180,16 @@ initial begin
 end
 
 	always_ff @(posedge clk) begin
-	    if (ce) begin
+	    if (addr_ce)
 	        q_mem <= microcode_rom[addr];
+	    if (q_ce) begin
 	        q_r <= {ucode_predecode(q_mem[36:0]), q_mem[36:0]};
 	        q_shift_source_r <= q_mem[23:18];
+	        q_shift2_source_r <= shift2_source_predecode(q_mem[23:18]);
 	        q_shift_alu_src_r <= q_mem[36:31];
 	        q_shift_aluop_r <= q_mem[17:11];
+	        q_dly_source_r <= dly_source_predecode(q_mem[23:18]);
+	        q_mem_ctrl_r <= mem_ctrl_predecode(q_mem[36:0]);
 	    end
 	end
 
@@ -149,7 +199,10 @@ assign q_kind_early = q_mem[39:37];
 `endif
 
 assign q_shift_source = q_shift_source_r;
+assign q_shift2_source = q_shift2_source_r;
 assign q_shift_alu_src = q_shift_alu_src_r;
 assign q_shift_aluop = q_shift_aluop_r;
+assign q_dly_source = q_dly_source_r;
+assign q_mem_ctrl = q_mem_ctrl_r;
 
 endmodule

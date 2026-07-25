@@ -16,6 +16,8 @@ bounded recipes; a memory ustep may hold while its request completes.
 | `lea` | `0B9` | `EA` | `0B9` | `0B9 0BA` | `src-reg` | `reclaim` | ea |
 | `shift-r-imm` | `0F9` | `NONE` | `0F9 0FA` | `0F9 0FA 0FB` | `shift-dst/flags` | `reclaim` | dst |
 | `shift-r-cl` | `0FF` | `NONE` | `0FF 100` | `0FF 100 101` | `shift-dst/flags` | `reclaim` | dst, ecx |
+| `shxd-r-imm` | `0FC` | `NONE` | `0FC 0FD` | `0FC 0FD 0FE` | `shift-dst/flags` | `reclaim` | dst, src |
+| `shxd-r-cl` | `102` | `NONE` | `102 103` | `102 103 104` | `shift-dst/flags` | `reclaim` | dst, src, ecx |
 | `shift-r-one` | `105` | `NONE` | `105 106` | `105 106 107` | `shift-dst/flags` | `reclaim` | dst |
 | `szext-r-16` | `1E8` | `NONE` | `1E8 1E9` | `1E8 1E9 1EA` | `sigma-src` | `reclaim` | dst |
 | `szext-r-32` | `1F0` | `NONE` | `1F0 1F1` | `1F0 1F1 1F2` | `sigma-src` | `reclaim` | dst |
@@ -39,5 +41,5 @@ bounded recipes; a memory ustep may hold while its request completes.
 | `push-imm` | `09D` | `STACK` | `09D` | `09D 09E` | `store/esp` | `retain` | stack |
 | `pop-r` | `09F` | `STACK` | `09F 0A0` | `09F 0A0 0A1` | `mem-dst/esp` | `retain` | stack |
 
-Recipes: 32. Native microcode remains 37-bit.
+Recipes: 34. Native microcode remains 37-bit.
 The generated 40-bit ROM image stores the D2 early kind in bits 39:37.

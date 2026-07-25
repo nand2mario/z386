@@ -149,6 +149,15 @@ function automatic fast_class_t dec_fast_class(input dec_entry_t e);
             else r.reads_dst = 1'b1;   // SZ_EXT reads DSTREG at the entry word =
                                        // the deferred-load-commit cycle when
                                        // chained out of a load: gate needed
+        end else if (((e.opcode == 8'hA4) || (e.opcode == 8'hA5) ||
+                      (e.opcode == 8'hAC) || (e.opcode == 8'hAD)) && mod11) begin
+            // SHLD/SHRD r,r,imm/CL: SHIFT1 then SHIFT2+RNI; replace the
+            // SIGMA->DSTREG slot with the existing deferred SHIFT commit.
+            r.fast = 1'b1; r.multi_word = 1'b1;
+            r.commit_sel = FAST_COMMIT_SHIFT;
+            r.reads_dst = 1'b1; r.reads_src = 1'b1;
+            r.reads_ecx = e.opcode[0];
+            r.writes_flags = 1'b1;
         end
     end else if (!e.has_0f && e.rep_lock == PREFIX_NOREPLOCK) begin
         if (e.opcode[7:6] == 2'b00) begin
@@ -273,7 +282,11 @@ function automatic fast_class_t dec_fast_class(input dec_entry_t e);
             // SIGMA precompute (uses_ea via the stack gate).
             r.br_rel = 1'b1;
             r.fast = 1'b1; r.multi_word = 1'b1;
-            if (e.opcode == 8'hE8) r.uses_ea = 1'b1;
+            if (e.opcode == 8'hE8) begin
+                r.uses_ea = 1'b1;
+                if (e.data32)
+                    r.commit_sel = FAST_COMMIT_ESP;
+            end
         end else if (e.opcode == 8'hC3 || e.opcode == 8'hC2) begin
             // RET / RET iw (near): 072 RD + new-ESP, 073 eSP + jump, 074
             // IND=OPR_R, JMP_PREF..., 068 eIP+RNI - chainN reclaims the final

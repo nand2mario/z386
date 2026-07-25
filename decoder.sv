@@ -7,7 +7,7 @@ module decoder
     input               reset_n,
 
     // Prefetch queue interface (two-cursor protocol)
-    input        [31:0] win_d1,         // registered window at the D1 cursor
+    input        [63:0] win_d1,         // registered raw window at the D1 cursor
     input        [5:0]  d1_avail,       // bytes fetched beyond the D1 cursor
     output       [3:0]  d1_adv,         // D1 cursor advance (0-11 bytes: a prefix,
                                         //   or the whole rest of the instruction
@@ -24,26 +24,21 @@ module decoder
 
     // Control signals
     input               q_flush,        // Flush decoder on branch
-    input               i_pop,          // Pop decoded instruction from queue
+    input               i_pop,          // D2 fires into EX
 
     // Decoded instruction output
     output dec_entry_t  i_bus,          // Decoded instruction
-    output              decq_empty,     // Instruction queue empty
-    output dec_entry_t  i_bus2,         // Second queue entry (issue lookahead)
-    output              decq_has2,      // i_bus2 is valid
+    output              decq_empty,     // Legacy name: unified D2 has no skeleton
+    output dec_entry_t  i_bus2,         // Registered D1 skid successor
+    output              decq_has2,      // skid successor can complete D2 in one cycle
     output              decq_has_jmp_call, // JMP/CALL rel in flight (halt speculative prefetch)
 
-    // D2-AGU sidecar
-    output dec_entry_t  d2_entry,       // the completing entry (= push_entry)
-    output              d2_push,        // it lands this cycle (= i_push)
-    output       [11:0] skel_entry_point, // skel.entry.entry_point, a PURE register
-                                        //   field for the fold-entry uaddr leg
-    input        [31:0] d2_ea_lin,      // AGU result for the completing entry
-    input               d2_ea_v,        // eligible + no same-cycle conflict
-    input        [7:0]  ea_inval_gpr,   // GPR writes committing this cycle (onehot)
-    input               ea_inval_all,   // seg-base load / mode change / rare events
-    output       [31:0] head_ea_lin,    // head's sidecar linear
-    output              head_ea_v       //   (valid => equals the pop-time compute)
+    // Unified D2 payload and empty-pipe D1 launch
+    output dec_entry_t  d2_entry,       // instruction completing D2
+    output              d2_push,        // d2_entry is complete this cycle
+    output              d1_issue_direct,// handoff has no older D2 skeleton
+    output       [11:0] d1_issue_entry_point,
+    output dec_entry_t  d1_issue_entry  // live structural entry for empty-pipe launch
 );
 
 typedef enum logic [1:0] {
@@ -72,57 +67,6 @@ typedef struct packed {
 `include "pla_control.svh"
 `include "pla_entry.svh"
 
-dec_entry_t head_reg;
-dec_entry_t ela_reg;
-dec_entry_t ela2_reg;   // second elasticity slot: banking depth, not rate -
-                        // lets D1/D2 run ahead through multi-cycle EX
-                        // instructions and feed issue bursts (the 4-deep
-                        // decq provided this; A/B measured on Dhrystone)
-reg         head_v;
-reg         ela_v;
-reg         ela2_v;
-
-assign i_bus = head_reg;
-assign decq_empty = !head_v;
-reg    ela2_off = 1'b0;   // sim chicken bit: +ela2_off = 2-deep elasticity A/B
-// Registered occupancy ONLY - no i_pop bypass (L1).
-wire   out_full = head_v && ela_v && (ela2_v || ela2_off);
-// synthesis translate_off
-initial if ($test$plusargs("ela2_off")) ela2_off = 1'b1;
-longint ela_c0, ela_c1, ela_c2, ela_cblk;
-always @(posedge clk) if (reset_n) begin
-    ela_c0 <= ela_c0 + 1;
-    if (ela_v)  ela_c1 <= ela_c1 + 1;
-    if (ela2_v) ela_c2 <= ela_c2 + 1;
-    if (d2_done_blocked) ela_cblk <= ela_cblk + 1;
-end
-final if ($test$plusargs("ela_stats"))
-    $display("ela: cycles=%0d ela_v=%0d (%.1f%%) ela2_v=%0d (%.1f%%) d2_blocked_by_full=%0d (%.1f%%)",
-             ela_c0, ela_c1, 100.0*ela_c1/ela_c0, ela_c2, 100.0*ela_c2/ela_c0,
-             ela_cblk, 100.0*ela_cblk/ela_c0);
-// synthesis translate_on
-
-assign i_bus2 = ela_v ? ela_reg : push_entry;
-assign decq_has2 = head_v && (ela_v || d2_done);
-
-assign d2_entry = push_entry;
-assign d2_push  = d2_done;
-
-// D2-AGU sidecar: one {linear, valid} per slot, shifting with the promotes.
-reg [31:0] head_ea_r, ela_ea_r, ela2_ea_r;
-reg        head_eav, ela_eav, ela2_eav;
-// synthesis translate_off
-reg [31:0] head_ea_tag, ela_ea_tag, ela2_ea_tag;  // entry displacement at land (desync detector)
-// synthesis translate_on
-assign head_ea_lin = head_ea_r;
-assign head_ea_v   = head_eav;
-
-// A stored sidecar survives only while nothing that fed it changes.
-function automatic logic ea_keep(input dec_entry_t e, input logic v);
-    ea_keep = v && !ea_inval_all &&
-              (((e.ea_base_onehot | e.ea_index_onehot) & ea_inval_gpr) == 8'h00);
-endfunction
-
 //=============================================================================
 // D1 - structural decode
 //=============================================================================
@@ -135,17 +79,22 @@ logic        prefix_rep;
 logic [3:0]  prefix_count;
 logic [1:0]  prefix_rep_lock;
 logic [2:0]  prefix_seg;
+reg         code32_r;     // Local CS.D copy; frontend flush hides its one-cycle update latency.
 
 reg            d1_sib;      // SIB sub-cycle pending (cursor held)
 decoder_work_t pend_work;   // struct_work parked across the SIB sub-cycle
+decoder_work_t skid;        // one registered D1 successor ahead of D2
+reg            skid_v;
+reg [4:0]      skid_lit_off;
+reg            skid_one_d2;
 
 // Byte aliases at the D1 cursor.  The cursor does not advance until the
 // skeleton handoff, so during the SIB sub-cycle the sib byte is byte 2.
 wire [7:0] opcode = win_d1[7:0];
 wire [7:0] modrm  = win_d1[15:8];
 wire [7:0] sib_b  = win_d1[23:16];
-wire       data32 = D ^ prefix_66;
-wire       addr32 = D ^ prefix_67;
+wire       data32 = code32_r ^ prefix_66;
+wire       addr32 = code32_r ^ prefix_67;
 
 wire consume_prefix = !d1_sib && !prefix_0f && is_prefix(opcode) &&
                       (d1_avail >= 6'd1);
@@ -162,16 +111,22 @@ wire sib_bytes_ok    = d1_sib && (d1_avail >= 6'd3);   // opcode+modrm+sib in vi
 // skel_free: d2_done's terms are lit_avail / out_full / phase - all
 // register-derived, never i_pop (L1) - so the same-edge free is legal.
 wire d2_done;
-wire skel_free = !skel_v || d2_done;
+wire d1_slot_ready = !skid_v || i_pop;
 
 wire d1_to_sib  = !consume_prefix && !consume_0f &&
                   struct_bytes_ok && struct_work.need_sib;
-wire d1_handoff = !consume_prefix && !consume_0f && skel_free &&
+wire d1_handoff = !consume_prefix && !consume_0f && d1_slot_ready &&
                   ((struct_bytes_ok && !struct_work.need_sib) || sib_bytes_ok);
 
 decoder_work_t handoff_work;
 always_comb begin
     handoff_work = d1_sib ? capture_sib(pend_work, sib_b) : struct_work;
+end
+decoder_work_t handoff_d2;
+always_comb begin
+    handoff_d2 = handoff_work;
+    {handoff_d2.entry.ea_index_onehot, handoff_d2.entry.ea_base_onehot} =
+        dec_ea_onehots(handoff_work.entry);
 end
 // First literal byte, as an offset from the POP cursor (prefix bytes are
 // not popped until D2 completes): total length minus the literal bytes.
@@ -184,6 +139,34 @@ wire [4:0] handoff_lit_off = handoff_work.entry.length -
 // bytes; d1_avail clamps to 0 in that case and D1 waits for the fill.
 wire [4:0] handoff_adv = handoff_work.entry.length -
                          {1'b0, prefix_count} - (prefix_0f ? 5'd1 : 5'd0);
+// Prefix and 0F bytes have already advanced the D1 cursor. Relative to the
+// registered raw D1 window, the first literal follows only opcode/ModR/M/SIB.
+wire [4:0] handoff_raw_lit_off_w = handoff_lit_off -
+                                    {1'b0, prefix_count} -
+                                    (prefix_0f ? 5'd1 : 5'd0);
+wire [1:0] handoff_raw_lit_off = handoff_raw_lit_off_w[1:0];
+
+// The entry PLA result is valid during D1 handoff, one cycle before the
+// registered skeleton completes D2. It directly launches an empty D2 pipe.
+wire [3:0] handoff_lit_size = {1'b0, handoff_work.lit1_size} +
+                              {1'b0, handoff_work.lit2_size};
+wire handoff_one_d2 = (handoff_work.lit2_kind == LIT_NONE ||
+                       handoff_lit_size <= 4'd4) &&
+                      (d1_avail >= {1'b0, handoff_adv});
+wire [3:0] handoff_raw_need = (handoff_work.lit2_kind == LIT_NONE ||
+                               handoff_lit_size <= 4'd4)
+                            ? handoff_lit_size
+                            : {1'b0, handoff_work.lit1_size};
+wire [5:0] handoff_raw_end = {1'b0, handoff_raw_lit_off_w} +
+                             {2'b00, handoff_raw_need};
+wire handoff_raw_valid = (d1_avail >= handoff_raw_end);
+// Launch the synchronous ROM as soon as structural decode owns an empty D2.
+// D2 holds the returned word while late or second literals are captured.
+assign d1_issue_direct = d1_handoff && !skel_v;
+assign d1_issue_entry_point = handoff_work.entry.entry_point;
+always_comb begin
+    d1_issue_entry = handoff_d2.entry;
+end
 
 // TIMING: no !q_flush in the advance/pop legs. q_flush carries the deep uc_exec/mem-block cone
 assign d1_adv = (consume_prefix || consume_0f) ? 4'd1 :
@@ -195,15 +178,47 @@ assign d1_adv = (consume_prefix || consume_0f) ? 4'd1 :
 //=============================================================================
 
 decoder_work_t skel;
-// Member-select port assign lives BELOW the struct declaration (Quartus
-// rejects field selects on identifiers declared later in the file).
-assign skel_entry_point = skel.entry.entry_point;
 reg            skel_v;
 reg [4:0]      skel_lit_off;
+reg [31:0]     skel_raw_hi_r;    // upper half of the opcode-relative D1 window
+reg [1:0]      skel_raw_lit_off_r;
+reg [31:0]     skel_lit_r;       // shared low raw half or pop-relative literal
+reg            skel_window_valid_r;
+reg            skel_window_raw_r; // skel_lit_r is the low half of the D1 window
+wire           head_v = skel_v;  // temporary trace compatibility alias
+
+// Register the raw literal window on the edge that installs an instruction in
+// D2. On replacement, the old pop cursor is still active, so add the retiring
+// instruction length to reach the successor. Literal interpretation remains a
+// D2 operation and therefore does not lengthen the D1 structural path.
+wire promote_skid_capture = i_pop && skid_v;
+wire promote_handoff_capture = d1_handoff &&
+                                ((!skel_v && !i_pop) || (i_pop && !skid_v));
+wire incoming_capture = promote_skid_capture || promote_handoff_capture;
+// Only skid promotion reads a successor through the pop-relative literal
+// port. A direct D1 handoff freezes its opcode-relative win_d1 bytes instead;
+// do not feed live structural length decode back through the queue aligner.
+wire [5:0] skid_lit_abs = {1'b0, skel.entry.length} +
+                          {1'b0, skid_lit_off};
+wire [2:0] incoming_lit1_size = promote_skid_capture ? skid.lit1_size :
+                                                        handoff_d2.lit1_size;
+wire [2:0] incoming_lit2_size = promote_skid_capture ? skid.lit2_size :
+                                                        handoff_d2.lit2_size;
+wire [1:0] incoming_lit2_kind = promote_skid_capture ? skid.lit2_kind :
+                                                        handoff_d2.lit2_kind;
+wire [3:0] incoming_lit_total = {1'b0, incoming_lit1_size} +
+                                {1'b0, incoming_lit2_size};
+wire incoming_fields_fit = (incoming_lit2_kind == LIT_NONE) ||
+                           (incoming_lit_total <= 4'd4);
+wire [3:0] incoming_lit_size = incoming_fields_fit ? incoming_lit_total :
+                                                     {1'b0, incoming_lit1_size};
+wire incoming_bytes_ok = lit_avail >= {2'b00, incoming_lit_size};
 
 always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
+        code32_r <= 1'b0;
         skel_v <= 1'b0;
+        skid_v <= 1'b0;
         d1_sib <= 1'b0;
         prefix_66 <= 1'b0;
         prefix_67 <= 1'b0;
@@ -213,7 +228,9 @@ always_ff @(posedge clk or negedge reset_n) begin
         prefix_rep_lock <= PREFIX_NOREPLOCK;
         prefix_seg <= PREFIX_NOSEG;
     end else if (q_flush) begin
+        code32_r <= D;
         skel_v <= 1'b0;
+        skid_v <= 1'b0;
         d1_sib <= 1'b0;
         prefix_66 <= 1'b0;
         prefix_67 <= 1'b0;
@@ -223,6 +240,7 @@ always_ff @(posedge clk or negedge reset_n) begin
         prefix_rep_lock <= PREFIX_NOREPLOCK;
         prefix_seg <= PREFIX_NOSEG;
     end else begin
+        code32_r <= D;
         if (consume_prefix || consume_0f) begin
             if (consume_0f) begin
                 prefix_0f <= 1'b1;
@@ -253,9 +271,6 @@ always_ff @(posedge clk or negedge reset_n) begin
         end
 
         if (d1_handoff) begin
-            skel <= handoff_work;
-            skel_v <= 1'b1;
-            skel_lit_off <= handoff_lit_off;
             d1_sib <= 1'b0;
             // The skeleton carries the prefix state; clear for the next one.
             prefix_66 <= 1'b0;
@@ -265,8 +280,42 @@ always_ff @(posedge clk or negedge reset_n) begin
             prefix_count <= 4'd0;
             prefix_rep_lock <= PREFIX_NOREPLOCK;
             prefix_seg <= PREFIX_NOSEG;
-        end else if (d2_done) begin
-            skel_v <= 1'b0;
+        end
+
+        // The skid holds one structurally decoded successor while D2 owns the
+        // current instruction. On d2_fire it promotes from registered state,
+        // keeping the full D1 decoder out of the ROM-address path.
+        if (i_pop) begin
+            if (skid_v) begin
+                skel <= skid;
+                skel_v <= 1'b1;
+                skel_lit_off <= skid_lit_off;
+                if (d1_handoff) begin
+                    skid <= handoff_d2;
+                    skid_v <= 1'b1;
+                    skid_lit_off <= handoff_lit_off;
+                    skid_one_d2 <= handoff_one_d2;
+                end else begin
+                    skid_v <= 1'b0;
+                end
+            end else if (d1_handoff) begin
+                skel <= handoff_d2;
+                skel_v <= 1'b1;
+                skel_lit_off <= handoff_lit_off;
+            end else begin
+                skel_v <= 1'b0;
+            end
+        end else if (d1_handoff) begin
+            if (!skel_v) begin
+                skel <= handoff_d2;
+                skel_v <= 1'b1;
+                skel_lit_off <= handoff_lit_off;
+            end else begin
+                skid <= handoff_d2;
+                skid_v <= 1'b1;
+                skid_lit_off <= handoff_lit_off;
+                skid_one_d2 <= handoff_one_d2;
+            end
         end
     end
 end
@@ -287,24 +336,39 @@ wire       has_litB = (skel.lit2_kind != LIT_NONE);
 wire [3:0] sizeAB   = {1'b0, sizeA} + {1'b0, sizeB};
 wire       ab_fit   = (sizeAB <= 4'd4);   // both fields inside one window
 
-assign lit_off = skel_lit_off + (d2_phaseB ? {2'b00, sizeA} : 5'd0);
+// Once field A is in the registered window, the live literal port is free to
+// preread field B while D2 interprets A.
+wire d2_window_valid = skel_window_valid_r;
+wire prefetch_fieldB = skel_v && d2_window_valid && !d2_phaseB &&
+                       has_litB && !ab_fit;
+wire [4:0] resident_lit_off = skel_lit_off +
+                              ((d2_phaseB || prefetch_fieldB)
+                                  ? {2'b00, sizeA} : 5'd0);
+assign lit_off = promote_skid_capture ? skid_lit_abs[4:0] : resident_lit_off;
 
-// Captures reproduce the old DEC_LIT1/DEC_LIT2 semantics exactly: same
-// capture_literal function, same field-merge behavior, and the second
-// field always sees its bytes at offset 0 of its view (winB pre-shifts
-// when both fields capture in one cycle).
+// D1 carries raw bytes, not parsed literals. D2 selects the literal start from
+// the registered window; the second field uses the live literal port only when
+// both fields do not fit in this 32-bit view.
 decoder_work_t capA;
 decoder_work_t capAB;
 decoder_work_t capB;
-wire [31:0] winB = (sizeA == 3'd1) ? { 8'h00, win_lit[31:8]}  :
-                   (sizeA == 3'd2) ? {16'h0,  win_lit[31:16]} :
-                   (sizeA == 3'd3) ? {24'h0,  win_lit[31:24]} : 32'h0;
+wire [31:0] skel_raw_lit_win =
+    skel_raw_lit_off_r == 2'd0 ? skel_lit_r :
+    skel_raw_lit_off_r == 2'd1 ? {skel_raw_hi_r[7:0],  skel_lit_r[31:8]}  :
+    skel_raw_lit_off_r == 2'd2 ? {skel_raw_hi_r[15:0], skel_lit_r[31:16]} :
+                                 {skel_raw_hi_r[23:0], skel_lit_r[31:24]};
+wire [31:0] skel_lit_win = skel_window_raw_r ? skel_raw_lit_win : skel_lit_r;
+wire [31:0] winB = (sizeA == 3'd1) ? { 8'h00, skel_lit_win[31:8]}  :
+                   (sizeA == 3'd2) ? {16'h0,  skel_lit_win[31:16]} :
+                   (sizeA == 3'd3) ? {24'h0,  skel_lit_win[31:24]} : 32'h0;
 always_comb begin
-    capA  = capture_literal(skel, win_lit, skel.lit1_kind, skel.lit1_size,
+    capA  = capture_literal(skel, skel_lit_win,
+                            skel.lit1_kind, skel.lit1_size,
                             skel.lit1_sign_extend, skel.lit1_mirror_disp);
     capAB = capture_literal(capA, winB, capA.lit2_kind, capA.lit2_size,
                             capA.lit2_sign_extend, capA.lit2_mirror_disp);
-    capB  = capture_literal(workB, win_lit, workB.lit2_kind, workB.lit2_size,
+    capB  = capture_literal(workB, skel_lit_win,
+                            workB.lit2_kind, workB.lit2_size,
                             workB.lit2_sign_extend, workB.lit2_mirror_disp);
 end
 
@@ -313,13 +377,12 @@ wire [3:0] need_now  = d2_phaseB ? {1'b0, sizeB} :
                        !has_litA ? 4'd0 :
                        (has_litB && ab_fit) ? sizeAB : {1'b0, sizeA};
 wire       bytes_ok  = (lit_avail >= {2'b00, need_now});
-wire       d2_can    = skel_v && bytes_ok;
-assign     d2_done   = d2_can && finishing && !out_full;
-`ifndef SYNTHESIS
-wire       d2_done_blocked = d2_can && finishing && out_full;  // census only
-`endif
+wire       d2_can    = skel_v && d2_window_valid;
+wire       d2_complete = d2_can && finishing;
+assign     d2_done   = i_pop;
 // Field A may capture while the output side is full (no push happens here).
 wire       d2_stepA  = d2_can && !finishing;
+wire       d2_late_capture = skel_v && !d2_window_valid && bytes_ok;
 
 decoder_work_t d2_final;
 always_comb begin
@@ -333,11 +396,48 @@ always_ff @(posedge clk or negedge reset_n) begin
         d2_phaseB <= 1'b0;
     end else if (q_flush) begin
         d2_phaseB <= 1'b0;
+    end else if (incoming_capture) begin
+        d2_phaseB <= 1'b0;
+    end else if (d2_done) begin
+        d2_phaseB <= 1'b0;
     end else if (d2_stepA) begin
         workB <= capA;
         d2_phaseB <= 1'b1;
+    end
+end
+
+always_ff @(posedge clk or negedge reset_n) begin
+    if (!reset_n) begin
+        skel_raw_hi_r <= 32'h0;
+        skel_raw_lit_off_r <= 2'd0;
+        skel_lit_r <= 32'h0;
+        skel_window_valid_r <= 1'b0;
+        skel_window_raw_r <= 1'b0;
+    end else if (q_flush) begin
+        skel_window_valid_r <= 1'b0;
+    end else if (i_pop && skid_v) begin
+        // A skid promotion has a full registered D2 cycle before use. Capture
+        // its pop-relative literal view now instead of duplicating 64 raw bits
+        // in the D1 skid entry.
+        skel_lit_r <= win_lit;
+        skel_window_valid_r <= incoming_bytes_ok;
+        skel_window_raw_r <= 1'b0;
+    end else if (promote_handoff_capture) begin
+        skel_lit_r <= win_d1[31:0];
+        skel_raw_hi_r <= win_d1[63:32];
+        skel_raw_lit_off_r <= handoff_raw_lit_off;
+        skel_window_valid_r <= handoff_raw_valid;
+        skel_window_raw_r <= 1'b1;
+    end else if (d2_stepA) begin
+        skel_lit_r <= win_lit;
+        skel_window_valid_r <= (lit_avail >= {3'b000, sizeB});
+        skel_window_raw_r <= 1'b0;
+    end else if (d2_late_capture) begin
+        skel_lit_r <= win_lit;
+        skel_window_valid_r <= 1'b1;
+        skel_window_raw_r <= 1'b0;
     end else if (d2_done) begin
-        d2_phaseB <= 1'b0;
+        skel_window_valid_r <= 1'b0;
     end
 end
 
@@ -348,7 +448,13 @@ always_comb begin
     {push_entry.ea_index_onehot, push_entry.ea_base_onehot} = dec_ea_onehots(push_entry);
 end
 
-wire i_push = d2_done;
+assign d2_entry = push_entry;
+assign d2_push  = d2_complete;
+assign i_bus = push_entry;
+assign decq_empty = !skel_v;
+assign i_bus2 = skid.entry;
+assign decq_has2 = skel_v && skid_v && skid_one_d2;
+
 assign pop_now = d2_done;
 assign pop_len = skel.entry.length;
 
@@ -413,6 +519,9 @@ always @(posedge clk) begin
                  push_entry.immediate, push_entry.displacement, d2_phaseB);
 end
 always @(posedge clk) begin
+    if (reset_n && d1_handoff && (handoff_raw_lit_off_w[4:2] != 3'b000))
+        $fatal(1, "D1: raw literal offset exceeds opcode window: off=%0d op=%02x",
+               handoff_raw_lit_off_w, handoff_work.entry.opcode);
     // The literal plan must tile the instruction exactly: pop_len bytes =
     // struct bytes (lit_off) + literal bytes.
     if (reset_n && skel_v &&
@@ -425,129 +534,6 @@ always @(posedge clk) begin
 end
 // synthesis translate_on
 
-// EX-side registers: head + elasticity (the decq replacement)
-always_ff @(posedge clk) begin
-    if (!reset_n || q_flush) begin
-        head_v <= 1'b0;
-        ela_v  <= 1'b0;
-        ela2_v <= 1'b0;
-    end else begin
-        if (i_pop) begin
-            head_reg <= ela_reg;
-            head_v   <= ela_v;
-            ela_reg  <= ela2_reg;
-            ela_v    <= ela2_v;
-            ela2_v   <= 1'b0;
-            if (i_push) begin
-                // Land at the pre-pop tail (the later assignment overrides
-                // the promote of that slot); occupancy 3 is unreachable
-                // here (out_full gate).
-                if (ela_v) begin
-                    ela_reg <= push_entry;
-                    ela_v   <= 1'b1;
-                end else begin
-                    head_reg <= push_entry;
-                    head_v   <= 1'b1;
-                end
-            end
-        end else if (i_push) begin
-            if (!head_v) begin
-                head_reg <= push_entry;
-                head_v   <= 1'b1;
-            end else if (!ela_v) begin
-                ela_reg <= push_entry;
-                ela_v   <= 1'b1;
-            end else begin
-                ela2_reg <= push_entry;
-                ela2_v   <= 1'b1;
-            end
-        end
-    end
-end
-
-// synthesis translate_off
-always @(posedge clk) begin
-    if (reset_n && i_pop && !head_v)
-        $fatal(1, "EXQ: pop with empty head register");
-    if (reset_n && i_push && i_pop && ela_v && ela2_v)
-        $fatal(1, "EXQ: push at full occupancy (gate must block this)");
-    if (reset_n && ((ela_v && !head_v) || (ela2_v && !ela_v)))
-        $fatal(1, "EXQ: occupancy not contiguous (h=%b e=%b e2=%b)",
-               head_v, ela_v, ela2_v);
-end
-// synthesis translate_on
-
-// Sidecar shift: mirrors the entry block above; valids additionally pass
-// through the invalidation snoop each cycle (a captured sidecar is checked
-// against writes committing in ITS OWN landing cycle by the core-side
-// d2_ea_v, and against later writes here).
-wire d2_ea_land_v = d2_ea_v && !ea_inval_all;
-always_ff @(posedge clk) begin
-    if (!reset_n || q_flush) begin
-        head_eav <= 1'b0;
-        ela_eav  <= 1'b0;
-        ela2_eav <= 1'b0;
-    end else begin
-        if (i_pop) begin
-            head_ea_r <= ela_ea_r;
-            head_eav  <= ea_keep(ela_reg, ela_v ? ela_eav : 1'b0);
-            ela_ea_r  <= ela2_ea_r;
-            ela_eav   <= ea_keep(ela2_reg, ela2_v ? ela2_eav : 1'b0);
-            ela2_eav  <= 1'b0;
-            // synthesis translate_off
-            head_ea_tag <= ela_ea_tag; ela_ea_tag <= ela2_ea_tag;
-            // synthesis translate_on
-            if (i_push) begin
-                if (ela_v) begin
-                    ela_ea_r <= d2_ea_lin;
-                    ela_eav  <= d2_ea_land_v;
-                    // synthesis translate_off
-                    ela_ea_tag <= d2_entry.displacement;
-                    // synthesis translate_on
-                end else begin
-                    head_ea_r <= d2_ea_lin;
-                    head_eav  <= d2_ea_land_v;
-                    // synthesis translate_off
-                    head_ea_tag <= d2_entry.displacement;
-                    // synthesis translate_on
-                end
-            end
-        end else begin
-            head_eav <= ea_keep(head_reg, head_v ? head_eav : 1'b0);
-            ela_eav  <= ea_keep(ela_reg,  ela_v  ? ela_eav  : 1'b0);
-            ela2_eav <= ea_keep(ela2_reg, ela2_v ? ela2_eav : 1'b0);
-            if (i_push) begin
-                if (!head_v) begin
-                    head_ea_r <= d2_ea_lin;
-                    head_eav  <= d2_ea_land_v;
-                    // synthesis translate_off
-                    head_ea_tag <= d2_entry.displacement;
-                    // synthesis translate_on
-                end else if (!ela_v) begin
-                    ela_ea_r <= d2_ea_lin;
-                    ela_eav  <= d2_ea_land_v;
-                    // synthesis translate_off
-                    ela_ea_tag <= d2_entry.displacement;
-                    // synthesis translate_on
-                end else begin
-                    ela2_ea_r <= d2_ea_lin;
-                    ela2_eav  <= d2_ea_land_v;
-                    // synthesis translate_off
-                    ela2_ea_tag <= d2_entry.displacement;
-                    // synthesis translate_on
-                end
-            end
-        end
-    end
-end
-
-// synthesis translate_off
-always @(posedge clk)
-    if (reset_n && i_pop && head_eav && (head_ea_tag !== head_reg.displacement))
-        $fatal(1, "EXQ: sidecar/entry DESYNC at pop: tag=%08x entry.disp=%08x op=%02x",
-               head_ea_tag, head_reg.displacement, head_reg.opcode);
-// synthesis translate_on
-
 // JMP/CALL rel is unconditionally taken, so its speculative fall-through prefetch is always wasted.
 function automatic logic entry_jmp_call(input dec_entry_t e);
     entry_jmp_call = !e.has_0f && (e.opcode == 8'hEB || e.opcode == 8'hE9 ||
@@ -555,10 +541,9 @@ function automatic logic entry_jmp_call(input dec_entry_t e);
 endfunction
 
 assign decq_has_jmp_call =
-    (head_v && entry_jmp_call(head_reg)) ||
-    (ela_v  && entry_jmp_call(ela_reg)) ||
-    (ela2_v && entry_jmp_call(ela2_reg)) ||
-    (i_push && entry_jmp_call(push_entry));
+    (d2_push && entry_jmp_call(push_entry)) ||
+    (skid_v && skid_one_d2 && entry_jmp_call(skid.entry)) ||
+    (d1_handoff && handoff_one_d2 && entry_jmp_call(d1_issue_entry));
 
 //=============================================================================
 // Structural Decode
@@ -605,9 +590,8 @@ task automatic build_struct_work(
         imm_total_size = 3'd0;
         imm_first_size = 3'd0;
 
-        // Fold step 1: entry resolution back in D1 (pe read live; a PE/D
-        // change always flushes the frontend, so a skeleton is never
-        // consumed across a mode switch).
+        // A PE/D change flushes the frontend, so a skeleton is never consumed
+        // across a mode switch.
         entry_first = pla_entry_lookup({data32, opcode, prefix_rep, pe_enable,
                                         1'b1, prefix_0f});
         entry_group = ~(|entry_first[11:6]) && has_modrm;
@@ -658,6 +642,9 @@ task automatic build_struct_work(
                 if (disp_size != 3'd0) begin
                     w.lit1_kind = LIT_DISP;
                     w.lit1_size = disp_size;
+                    // Normalize disp8 while D2 captures the literal so the
+                    // live EA path consumes one ready 32-bit addend.
+                    w.lit1_sign_extend = (disp_size == 3'd1);
                 end
                 if (imm_total_size != 3'd0) begin
                     if (w.lit1_kind == LIT_NONE) begin
@@ -754,6 +741,7 @@ function automatic decoder_work_t capture_sib(input decoder_work_t in,
         if (disp_size != 3'd0) begin
             out.lit1_kind = LIT_DISP;
             out.lit1_size = disp_size;
+            out.lit1_sign_extend = (disp_size == 3'd1);
         end
 
         if (in.pending_imm_size != 3'd0) begin

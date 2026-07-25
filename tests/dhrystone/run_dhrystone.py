@@ -312,7 +312,7 @@ def main() -> int:
     parser.add_argument(
         "--core",
         choices=("both", "z386_release", "z386_current"),
-        default="both",
+        default="z386_current",
         help="core revision(s) to run",
     )
     parser.add_argument(

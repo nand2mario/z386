@@ -17,7 +17,8 @@ module alu
     // derives them from the registered result; NOT/MOVZX/MOVSX preserve
     // all flags and AAA/AAS preserve ZF/SF/PF.
     output        zsp_update,
-    // v50 timing-first: dedicated pre-assembled Z/S/P for the z386-level eflags_ahead overlay (the jcc pop-time condition capture).
+    // v50 timing-first: dedicated pre-assembled Z/S/P for the z386-level eflags_ahead overlay (the jcc pop-time condition capture). These are...
+    // Details: doc/z386x/implementation_notes.md#src-24-z386x-alu-sv-20
     output [2:0]  zsp_ahead    // {sf, zf, pf}
 );
 
@@ -290,7 +291,8 @@ wire is_adjust = (op == ALU_DAA) || (op == ALU_DAS) || (op == ALU_AAA) || (op ==
 wire [31:0] R = slice_result;
 wire flag_byte_mode = is_byte || is_adjust;
 
-// Zero-flag anticipation for adder-based ops, independent of the carry chain
+// Zero-flag anticipation for adder-based ops, independent of the carry chain: x + y + cin == 0 (mod 2^w) ⟺ (x ^ y)[w-1:0] == ({(x|y),...
+// Details: doc/z386x/implementation_notes.md#src-24-z386x-alu-sv-299
 wire [31:0] za_neq = (arg1_bus ^ arg2_bus) ^
                      {arg1_bus[30:0] | arg2_bus[30:0], carry_in0};
 wire zfa_byte  = ~|za_neq[7:0];

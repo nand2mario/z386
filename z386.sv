@@ -1,4 +1,4 @@
-// z386x - An x86 core with the original 386 microcode and some 486-style pipelining
+// z386x - An x86 core with the original 386 microcode and some 486-style pipelining 
 //
 // nand2mario, July 2026
 //
@@ -153,7 +153,7 @@ wire [1:0] cpl = vm ? 2'd3 : !pe ? 2'd0 : CS[1:0];
 reg [2:0]  latched_pf_code;         // Latched page fault error code (for LPCR microcode access)
 reg [31:0] latched_pf_addr;         // Latched faulting linear address (for LPCR microcode access)
 
-wire [31:0] win_d1;                 // registered window at the prefetcher's D1 cursor
+wire [63:0] win_d1;                 // registered raw window at the prefetcher's D1 cursor
 wire [5:0]  d1_avail;               // bytes fetched beyond the D1 cursor
 wire [3:0]  d1_adv;                 // D1 cursor advance this cycle (a prefix, or
                                     //   the instruction rest at handoff, 0-11)
@@ -209,17 +209,35 @@ wire        pf_fault;
 reg [11:0] uaddr_now;               // Next address, launched early to the ucode ROM
 reg [11:0] uaddr;                   // Address being fetched in the current ucode pipeline
 reg [11:0] uc_addr;                 // Address of current uc (for debug)
+reg [11:0] uc_addr_mem_r;           // Address aligned with the ROM q_mem stage
 wire [50:0] uc;                     // Current microcode word + pre-computed bits (50:37)
 wire [50:0] uc_next;
 
-// Instruction Life cycle: entry -> pop -> first -> RNI -> RNI delay slot -> inactive
-wire       i_entry;                 // Load entry point into uaddr, set init_cycle (queue NOT popped yet)
-wire       i_pop;                   // Actually pop from instruction queue (during init_cycle)
+// Instruction lifecycle: D2 start -> D2 fire -> first EX -> RNI -> delay slot.
+// Keep i_entry/i_pop as waveform-compatible names during the v53 migration.
+wire       i_entry;                 // Normal (non-chained) D2 start
+wire       i_pop;                   // Legacy alias of d2_fire
 reg        i_first;                 // First ucode execution cycle after i_pop
 wire       i_rni;                   // RNI detected in this cycle (combinational from uc bits)
 reg        i_rni_delay;             // RNI delay slot - RNI has been executed. this is last instruction cycle
 
-reg        init_cycle;              // Cycle or cycles after i_entry - uc is being latched, not yet valid
+wire       d2_start;                // Launch a macro entry address into the ROM
+wire [11:0] d2_start_entry;         // Entry address selected on d2_start
+wire       d2_valid;                // A launched macro entry is resident in D2
+wire       d2_ready;                // D2 may transfer its instruction to EX
+wire       d2_fire;                 // D2 -> EX transfer; instruction state latches once
+reg        d2_valid_r;
+reg        d2_waited_r;             // D2 held after predecessor delay slot
+reg        d2_stale_slot_r;         // D2 also waited during predecessor delay slot
+reg        d2_rom_mem_r;            // D2 entry tag aligned with ROM q_mem
+reg        d2_rom_q_r;              // D2 entry tag aligned with execution q
+reg        d2_launch_id_r;          // toggles for every macro entry launch
+reg        d2_id_r;                 // generation owned by resident D2
+reg        d2_rom_mem_id_r;
+reg        d2_rom_q_id_r;
+reg [2:0]  d2_rom_q_kind_r;
+reg        d2_slot_prefetched_r;    // q_mem holds entry+1 while D2 q is held
+wire       init_cycle = d2_valid_r; // Temporary waveform alias; not control logic
 reg        uc_active;               // Tracks when instruction execution has begun
 reg        fault_suppress_delay_slot;   // Fault handling: suppress delay slot after fault triggers
 
@@ -232,6 +250,8 @@ reg        fast_jcc_r;              // ... and it is a Jcc (chain on not-taken o
 reg        fast_wf_r;               // ... and it produces arithmetic flags
 reg [2:0]  fast_commit_sel_r;       // FAST sideband select (FAST_COMMIT_*) at the RNI-word cycle
 reg        fast_keep_slot_r;        // memory class: the slot word is real work when unchained
+reg        branch_ustep_r;          // Relative JMP/Jcc uses one bounded EX ustep
+reg        branch_ustep_jcc_r;      // The bounded branch evaluates condition code
 reg        fast_memc_pending;       // deferred MEM commit: write OPR_R to a GPR this cycle
 reg [2:0]  fast_memc_dst;           //   destination selector (dst_reg_sel of the load)
 reg [1:0]  fast_memc_size;          //   operand size of the load
@@ -247,17 +267,26 @@ initial if ($test$plusargs("z386x_fast_off")) fast_off = 1'b1;
 wire       fast_active;             // executing a FAST instruction's entry word this cycle
 wire       fast_last;               // executing a FAST instruction's RNI word this cycle
 
-// i_entry: load entry point into uaddr (e.g. when RNI)
-wire       fold_entry  = decq_empty && d2_push;
-wire       i_entry_raw = (i_rni || i_rni_delay || ~uc_active) && ~halted && !stall && (!decq_empty || fold_entry) && !q_flush && !init_cycle &&
+// Empty D2 may launch directly from D1. Otherwise the resident D2 skeleton
+// supplies a registered entry address when the current instruction ends.
+wire       d1_issue_direct;
+wire [11:0] d1_issue_entry_point;
+dec_entry_t d1_issue_entry;
+wire       i_entry_raw = (i_rni || i_rni_delay || ~uc_active) && ~halted && !stall &&
+                         (d1_issue_direct || !decq_empty) && !q_flush && !d2_valid &&
                          !fault_suppress_delay_slot && !interrupt_entry;
 assign     i_entry = i_entry_raw && !any_fault_pop;
 
-// i_pop: actually pop the instruction queue
+// D2 -> EX readiness. Keep this factored from the valid bit so v53 can move
+// D2 ownership without changing the meaning of the transfer edge.
 wire       interrupt_deliverable = nmi_request_active ||
                                    (intr_pending && EFLAGS[9] && !inhibit_interrupts);
 wire       interrupt_at_boundary = i_rni_delay && interrupt_deliverable && !single_step;
-assign     i_pop = init_cycle && !stall && !any_fault_pop && !interrupt_at_boundary && !q_flush;
+assign     d2_valid = d2_valid_r;
+assign     d2_ready = d2_push && !stall && !any_fault_pop &&
+                      !interrupt_at_boundary && !q_flush;
+assign     d2_fire  = d2_valid && d2_ready;
+assign     i_pop    = d2_fire;
 
 wire       core_live = !halted && uc_active && !fault_suppress_delay_slot && !interrupt_entry;
 wire       dly_grace_now = mem_dly_grace && uc_p_pure_dly;
@@ -267,7 +296,11 @@ wire       mem_block_busy = (uc_bus_or_dly && !dly_grace_now && !posted_write_re
 wire       mem_block_idle = (uc_busreq && !mem_accepted);  // uop wants the bus, paging not ready
 wire       stall_mem = mem_servicing ? mem_block_busy : (mem_req_current && !mem_accepted);
 wire       stall_wio = (uc_is_wio && !interrupt_pending && !single_step);
-wire       stall = stall_mem || stall_wio;
+// An entry may reach the ROM before its D2 literals arrive. Let the ending
+// instruction execute its architectural RNI delay slot, then hold the ROM word
+// until D2 can transfer it to EX.
+wire       stall_d2 = d2_valid && !d2_push && !i_rni_delay;
+wire       stall = stall_mem || stall_wio || stall_d2;
 
 // Repeat
 wire       prot_result_now = prot_result_valid && prot_test_inflight;
@@ -275,7 +308,9 @@ wire       repeat_active = uc_is_rpt && (COUNTR[4:0] != 0 || prot_test_inflight)
                            && !(uc_is_wio && interrupt_pending);
 
 // uc_exec: master enable for microcode execution
-wire       uc_exec = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) && !stall_wio && !fast_dead_slot;
+wire       d2_release_hold = d2_valid && (d2_waited_r || d2_stale_slot_r);
+wire       uc_exec = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) &&
+                     !stall_wio && !stall_d2 && !d2_release_hold && !fast_dead_slot;
 wire       uc_exec_writeback = uc_exec;  // local copies for reducing fanout
 wire       uc_exec_mul_start = uc_exec;
 wire       uc_exec_result = uc_exec;
@@ -283,15 +318,14 @@ wire       uc_exec_shift = uc_exec;
 
 assign     seg_cmd_valid = i_pop || uc_exec;
 
-dec_entry_t i_bus;            // Decoded instruction from decoder module
-wire       decq_has_jmp_call; // decode queue holds a JMP/CALL rel (halt speculative prefetch)
-wire       decq_empty;        // Decoder instruction queue empty
-dec_entry_t i_bus2;           // Second decode-queue entry (z386x FAST-chain lookahead)
+dec_entry_t i_bus;            // Instruction resident in unified D2
+wire       decq_has_jmp_call; // D1/D2 holds a JMP/CALL rel (halt speculative prefetch)
+wire       decq_empty;        // Legacy name: unified D2 has no skeleton
+dec_entry_t i_bus2;           // Registered D1 skid successor
 dec_entry_t i;                // Current instruction (latched at i_pop; written far below)
 wire       decq_has2;         // i_bus2 is valid
 
-// Combinational EA-operand decode shared by queue-head and D2-completion
-// chaining. Declare it before the fold gates for strict Quartus ordering.
+// Combinational EA-operand decode shared by resident D2 and skid successor.
 typedef struct packed {
     logic [7:0]  base_sel;    // onehot GPR selector (bit i = GPR i)
     logic [7:0]  index_sel;   // onehot GPR selector
@@ -308,7 +342,7 @@ ea_dec_t    d2_agu_dec;       // EA decode for d2_entry
 fast_class_t fast_pop_fc, fast_next_fc, fast_head_fc;
 assign     fast_pop_fc    = recipe_fast_class(i_bus);
 assign     fast_next_fc   = recipe_fast_class(i_bus2);
-assign     fast_head_fc   = fast_pop_fc;   // queue head; = next instr during i_first
+assign     fast_head_fc   = fast_pop_fc;   // resident D2 successor during i_first
 wire       fast_pop_fast  = fast_pop_fc.fast && !fast_off;
 // reads_flags successors may chain when the predecessor writes -- doc/z386x/core_notes_v51.md #5
 wire       fast_next_ok   = decq_has2 && fast_next_fc.fast &&
@@ -338,7 +372,7 @@ wire       fast_loaduse_conflict =
                 fast_gpr_overlap(i.dst_reg_sel, fast_load_dst_byte, i_bus.src_reg_sel, head_byte_op)) ||
                (fast_head_fc.reads_ecx &&
                 fast_gpr_overlap(i.dst_reg_sel, fast_load_dst_byte, 3'd1, 1'b0));
-wire       fast_head_ok   = !decq_empty && fast_head_fc.fast &&
+wire       fast_head_ok   = !decq_empty && d2_push && fast_head_fc.fast &&
                             (!fast_head_fc.reads_flags || !fast_wf_r ||
                              fast_head_fc.jcc) &&
                             (!fast_head_fc.uses_ea || !fast_ea2_conflict) &&
@@ -406,48 +440,118 @@ wire       fast_issueJ    = fast_active && fast_jcc_r && uc_exec &&
                             jcc_pop_cond_v_r && !jcc_pop_taken_r &&
                             !q_flush && fast_head_ok && !jcc_fold_r;
 wire       fast_issue     = (fast_issue1 || fast_issueN || fast_issueJ) &&
+                            (!d2_valid || d2_fire) &&
+                            !d2_waited_r &&
                             !interrupt_pending && !single_step && !any_fault_pop;
+
+// A normal boundary uses i_entry. FAST chaining launches the successor on the
+// predecessor's transfer/execute edge and may overlap d2_fire.
+assign d2_start = i_entry || fast_issue;
+assign d2_start_entry = fast_issue
+                      ? (fast_issue1 ? i_bus2.entry_point : i_bus.entry_point)
+                      : (decq_empty ? d1_issue_entry_point : i_bus.entry_point);
 
 // The physical microcode ROM contains 37-bit native words plus the v52
 // three-bit early kind.  The execution bus remains native ucode + 14-bit
 // predecode.
-wire        microcode_rom_ce = !stall && !repeat_active;
+// Track the D2 entry through both synchronous ROM stages. The generation bit
+// distinguishes a replacement D2 from the predecessor word still in q.
+wire        d2_rom_mem_resident = d2_rom_mem_r &&
+                                  (d2_rom_mem_id_r == d2_id_r);
+wire        d2_rom_resident = d2_rom_q_r && (d2_rom_q_id_r == d2_id_r);
+// q is EX-owned. A completed ROM lookup may wait in q_mem, but it advances
+// into q only on the D2->EX transfer edge.
+wire        d2_rom_cancel = interrupt_at_boundary || any_fault || any_fault_pop;
+wire        d2_rom_hold = d2_valid && d2_rom_mem_resident && !d2_fire &&
+                          !d2_rom_cancel;
+wire        microcode_rom_base_ce = !stall_mem && !stall_wio && !repeat_active;
+wire        d2_delay_preload = d2_valid && d2_rom_mem_resident && d2_fire &&
+                               !d2_start && !d2_slot_prefetched_r;
+wire        microcode_rom_addr_ce = microcode_rom_base_ce && !d2_rom_hold;
+// A redirect replaces the parked lookup but must not expose the canceled word.
+wire        microcode_rom_ce = microcode_rom_base_ce && !d2_rom_hold &&
+                               !d2_rom_cancel;
+// A branch may redirect uaddr in the same cycle that q_mem must preread the
+// architectural delay slot. Keep the physical ROM address independent; the
+// normal uaddr update below still advances loads and other multi-word entries.
+wire [11:0] microcode_rom_addr = d2_delay_preload
+                                ? (i_bus.entry_point + 12'd1)
+                               : uaddr_now;
 wire [50:0] uc_rom_q;
 wire [50:0] uc_rom_early;
 wire [2:0]  uc_kind_early;
 (* noprune *) reg [2:0] early_kind_probe_r;
 wire [5:0]  uc_source_shift;
+wire [1:0]  uc_shift2_source;
 wire [5:0]  uc_alu_src_shift;
 wire [6:0]  uc_aluop_shift;
+wire [2:0]  uc_dly_source;
+wire [8:0]  uc_mem_ctrl;
 assign uc = uc_rom_q;
 assign uc_next = uc_rom_early;
 
 ucode_rom microcode_rom (
     .clk(clk),
-    .ce(microcode_rom_ce),
-    .addr(uaddr_now),
+    .addr_ce(microcode_rom_addr_ce),
+    .q_ce(microcode_rom_ce),
+    .addr(microcode_rom_addr),
     .q_early(uc_rom_early),
     .q(uc_rom_q),
     .q_kind_early(uc_kind_early),
     .q_shift_source(uc_source_shift),
+    .q_shift2_source(uc_shift2_source),
     .q_shift_alu_src(uc_alu_src_shift),
-    .q_shift_aluop(uc_aluop_shift)
+    .q_shift_aluop(uc_aluop_shift),
+    .q_dly_source(uc_dly_source),
+    .q_mem_ctrl(uc_mem_ctrl)
 );
 
+wire [2:0] d2_kind = d2_rom_resident ? d2_rom_q_kind_r : uc_kind_early;
 always_ff @(posedge clk) begin
+    if (!reset_n || q_flush) begin
+        d2_rom_mem_r <= 1'b0;
+        d2_rom_q_r <= 1'b0;
+        d2_launch_id_r <= 1'b0;
+        d2_id_r <= 1'b0;
+        d2_rom_mem_id_r <= 1'b0;
+        d2_rom_q_id_r <= 1'b0;
+        d2_rom_q_kind_r <= 3'b000;
+        d2_slot_prefetched_r <= 1'b0;
+    end else begin
+        if (microcode_rom_addr_ce) begin
+            d2_rom_mem_r <= d2_start;
+            if (d2_start) begin
+                d2_launch_id_r <= !d2_launch_id_r;
+                d2_id_r <= !d2_launch_id_r;
+                d2_rom_mem_id_r <= !d2_launch_id_r;
+            end
+        end
+        if (microcode_rom_ce) begin
+            d2_rom_q_r <= d2_rom_mem_r;
+            d2_rom_q_id_r <= d2_rom_mem_id_r;
+            d2_rom_q_kind_r <= uc_kind_early;
+        end
+        if (d2_start) begin
+            d2_slot_prefetched_r <= 1'b0;
+        end else if (d2_delay_preload && microcode_rom_addr_ce) begin
+            d2_slot_prefetched_r <= 1'b1;
+        end else if (d2_fire) begin
+            d2_slot_prefetched_r <= 1'b0;
+        end
+    end
     if (i_pop)
-        early_kind_probe_r <= uc_kind_early;
+        early_kind_probe_r <= d2_kind;
 end
 
 // synthesis translate_off
-// At i_pop, q_early is the entry word launched by i_entry.  Prove that the
+// At i_pop, d2_kind is the annotation captured with the entry word. Prove it
 // physical ROM annotation agrees with the optimizer-generated entry lookup;
 // instruction legality comes from recipe_fast_class() and registered operands.
 always @(posedge clk) begin
     if (reset_n && i_pop &&
-        (uc_kind_early !== recipe_early_kind(i_bus.entry_point)))
+        (d2_kind !== recipe_early_kind(i_bus.entry_point)))
         $fatal(1, "ucode early-kind mismatch: entry=%03x rom=%0d expected=%0d",
-               i_bus.entry_point, uc_kind_early,
+               i_bus.entry_point, d2_kind,
                recipe_early_kind(i_bus.entry_point));
 end
 // synthesis translate_on
@@ -788,7 +892,9 @@ prefetch prefetch_inst (
     .spec_req(pf_spec_req),
     .spec_linear(spec_target_lin),
     .spec_owner(pf_spec_owner_r),
-    .spec_kill(pf_spec_kill)
+    .spec_store_valid(pf_spec_store),
+    .spec_store_linear(pf_spec_store_linear),
+    .spec_global_kill(pf_spec_global_kill)
 );
 
 // z386x speculative branch-target fetch
@@ -797,7 +903,8 @@ wire [31:0] spec_disp      = spec_br_rel8 ? {{24{i_bus.displacement[7]}}, i_bus.
                                           : i_bus.displacement;
 // Stale-EIP pop guard: a pop CHAINED into a control transfer's
 wire        spec_eip_stale = uc_exec && fast_last && (uc_dest == DEST_eIP);
-wire [31:0] spec_target_lin = CS_base + EIP + ({27'd0, i_bus.length} + spec_disp);
+wire [31:0] spec_target_eip = EIP + ({27'd0, i_bus.length} + spec_disp);
+wire [31:0] spec_target_lin = CS_base + spec_target_eip;
 wire        pf_spec_req    = i_pop && fast_pop_fc.br_rel && i_bus.data32 && !fast_off &&
                              !spec_eip_stale;
 // Ownership: set when an instruction's i_pop requests a spec fetch, cleared
@@ -816,10 +923,12 @@ always_ff @(posedge clk) begin
     end
 end
 
-// Any committed store or external snoop may make the buffered
-wire        pf_spec_kill   = (dcache_req_valid && dcache_req_write) ||
-                             snoop_valid || cr3_write ||
-                             (uc_exec && (uc_dest == DEST_CR0));
+// Store invalidation is line-selective inside prefetch. External coherence or
+// an address-space change invalidates the speculative line conservatively.
+wire        pf_spec_store;
+wire [31:0] pf_spec_store_linear;
+wire        pf_spec_global_kill = snoop_valid || cr3_write ||
+                                  (uc_exec && (uc_dest == DEST_CR0));
 
 //=============================================================================
 // Unit 2: Decode1 (structural decode)
@@ -853,22 +962,15 @@ decoder decoder_inst (
     .decq_has2  (decq_has2),
     .decq_has_jmp_call(decq_has_jmp_call),
 
-    // Step 3a D2-AGU sidecar (observer)
+    // Unified D2 payload and registered D1 skid
     .d2_entry   (d2_entry),
     .d2_push    (d2_push),
-    .skel_entry_point(skel_entry_point),
-    .d2_ea_lin  (d2_agu_lin),
-    .d2_ea_v    (d2_agu_valid),
-    .ea_inval_gpr(ea_inval_gpr),
-    .ea_inval_all(ea_inval_all),
-    .head_ea_lin(head_ea_lin),
-    .head_ea_v  (head_ea_v)
+    .d1_issue_direct(d1_issue_direct),
+    .d1_issue_entry_point(d1_issue_entry_point),
+    .d1_issue_entry(d1_issue_entry)
 );
 
 wire        d2_push;
-wire [11:0] skel_entry_point;
-wire [31:0] head_ea_lin;
-wire        head_ea_v;
 
 //=============================================================================
 // Unit 3: Decode2 - literals capture and early-address (EA decode, relocate,
@@ -893,42 +995,13 @@ function automatic ea_dec_t ea_decode_of(input dec_entry_t e);
             r.is16      = 1'b1;
         end
 
-        // Displacement value (sign-extend disp8, use full disp16/disp32)
-        begin
-            automatic logic [31:0] disp_val;
-            if (e.modrm[7:6] == 2'b01)
-                // disp8 - sign extend
-                disp_val = {{24{e.displacement[7]}}, e.displacement[7:0]};
-            else if (e.modrm[7:6] == 2'b10)
-                // disp16 or disp32
-                disp_val = e.addr32 ? e.displacement : {{16{e.displacement[15]}}, e.displacement[15:0]};
-            else
-                // disp32 for [disp32] or [disp16] modes (mod=00, special rm)
-                disp_val = e.addr32 ? e.displacement : {16'h0, e.displacement[15:0]};
+        // D2 literal capture has already normalized disp8 and leaves this zero
+        // for addressing forms without a displacement.
+        r.disp = e.displacement;
 
-            // POP r/m (8F) with ESP base: Intel 386 says EA uses post-increment ESP.
-            if (e.opcode == 8'h8F && e.addr32 && e.has_sib && e.sib[2:0] == 3'b100) begin
-                disp_val = disp_val + (e.data32 ? 32'd4 : 32'd2);
-            end
-            r.disp = disp_val;
-        end
-        // Zero disp when not used
-        if (e.modrm[7:6] == 2'b00 || e.modrm[7:6] == 2'b11) begin
-            if (e.addr32) begin
-                // 32-bit: special rm is rm=101 (non-SIB) or sib_base=101 (SIB)
-                if (e.has_sib && e.modrm[2:0] == 3'b100) begin
-                    if (e.sib[2:0] != 3'b101)
-                        r.disp = 32'h0;  // SIB, no disp32
-                end else begin
-                    if (e.modrm[2:0] != 3'b101)
-                        r.disp = 32'h0;  // Non-SIB, no disp32
-                end
-            end else begin
-                // 16-bit: special rm is rm=110
-                if (e.modrm[2:0] != 3'b110)
-                    r.disp = 32'h0;
-            end
-        end
+        // POP r/m (8F) with ESP base: Intel 386 says EA uses post-increment ESP.
+        if (e.opcode == 8'h8F && e.addr32 && e.has_sib && e.sib[2:0] == 3'b100)
+            r.disp = e.displacement + (e.data32 ? 32'd4 : 32'd2);
     end
     ea_decode_of = r;
 endfunction
@@ -1025,42 +1098,23 @@ assign ea_dec_disp          = ea_dec_cur.disp;
 assign ea_dec_is_16bit      = ea_dec_cur.is16;
 assign ea_dec_scale_to_base = ea_dec_cur.s2b;
 
-// !fast_dead_slot: a FAST instruction already committed its write at the
-// entry-word cycle, so the register file is current — no forwarding, and the
-// stale slot word's dest field must not be trusted.
-wire delay_slot_writes_esp = i_rni_delay && !fast_dead_slot && (uc_dest == DEST_eSP || uc_dest == DEST_ESP ||
-                                              (uc_dest == DEST_DSTREG && i.dst_reg_sel == 4 && op_size != 2'd0) ||
-                                              (uc_dest == DEST_SRCREG && i.src_reg_sel == 4 && op_size != 2'd0));
 // z386x: at a chained PUSH's RNI cycle, SIGMA holds the post-push ESP
 // (precomputed at its i_pop) - the minimal ESP tracker. push;push chains
 // read it here for their own i_pop precompute and stack addressing.
 wire        fast_esp_fwd = fast_last && (fast_commit_sel_r == FAST_COMMIT_ESP);
 
-// Dedicated delay-slot forward VALUE -- doc/z386x/core_notes_v51.md #17
-function automatic [31:0] dly_fwd_mux(input [5:0] s);
+// RNI-slot architectural GPR writes use only these four sources in the Intel
+// ROM. Keep this mux narrow: it feeds the next instruction's D2 EA bypass.
+function automatic [31:0] dly_fwd_mux(input [2:0] s);
     case (s)
-        SRC_CR0:    dly_fwd_mux = CR0;
-        SRC_TMPB:   dly_fwd_mux = TMPB;
-        SRC_TMPC:   dly_fwd_mux = TMPC;
-        SRC_TMPD:   dly_fwd_mux = TMPD;
-        SRC_TMPG:   dly_fwd_mux = TMPG;
-        SRC_TMP_TR: dly_fwd_mux = SLCTR;
-        SRC_COUNTR: dly_fwd_mux = COUNTR;
-        SRC_PROTUN: dly_fwd_mux = PROTUN;
-        SRC_TMPeSP: dly_fwd_mux = is_dword_src ? TMPeSP : {16'h0, TMPeSP[15:0]};
-        SRC_MDTMP:  dly_fwd_mux = RESULT;
-        SRC_SIGMA:  dly_fwd_mux = SIGMA;
-        SRC_LDTR:   dly_fwd_mux = {16'h0, LDTR};
-        SRC_TR:     dly_fwd_mux = {16'h0, TR};
-        SRC_OPR_R:  dly_fwd_mux = OPR_R;
-        SRC_IRF2:   dly_fwd_mux = IND;
-        SRC_ZERO:   dly_fwd_mux = 32'h0;
-        SRC_SRCREG: dly_fwd_mux = read_gpr(i_reg_src_reg_sel, op_size_src);
-        SRC_NEG1:   dly_fwd_mux = 32'hFFFF_FFFF;
+        3'd1:    dly_fwd_mux = SIGMA;
+        3'd2:    dly_fwd_mux = OPR_R;
+        3'd3:    dly_fwd_mux = COUNTR;
+        3'd4:    dly_fwd_mux = 32'hFFFF_FFFF;
         default:    dly_fwd_mux = 32'h0;
     endcase
 endfunction
-wire [31:0] dly_fwd_value = dly_fwd_mux(uc_source_shift);
+wire [31:0] dly_fwd_value = dly_fwd_mux(uc_dly_source);
 
 // synthesis translate_off
 // Re-prove the narrow mux against the full source read on every delay-slot
@@ -1071,14 +1125,6 @@ always @(posedge clk)
         $fatal(1, "DLY-FWD MUX MISMATCH: uc_addr=%03x src=%02x narrow=%08x full=%08x",
                uc_addr, uc_source, dly_fwd_value, dest_value);
 // synthesis translate_on
-
-wire        shc_esp_fwd = fast_shc_pending && (fast_shc_dst == 3'd4) &&
-                          (fast_shc_size != 2'd0);
-wire [31:0] forwarded_esp = fast_esp_fwd          ? SIGMA         :
-                            delay_slot_writes_esp ? dly_fwd_value :
-                            shc_esp_fwd           ? (fast_shc_size == 2'd1
-                                                     ? {ESP[31:16], fast_shc_data[15:0]}
-                                                     : fast_shc_data) : ESP;
 
 // Delay-slot GPR write descriptor for early-EA forwarding (which GPR the
 // delay-slot uop writes, and how)
@@ -1160,25 +1206,32 @@ wire       dly_gpr_we   = i_rni_delay && !fast_dead_slot &&
 wire [2:0] dly_gpr_sel  = dly_is_irf_pre_r ? COUNTR[2:0]              : dly_gpr_sel_pre_r;
 wire [1:0] dly_gpr_mode = dly_is_irf_pre_r ? (is_dword ? FWD_D : FWD_W) : dly_gpr_mode_pre_r;
 
+wire       dly_esp_fwd = dly_gpr_we && (dly_gpr_sel == 3'd4);
+wire       shc_esp_fwd = fast_shc_pending && (fast_shc_dst == 3'd4) &&
+                         (fast_shc_size != 2'd0);
+wire [31:0] forwarded_esp = fast_esp_fwd ? SIGMA :
+                            dly_esp_fwd  ? dly_fwd_value :
+                            shc_esp_fwd  ? (fast_shc_size == 2'd1
+                                            ? {ESP[31:16], fast_shc_data[15:0]}
+                                            : fast_shc_data) : ESP;
+
 // EA decode registered at i_entry
 reg [7:0]  ea_dec_base_sel_r, ea_dec_index_sel_r;
 reg [2:0]  ea_dec_base_idx_r, ea_dec_index_idx_r;  // priority-encoded at the latch
 reg [1:0]  ea_dec_scale_r;
-reg [31:0] ea_dec_disp_r;
 reg        ea_dec_base_valid_r, ea_dec_index_valid_r;
 reg        ea_dec_is_16bit_r, ea_dec_scale_to_base_r;
 function automatic [2:0] onehot_idx(input [7:0] oh);
     onehot_idx = oh[1] ? 3'd1 : oh[2] ? 3'd2 : oh[3] ? 3'd3 : oh[4] ? 3'd4 :
                  oh[5] ? 3'd5 : oh[6] ? 3'd6 : oh[7] ? 3'd7 : 3'd0;
 endfunction
-// Latched at i_entry (target = queue head) and at z386x chained entries
-// (chain1 target = the entry behind the head, chain2 target = the head).
+// D1 supplies only registered selectors to D2. Literal displacement remains a
+// D2 value and is consumed from d2_entry when the instruction fires.
 always_ff @(posedge clk) begin
-    if (i_entry || fast_issue) begin
-        // fold_entry: the head is landing this edge - decode the completing
-        // entry (d2_agu_dec is the AGU's ea_decode_of(d2_entry), reused).
+    if (d2_start) begin
         automatic ea_dec_t sel = (fast_issue && fast_issue1) ? fast_ea_dec2 :
-                                 (i_entry && decq_empty)     ? d2_agu_dec  : ea_dec_cur;
+                                 (i_entry && decq_empty)     ? ea_decode_of(d1_issue_entry) :
+                                                               ea_dec_cur;
         ea_dec_base_sel_r      <= sel.base_sel;
         ea_dec_index_sel_r     <= sel.index_sel;
         ea_dec_base_idx_r      <= onehot_idx(sel.base_sel);
@@ -1186,7 +1239,6 @@ always_ff @(posedge clk) begin
         ea_dec_base_valid_r    <= |sel.base_sel;
         ea_dec_index_valid_r   <= |sel.index_sel;
         ea_dec_scale_r         <= sel.scale;
-        ea_dec_disp_r          <= sel.disp;
         ea_dec_is_16bit_r      <= sel.is16;
         ea_dec_scale_to_base_r <= sel.s2b;
     end
@@ -1200,7 +1252,7 @@ wire [63:0] pop_ea_prep = calc_ea_prep(ea_fwd_base, ea_fwd_index,
                                        ea_dec_scale_r, ea_dec_scale_to_base_r);
 wire [31:0] pop_ea_a = pop_ea_prep[63:32];  // base_val
 wire [31:0] pop_ea_b = pop_ea_prep[31:0];   // scaled_val
-wire [31:0] pop_ea_c = ea_dec_disp_r;
+wire [31:0] pop_ea_c = d2_agu_dec.disp;
 wire [31:0] pop_ea_off = pop_ea_a + pop_ea_b + pop_ea_c;   // ternary (one ALM level)
 wire [31:0] ea_early = ea_dec_is_16bit_r ? {16'h0, pop_ea_off[15:0]} : pop_ea_off;
 
@@ -1313,6 +1365,8 @@ wire d2_agu_valid = d2_push &&
                     !d2_entry.stack_op && d2_entry.addr32 &&
                     eff_mask_pending &&
                     (((d2_agu_dec.base_sel | d2_agu_dec.index_sel) & ea_inval_gpr) == 8'h00);
+wire [31:0] head_ea_lin = d2_agu_lin;
+wire        head_ea_v   = d2_agu_valid;
 
 // Same-cycle conflict mask: a write committing at the CONSUMING edge
 wire head_ea_usable = head_ea_v &&
@@ -1413,7 +1467,7 @@ endfunction
 
 always_ff @(posedge clk) begin
     if (i_pop)
-        ea_reg <= ea_early;
+        ea_reg <= fast_pop_fc.br_rel ? spec_target_eip : ea_early;
 end
 
 //=============================================================================
@@ -1517,7 +1571,7 @@ always_comb begin
     seg_cmd_target = SEG_NONE;
     seg_cmd_data = dest_value;
 
-    if (init_cycle) begin
+    if (d2_valid) begin
         seg_cmd_target = init_final_seg;
         seg_cmd_data = {30'd0, i_bus.stack_op, i_bus.addr32};
     end else if ((uc_buscode == BUSOP_IND_PLUS_ALU || uc_buscode == BUSOP_IND_SRC)
@@ -1527,7 +1581,7 @@ always_comb begin
         seg_cmd_target = resolve_seg_target(uc_dest, seg_reg_sel, COUNTR[5:0]);
     end
 
-    if (init_cycle) begin
+    if (d2_valid) begin
         seg_cmd = SEG_CMD_INIT_SEG;
     end else if (uc_dest == DEST_DESCSW) begin
         seg_cmd = SEG_CMD_DESCSW;
@@ -1626,14 +1680,17 @@ wire nmi_accept_boundary = i_rni_delay && !stall && !page_fault &&
 
 reg inhibit_interrupts;     // STI shadow: real 386 suppresses interrupt recognition for one instruction after STI
 
-assign mem_op_eligible = core_live && !mem_servicing;   // current RD/WR/IACK uop request
-wire uc_busreq = (uc_is_mem_busop && !mem_is_io) ||
-                 io_busop_rd || io_busop_wr ||
-                 iack_busop;
+// A delayed D2 entry may already occupy the shared ROM q while it is still
+// waiting for literals. It is not an EX uop yet and must not issue its bus op.
+assign mem_op_eligible = core_live && !mem_servicing &&
+                         !stall_d2 && !d2_release_hold;
+wire uc_data_busreq = (uc_is_mem_busop && !mem_is_io) ||
+                      io_busop_rd || io_busop_wr;
+wire uc_busreq = uc_data_busreq || iack_busop;
 wire mem_req_current = mem_op_eligible && uc_busreq;    // drives paging unit
 
 // Delay prefetch on upcoming demand memory
-wire mem_req_upcoming = uc_next[39] && !halted && (uc_active || !decq_empty);
+wire mem_req_upcoming = uc_next[39] && !halted && (uc_active || d2_valid);
 
 // Implicit supervisor access: descriptor table and TSS reads, cross-privilege
 // stack writes use CPL=0 for paging regardless of current CPL.
@@ -1645,12 +1702,15 @@ wire [1:0] pg_cpl = implicit_supervisor ? 2'b00 : cpl;
 reg         gp_fault_r;
 reg         ss_fault_r;
 
-wire        mem_req_to_paging = mem_req_current && !gp_fault_trigger;
+wire        mem_req_to_paging = mem_op_eligible && uc_data_busreq && !gp_fault_trigger;
+wire        iack_req_to_paging = mem_op_eligible && iack_busop && !gp_fault_trigger;
 wire        mem_write_now = uc_is_write || (io_busop_wr && mem_is_io);
 wire [3:0]  mem_be_now = iack_busop ? 4'b1111 :
                           calc_be(mem_eff_size, ind_linear[1:0]);
-wire [31:0] paging_linear_addr = iack_busop ? IND : ind_linear;
-wire        paging_live_valid  = iack_busop ? 1'b1 : ind_linear_valid;
+wire [31:0] paging_linear_addr = ind_linear;
+assign pf_spec_store = mem_req_to_paging && mem_write_now && mem_accepted;
+assign pf_spec_store_linear = paging_linear_addr;
+wire        paging_live_valid  = ind_linear_valid;
 wire        paging_mem_rd_ind = (uc_buscode == BUSOP_RD_IND);
 wire        paging_is_write_access = uc_is_write || uc_is_check_write;
 wire        mem_ea_read = i_first && instr_ind_is_ea;
@@ -1665,8 +1725,10 @@ paging_unit paging_inst (
 
     // Memory/IO request: current RD/WR/IACK uop is held by stall until accepted.
     .mem_req            (mem_req_to_paging),
+    .mem_inta_req       (iack_req_to_paging),
+    .mem_inta_addr      (IND),
     .mem_ea_read        (mem_ea_read),      // modrm/stack/moffs reads SET-read (linear relocated at i_pop); microcode IND reads excluded
-    .mem_req_precheck   (mem_req_current),
+    .mem_req_precheck   (mem_op_eligible && uc_data_busreq),
     .mem_req_upcoming   (mem_req_upcoming), // suppresses prefetch start to minimize contention
     .mem_accepted       (mem_accepted),     // ready: request accepted this cycle
     .mem_servicing      (mem_servicing),
@@ -1685,7 +1747,6 @@ paging_unit paging_inst (
     .mem_check_only     (uc_is_check_write),
     .cpl                (pg_cpl),
     .mem_is_io          (mem_is_io),
-    .mem_is_inta        (iack_busop),
     .mem_be             (mem_be_now),
 
     // Prefetch (toggle protocol)
@@ -1882,7 +1943,7 @@ always_ff @(posedge clk) begin
 end
 
 //=============================================================================
-// Unit 7: Execution - control unit for microcode and fast instructions
+// Unit 7: Execution - control unit for microcode and fast instructions 
 // "chaining" = FAST issue pipelining
 //=============================================================================
 
@@ -1912,9 +1973,11 @@ reg        uc_cond_jump_taken_prev;     // Conditional jump taken last cycle (fo
 //   RNI/RnI terminate unless we're in a delay slot of a taken jump (loop continues)
 //   RNi only terminates when in delay slot (after a jump)
 //   jcc_fold_active: pop-time-resolved not-taken Jcc terminates at 065 (M4 fold)
+wire branch_ustep_exec;
+wire branch_ustep_redirect;
 assign i_rni = ((uc_is_rni || uc_is_rni_inhibit) && !uc_jump_taken_prev) ||
                            (uc_is_rni_lc && uc_jump_taken_prev) ||
-                           jcc_fold_active;
+                           jcc_fold_active || branch_ustep_exec;
 
 reg        instr_is_shxd;           // Instruction is a SHxD operation
 reg        instr_cf;                // CF bit at start of instruction
@@ -1957,9 +2020,10 @@ reg        gate_in_progress;        // Prevent second LDTST (at 5C3) from re-tri
 
 // Microcode PREF restarts from IND
 wire [31:0] pf_flush_ip = IND;
-assign pf_flush_addr = early_redirect     ? (CS_base + br_target) :
-                       pe_mode_toggle_now ? (CS_base + EIP) :
-                                            (CS_base + pf_flush_ip);
+assign pf_flush_addr = branch_ustep_redirect ? (CS_base + ea_reg) :
+                       early_redirect        ? (CS_base + br_target) :
+                       pe_mode_toggle_now    ? (CS_base + EIP) :
+                                               (CS_base + pf_flush_ip);
 
 wire        br_is_jcc      = (i.opcode[7:4] == 4'b0111 && !i.has_0f) ||
                              (i.opcode[7:4] == 4'b1000 && i.has_0f);
@@ -1981,7 +2045,7 @@ end
 
 // i_first PRECISE early branch redirect (NOT a prediction).
 wire br_jcc_taken = br_is_jcc && check_condition(i.opcode[3:0], eflags_fwd);
-// Registered pop-time condition (same validity gate as the NT
+// Registered pop-time condition (same validity gate as the NT 
 reg jcc_pop_taken_r;    // condition value captured at the Jcc's i_pop
 reg jcc_pop_cond_v_r;   // capture was valid (flags settled at the pop)
 always_ff @(posedge clk) begin
@@ -2003,9 +2067,11 @@ always @(posedge clk)
         $display("%0t JCC-POPCOND MISMATCH: pop=%b live=%b op=%02x", $time,
                  jcc_pop_taken_r, br_jcc_taken, i.opcode);
 // synthesis translate_on
-wire br_jcc_taken_early = jcc_pop_cond_v_r && jcc_pop_taken_r;
-wire early_redirect = i_first && is_dword &&
-                      (br_is_jmp_rel || br_is_call_rel || br_jcc_taken_early);
+wire branch_ustep_taken = !branch_ustep_jcc_r || jcc_pop_taken_r;
+assign branch_ustep_exec = i_first && branch_ustep_r && uc_exec;
+assign branch_ustep_redirect = branch_ustep_exec && branch_ustep_taken;
+wire early_redirect = branch_ustep_redirect ||
+                      (i_first && is_dword && br_is_call_rel);
 reg  early_redirected;
 // Cleared at the NEXT instruction's arrival
 always_ff @(posedge clk or negedge reset_n) begin
@@ -2100,7 +2166,7 @@ wire desc_accessed_writeback = pe && (uc_aluop == ALUJMP_JMP) &&
 // entry-point load of the next instruction.
 wire uc_reljump_taken = uc_exec && !repeat_active && is_reljump_taken(uc_aluop) &&
                         !desc_accessed_writeback && !prot_redirect_prev &&
-                        !jcc_fold_active;
+                        !jcc_fold_active && !branch_ustep_exec;
 
 wire uc_cond_jump_taken = (uc_reljump_taken &&
     uc_aluop != ALUJMP_JMP &&
@@ -2198,14 +2264,20 @@ wire gate_detect_now = uc_exec && gate_detect_cond;
 always_comb begin
     uaddr_now = uaddr;
 
-    if (((i_pop | uc_exec | (fault_suppress_delay_slot & !stall)) & !halted && !repeat_active))
+    if (((((i_pop && !d2_waited_r) | uc_exec) |
+          (fault_suppress_delay_slot & !stall)) & !halted && !repeat_active))
         uaddr_now = uaddr + 12'd1;
 
+    // A held D2 entry keeps q stable while q_mem primes its architectural
+    // delay-slot word. Branching entries override only sequencer state; the
+    // Jcc ROM-address exception above still reads the slot.
+    if (d2_delay_preload)
+        uaddr_now = i_bus.entry_point + 12'd1;
+
     if (i_entry_raw)
-        // fold_entry: the head is landing this edge; its entry_point is the
-        // skel REGISTER's field read DIRECTLY (capture_literal never touches
-        // entry_point - do not route it through the d2_final capture muxes).
-        uaddr_now = decq_empty ? skel_entry_point : i_bus.entry_point;
+        // Empty pipe uses the live D1 PLA result. A resident D2 instruction
+        // supplies a registered entry address.
+        uaddr_now = decq_empty ? d1_issue_entry_point : i_bus.entry_point;
 
     if (uc_exec) begin
         if (uc_reljump_taken)
@@ -2256,7 +2328,6 @@ always_comb begin
     // z386x chained entry: load the next instruction's address one
     if (fast_issue)
         uaddr_now = fast_issue1 ? i_bus2.entry_point : i_bus.entry_point;
-
     if (gp_fault_r)
         uaddr_now = ss_fault_r ? UADDR_STACK_FAULT : UADDR_GENERAL_FAULT1;
 
@@ -2276,7 +2347,9 @@ always_ff @(posedge clk) begin
     if (!reset_n) begin
         uaddr <= 12'h000;
         uc_active <= 1'b0;
-        init_cycle <= 1'b0;
+        d2_valid_r <= 1'b0;
+        d2_waited_r <= 1'b0;
+        d2_stale_slot_r <= 1'b0;
         microcode_sp <= 2'h0;
         i_rni_delay <= 1'b0;
         instr_eip_written <= 1'b0;
@@ -2288,6 +2361,18 @@ always_ff @(posedge clk) begin
         gate_in_progress <= 1'b0;
         interrupt_entry <= 1'b0;
     end else begin
+        if (d2_start || d2_fire || q_flush || any_fault) begin
+            d2_waited_r <= 1'b0;
+            d2_stale_slot_r <= 1'b0;
+        end else if (stall_d2) begin
+            d2_waited_r <= 1'b1;
+        end else if (d2_valid && !d2_push && i_rni_delay &&
+                     (uc_exec || fast_dead_slot)) begin
+            // q remains on the predecessor's slot while D2 waits. Suppress
+            // that stale word when D2 becomes ready on the following cycle.
+            d2_stale_slot_r <= 1'b1;
+        end
+
         // Commit the same next address that is launched to the ROM.
         uaddr <= uaddr_now;
 
@@ -2301,7 +2386,7 @@ always_ff @(posedge clk) begin
             i_rni_delay <= 1'b0;
             if (single_step)
                 halted <= 1'b1;
-            if (!i_pop && !init_cycle)
+            if (!i_pop && !d2_valid)
                 uc_active <= 1'b0;
         end
 
@@ -2329,7 +2414,7 @@ always_ff @(posedge clk) begin
             // Page fault handling: latch fault info for microcode access via LPCR bus op.
             if (page_fault) begin
                 i_rni_delay <= 1'b0;
-                init_cycle <= 1'b0;
+                d2_valid_r <= 1'b0;
                 latched_pf_code <= pg_fault_code;
                 latched_pf_addr <= pg_cr2_out;
             end
@@ -2340,7 +2425,9 @@ always_ff @(posedge clk) begin
                 // was chain-entered and executes in the slot — no delay slot.
                 if (!i_pop)
                     i_rni_delay <= 1'b1;
-                if (uc_dest == DEST_EIP || uc_dest == DEST_eIP)
+                if (branch_ustep_redirect)
+                    debug_ip <= ea_reg;
+                else if (uc_dest == DEST_EIP || uc_dest == DEST_eIP)
                     debug_ip <= is_dword ? alu_result : {EIP[31:16], alu_result[15:0]};
                 else
                     debug_ip <= EIP;  // Capture EIP at termination, before next instruction increments it
@@ -2373,16 +2460,16 @@ always_ff @(posedge clk) begin
         // chained out at i_pop and then faulted at its WR issue) so the next
         // instruction is not popped into the fault redirect.
         if (any_fault)
-            init_cycle <= 1'b0;
+            d2_valid_r <= 1'b0;
 
-        // i_entry: set init_cycle for next instruction (queue NOT popped yet)
+        // Normal macro entry starts D2; the decoded queue is not popped yet.
         if (i_entry)
-            init_cycle <= 1'b1;  // Next cycle: pop queue and load instruction registers
+            d2_valid_r <= 1'b1;
 
         // pop queue and load all instruction registers
         if (i_pop) begin
             uc_active <= 1'b1;
-            init_cycle <= 1'b0;
+            d2_valid_r <= 1'b0;
             i_first <= 1'b1;
             stack_init_pending <= i_bus.stack_op;
             instr_eip_written <= 1'b0;
@@ -2391,18 +2478,18 @@ always_ff @(posedge clk) begin
         end
 
         // z386x chained entry: the next decq entry pops in the next cycle
-        // (init_cycle stays up through a FAST->FAST chain).
+        // (d2_valid stays up through a FAST->FAST chain).
         if (fast_issue)
-            init_cycle <= 1'b1;
+            d2_valid_r <= 1'b1;
 
         if (!stall) begin
             if (stack_init_pending && !i_pop) stack_init_pending <= 1'b0;
             if (i_first && !i_pop) i_first <= 1'b0;  // chained i_pop re-arms i_first
         end
 
-        // Queue flush: init_cycle<=0 wins over i_entry's init_cycle<=1
+        // Queue flush: clear wins over a normal D2 start.
         if (q_flush) begin
-            init_cycle <= 1'b0;
+            d2_valid_r <= 1'b0;
             if (pe_mode_toggle_now)
                 uc_active <= 1'b0;
         end
@@ -2412,11 +2499,11 @@ always_ff @(posedge clk) begin
             if (nmi_request_active && !single_step) begin
                 uc_active <= 1'b1;
                 interrupt_entry <= 1'b1;
-                init_cycle <= 1'b0;
+                d2_valid_r <= 1'b0;
             end else if (intr_pending && EFLAGS[9] && !single_step && !inhibit_interrupts) begin
                 uc_active <= 1'b1;
                 interrupt_entry <= 1'b1;
-                init_cycle <= 1'b0;
+                d2_valid_r <= 1'b0;
             end
         end
     end
@@ -2425,10 +2512,127 @@ end
 // Microcode ROM address tracking. uc comes directly from the ROM output.
 always_ff @(posedge clk) begin
     if (!reset_n) begin
+        uc_addr_mem_r <= 12'h0;
         uc_addr <= 12'h0;
-    end else if (microcode_rom_ce)
-        uc_addr <= uaddr;
+    end else begin
+        if (microcode_rom_addr_ce)
+            uc_addr_mem_r <= microcode_rom_addr;
+        if (microcode_rom_ce)
+            uc_addr <= uc_addr_mem_r;
+    end
 end
+
+// synthesis translate_off
+// v53 lifecycle oracle. This block observes the existing implementation; it
+// must not alter execution. A chained successor may start on the same edge the
+// predecessor fires, so pending state is replaced rather than cleared then.
+reg        d2_oracle_pending_r;
+reg [11:0] d2_oracle_entry_r;
+reg        d2_fire_prev_r;
+reg [11:0] d2_fire_entry_r;
+reg        i_first_prev_r;
+integer    d2_age_r;
+longint    d2_stat_decode;
+longint    d2_stat_start;
+longint    d2_stat_fire;
+longint    d2_stat_first;
+longint    d2_stat_hold;
+longint    d2_stat_cancel;
+longint    d2_stat_chain;
+longint    d2_stat_latency;
+integer    d2_stat_latency_max;
+
+wire d2_oracle_cancel = q_flush || any_fault_pop || interrupt_at_boundary ||
+                        interrupt_entry;
+
+always @(posedge clk) begin
+    if (!reset_n) begin
+        d2_oracle_pending_r <= 1'b0;
+        d2_oracle_entry_r <= 12'h000;
+        d2_fire_prev_r <= 1'b0;
+        d2_fire_entry_r <= 12'h000;
+        i_first_prev_r <= 1'b0;
+        d2_age_r <= 0;
+        d2_stat_decode <= 0;
+        d2_stat_start <= 0;
+        d2_stat_fire <= 0;
+        d2_stat_first <= 0;
+        d2_stat_hold <= 0;
+        d2_stat_cancel <= 0;
+        d2_stat_chain <= 0;
+        d2_stat_latency <= 0;
+        d2_stat_latency_max <= 0;
+    end else begin
+        d2_fire_prev_r <= d2_fire;
+        i_first_prev_r <= i_first;
+
+        if (dec_pop_now)
+            d2_stat_decode <= d2_stat_decode + 1;
+        if (d2_start)
+            d2_stat_start <= d2_stat_start + 1;
+        if (d2_fire)
+            d2_stat_fire <= d2_stat_fire + 1;
+        if (i_first && !i_first_prev_r)
+            d2_stat_first <= d2_stat_first + 1;
+        if (d2_valid && !d2_ready)
+            d2_stat_hold <= d2_stat_hold + 1;
+        if (d2_start && d2_fire)
+            d2_stat_chain <= d2_stat_chain + 1;
+
+        if (d2_fire_prev_r) begin
+            if (!i_first)
+                $fatal(1, "D2 lifecycle: fire was not followed by first EX");
+            if (uc_addr !== d2_fire_entry_r)
+                $fatal(1, "D2 lifecycle: EX uaddr=%03x expected=%03x",
+                       uc_addr, d2_fire_entry_r);
+            if (i.entry_point !== d2_fire_entry_r)
+                $fatal(1, "D2 lifecycle: instruction entry=%03x expected=%03x",
+                       i.entry_point, d2_fire_entry_r);
+        end
+
+        if (d2_oracle_cancel) begin
+            if (d2_oracle_pending_r)
+                d2_stat_cancel <= d2_stat_cancel + 1;
+            d2_oracle_pending_r <= 1'b0;
+            d2_age_r <= 0;
+        end else begin
+            if (d2_valid && !d2_fire)
+                d2_age_r <= d2_age_r + 1;
+
+            if (d2_fire) begin
+                if (!d2_oracle_pending_r)
+                    $fatal(1, "D2 lifecycle: fire without a launched entry");
+                if ((!d2_rom_mem_resident && (uaddr !== d2_oracle_entry_r)) ||
+                    (d2_rom_mem_resident && (uc_addr_mem_r !== d2_oracle_entry_r)))
+                    $fatal(1, "D2 lifecycle: resident addr=%03x expected=%03x waited=%b",
+                           d2_rom_mem_resident ? uc_addr_mem_r : uaddr,
+                           d2_oracle_entry_r, d2_waited_r);
+                d2_fire_entry_r <= d2_oracle_entry_r;
+                d2_stat_latency <= d2_stat_latency + d2_age_r + 1;
+                if ((d2_age_r + 1) > d2_stat_latency_max)
+                    d2_stat_latency_max <= d2_age_r + 1;
+                d2_oracle_pending_r <= 1'b0;
+                d2_age_r <= 0;
+            end
+
+            if (d2_start) begin
+                if (d2_oracle_pending_r && !d2_fire)
+                    $fatal(1, "D2 lifecycle: start while prior entry is pending");
+                d2_oracle_pending_r <= 1'b1;
+                d2_oracle_entry_r <= d2_start_entry;
+                d2_age_r <= 0;
+            end
+        end
+    end
+end
+
+final if ($test$plusargs("d2_stats"))
+    $display("d2: decoded=%0d start=%0d fire=%0d first=%0d chain=%0d hold=%0d cancel=%0d avg_latency=%.2f max_latency=%0d",
+             d2_stat_decode, d2_stat_start, d2_stat_fire, d2_stat_first,
+             d2_stat_chain, d2_stat_hold, d2_stat_cancel,
+             d2_stat_fire ? (1.0 * d2_stat_latency / d2_stat_fire) : 0.0,
+             d2_stat_latency_max);
+// synthesis translate_on
 
 // Interrupt State Machine:
 always_ff @(posedge clk) begin
@@ -2491,6 +2695,8 @@ always_ff @(posedge clk) begin
         fast_jcc_r <= 1'b0;
         fast_commit_sel_r <= FAST_COMMIT_NONE;
         fast_keep_slot_r <= 1'b0;
+        branch_ustep_r <= 1'b0;
+        branch_ustep_jcc_r <= 1'b0;
     end else if (i_pop) begin
         i <= i_bus;
         fast_i_r <= fast_pop_fast;
@@ -2499,6 +2705,11 @@ always_ff @(posedge clk) begin
         fast_wf_r <= fast_pop_fc.writes_flags;
         fast_commit_sel_r <= fast_pop_fc.commit_sel;
         fast_keep_slot_r <= fast_pop_fc.keep_slot;
+        branch_ustep_r <= fast_pop_fast &&
+                          ((d2_kind == RECIPE_EARLY_BRANCH) || i_bus.opcode == 8'hE8) &&
+                          i_bus.data32 && (!i_bus.stack_op || i_bus.opcode == 8'hE8) &&
+                          (!fast_pop_fc.jcc || !jcc_pop_unsafe);
+        branch_ustep_jcc_r <= fast_pop_fc.jcc;
         // LSS/LFS/LGS (0F B2/B4/B5): put opcode in i.immediate for microcode XOR trick
         if (i_bus.has_0f && (i_bus.opcode == 8'hB2 || i_bus.opcode == 8'hB4 || i_bus.opcode == 8'hB5))
             i.immediate <= {24'h0, i_bus.opcode};
@@ -2532,6 +2743,7 @@ always_ff @(posedge clk) begin
         fast_multi_r <= 1'b0;
         fast_jcc_r <= 1'b0;
         fast_commit_sel_r <= FAST_COMMIT_NONE;
+        branch_ustep_r <= 1'b0;
     end
 end
 
@@ -2622,7 +2834,7 @@ end
 
 
 //=============================================================================
-// Unit 8: Write-back - deferred commits that retire one cycle after their producer:
+// Unit 8: Write-back - deferred commits that retire one cycle after their producer: 
 //         the two-cycle ALU flag retirement and the two-cycle shift.
 //=============================================================================
 
@@ -2683,31 +2895,31 @@ always_ff @(posedge clk) begin
                 sh2_cf <= i.opcode[3] ? shift_last_out_lsb : shift_last_out_msb;
                 if (shift_size == 5'd1) begin
                     sh2_we_of <= 1'b1;
-                    sh2_of <= i.opcode[3] ? (shift_result[width-1] ^ shift_result[width-2]) :
-                                            (shift_result[width-1] ^ shift_last_out_msb);
+                    sh2_of <= i.opcode[3] ? (shift_result[sh1_width_r-1] ^ shift_result[sh1_width_r-2]) :
+                                            (shift_result[sh1_width_r-1] ^ shift_last_out_msb);
                 end
             end else begin
                 case (shift_op)
                     SHL,SAL: sh2_cf <= shift_overflow ? (shift_eq_width ? shift_eq_cf : 1'b0) : shift_last_out_msb;
                     RCL:     sh2_cf <= shift_last_out_msb;
                     SHR:     sh2_cf <= shift_overflow ? (shift_eq_width ? shift_eq_cf : 1'b0) : shift_last_out_lsb;
-                    SAR:     sh2_cf <= shift_overflow ? shift_result[width-1] : shift_last_out_lsb;
+                    SAR:     sh2_cf <= shift_overflow ? shift_result[sh1_width_r-1] : shift_last_out_lsb;
                     RCR:     sh2_cf <= shift_last_out_lsb;
                     ROL:     sh2_cf <= shift_result[0];
-                    ROR:     sh2_cf <= shift_result[width-1];
+                    ROR:     sh2_cf <= shift_result[sh1_width_r-1];
                 endcase
                 if (shift_size == 5'd1) begin
                     case (shift_op)
-                        SHL:     begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_last_out_msb; end
-                        SHR:     begin sh2_we_of <= 1'b1; sh2_of <= shift_lo[width-1]; end
+                        SHL:     begin sh2_we_of <= 1'b1; sh2_of <= shift_result[sh1_width_r-1] ^ shift_last_out_msb; end
+                        SHR:     begin sh2_we_of <= 1'b1; sh2_of <= shift_lo[sh1_width_r-1]; end
                         SAR:     begin sh2_we_of <= 1'b1; sh2_of <= 1'b0; end
-                        ROR,RCR: begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_result[width-2]; end
+                        ROR,RCR: begin sh2_we_of <= 1'b1; sh2_of <= shift_result[sh1_width_r-1] ^ shift_result[sh1_width_r-2]; end
                         default: ;
                     endcase
                 end
                 // ROL/RCL: OF computed for ALL counts (real 386 behavior)
-                if (shift_op == ROL) begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_result[0]; end
-                if (shift_op == RCL) begin sh2_we_of <= 1'b1; sh2_of <= shift_result[width-1] ^ shift_last_out_msb; end
+                if (shift_op == ROL) begin sh2_we_of <= 1'b1; sh2_of <= shift_result[sh1_width_r-1] ^ shift_result[0]; end
+                if (shift_op == RCL) begin sh2_we_of <= 1'b1; sh2_of <= shift_result[sh1_width_r-1] ^ shift_last_out_msb; end
             end
         end
     end
@@ -3158,6 +3370,8 @@ always @(posedge clk)
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         EIP <= 32'h0000FFF0;  // 386 reset vector offset
+    end else if (branch_ustep_redirect) begin
+        EIP <= ea_reg;
     end else if (i_pop && !halted /*&& (~uc_active || i_rni_delay)*/) begin
         // z386x: a chained i_pop can land on a control transfer's fina -- doc/z386x/core_notes_v51.md #25
         if (uc_exec && fast_last && (uc_dest == DEST_eIP)) begin
@@ -3867,15 +4081,15 @@ wire in_rpti_routine = (uaddr >= 12'h208) && (uaddr <= 12'h20e);   // TODO: Remo
 // Pre-computed ROM bits (eliminates wide combinational comparisons from hot paths)
 wire alu_update_flags  = uc[37];
 wire uc_bus_or_dly     = uc[38];
-wire uc_is_mem_busop   = uc[39];
-wire uc_is_write       = uc[40];
-wire uc_is_check_write = uc[41];
-wire uc_is_word_op     = uc[42];
-wire uc_is_dword_op    = uc[43];
-wire uc_jpereq_fwd     = uc[44];
-wire uc_p_io_rd        = uc[45];   // IO-capable read buscode
-wire uc_p_io_wr        = uc[46];   // IO-capable write buscode
-wire uc_p_iack         = uc[47];   // IACK bus cycle
+wire uc_is_mem_busop   = uc_mem_ctrl[0];
+wire uc_is_write       = uc_mem_ctrl[1];
+wire uc_is_check_write = uc_mem_ctrl[2];
+wire uc_is_word_op     = uc_mem_ctrl[3];
+wire uc_is_dword_op    = uc_mem_ctrl[4];
+wire uc_jpereq_fwd     = uc_mem_ctrl[5];
+wire uc_p_io_rd        = uc_mem_ctrl[6];   // IO-capable read buscode
+wire uc_p_io_wr        = uc_mem_ctrl[7];   // IO-capable write buscode
+wire uc_p_iack         = uc_mem_ctrl[8];   // IACK bus cycle
 wire uc_p_pure_dly     = uc[48];   // DLY without a bus request of its own
 wire uc_p_rpt          = uc[49];   // RPT opcode
 wire uc_p_wio          = uc[50];   // WIO (RPT opcode + WIO subcode)
@@ -3945,11 +4159,11 @@ always_comb begin
     if (uc_aluop_shift == ALUJMP_SHIFT2) begin
         // The immutable ROM uses only these four sources for SHIFT2. Keeping
         // this timing-critical path separate avoids the general shift mux.
-        case ({uc_source_shift[1], uc_source_shift[5:4]})
-            3'b000:  shift_src_value = TMPC;  // SRC_TMPC
-            3'b100:  shift_src_value = TMPE;  // SRC_TMPE
-            3'b101:  shift_src_value = SIGMA; // SRC_SIGMA
-            3'b111:  shift_src_value = read_gpr(i_reg_src_reg_sel, op_size); // SRC_SRCREG
+        case (uc_shift2_source)
+            2'd0:    shift_src_value = TMPC;
+            2'd1:    shift_src_value = TMPE;
+            2'd2:    shift_src_value = SIGMA;
+            2'd3:    shift_src_value = read_gpr(i_reg_src_reg_sel, op_size);
             default: shift_src_value = 32'd0;
         endcase
     end else begin
@@ -3970,6 +4184,14 @@ always_comb begin
         endcase
     end
 end
+
+// synthesis translate_off
+always @(posedge clk)
+    if (reset_n && uc_exec && (uc_aluop_shift == ALUJMP_SHIFT2) &&
+        (uc_source_shift != SRC_TMPC) && (uc_source_shift != SRC_TMPE) &&
+        (uc_source_shift != SRC_SIGMA) && (uc_source_shift != SRC_SRCREG))
+        $fatal(1, "SHIFT2 source outside ROM predecode inventory: %02x", uc_source_shift);
+// synthesis translate_on
 
 always_comb begin
     case (uc_alu_src_shift)
@@ -4024,8 +4246,10 @@ wire         shift_sf = shift_overflow ? (is_sar ? shift_lo_sign : 1'b0) :
 
 // flags related
 reg          shift_SET_Nzs;
+reg   [5:0]  sh1_width_r;  // Registered SHIFT1 width keeps op_size out of SHIFT2 flag selects.
 reg   [2:0]  shift_op;     // ROL/ROR/RCL/RCR/SHL/SHR/SAR, for flag update
 wire         shift_last_out_lsb = shift_in[shift_count-1];
+// BSR can consume this on cycles where sh1_width_r is stale by one cycle.
 wire         shift_last_out_msb = shifted[width];
 // Simplified shift CF for uc_flags: left shift uses MSB, right shift uses LSB
 wire         shift_cf = shift_swap ? shift_last_out_msb : shift_last_out_lsb;
@@ -4048,6 +4272,7 @@ always_ff @(posedge clk) begin
             default: count_mod = count_raw;               // mod 32, count is already 0..31
         endcase
         shift_size = count_raw;  // Store original count for OF check (count==1)
+        sh1_width_r <= width;
 
         if (instr_is_shxd) begin   // i.opcode[3], 1: SHRD, 0: SHLD
             shift_swap <= ~i.opcode[3];

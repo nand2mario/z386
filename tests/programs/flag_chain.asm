@@ -113,6 +113,43 @@ start:
     cmp si, 8            ; 0xA5C3 has 8 set bits
     jne fail
 
+;--- 6: SHLD/SHRD use the two-word FAST shift path.  Check its deferred
+;       destination and flags in the immediately following instruction.
+    mov ax, 0x1234
+    mov dx, 0xABCD
+    shld ax, dx, 4
+    cmp ax, 0x234A
+    jne fail
+
+    mov bx, 0x5678
+    mov si, 0x9ABC
+    mov cx, 4
+    shrd bx, si, cl
+    cmp bx, 0xC567
+    jne fail
+
+    mov eax, 0x12345678
+    mov edx, 0x9ABCDEF0
+    shld eax, edx, 8
+    cmp eax, 0x3456789A
+    jne fail
+
+    mov eax, 0x12345678
+    shrd eax, edx, 8
+    cmp eax, 0xF0123456
+    jne fail
+
+    mov ax, 0x8000
+    mov dx, 0
+    shld ax, dx, 1       ; CF=1
+    dec bx               ; preserve the deferred SHLD carry
+    jnc fail
+
+    mov ax, 1
+    shrd ax, dx, 1       ; CF=1
+    dec bx
+    jnc fail
+
 pass:
     mov al, STATUS_PASS
     mov dx, STATUS_PORT

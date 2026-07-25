@@ -885,12 +885,66 @@ addm_08: add [edi], eax
 
     cmp dword [edi], ADDM_INIT + 8
     jne short phase_alu_mem_fail
-    jmp phase_done
+    jmp phase_shld_imm
 
 phase_alu_mem_fail:
     jmp fail_01
 
     times (0x1D00 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 29: SHLD r32,r32,imm8 - common DOOM fixed-point normalization
+;------------------------------------------------------------------------------
+phase_shld_imm:
+    mov eax, 0x12345678
+    mov edx, 0x9ABCDEF0
+    mov ebx, 0x23456789
+    mov esi, 0xABCDEF01
+    mov edi, 0x3456789A
+    mov ebp, 0xBCDEF012
+shldimm_01: shld eax, edx, 8
+shldimm_02: shld ebx, esi, 8
+shldimm_03: shld edi, ebp, 8
+shldimm_04: shld eax, edx, 8
+shldimm_05: shld ebx, esi, 8
+shldimm_06: shld edi, ebp, 8
+shldimm_07: shld eax, edx, 8
+shldimm_08: shld ebx, esi, 8
+    cmp eax, 0x789A9A9A
+    jne short phase_shld_imm_fail
+    cmp ebx, 0x89ABABAB
+    jne short phase_shld_imm_fail
+    cmp edi, 0x789ABCBC
+    jne short phase_shld_imm_fail
+    jmp phase_unary_mem
+
+phase_shld_imm_fail:
+    jmp fail_02
+
+    times (0x1E00 - ($ - $$)) db 0x90
+
+;------------------------------------------------------------------------------
+; Phase 30: Unary memory RMW - `inc dword [edi]` (shared 04E routine)
+;------------------------------------------------------------------------------
+phase_unary_mem:
+    mov edi, STORE_ADDR
+    mov dword [edi], ADDM_INIT
+
+incm_01: inc dword [edi]
+incm_02: inc dword [edi]
+incm_03: inc dword [edi]
+incm_04: inc dword [edi]
+incm_05: inc dword [edi]
+incm_06: inc dword [edi]
+incm_07: inc dword [edi]
+incm_08: inc dword [edi]
+
+    cmp dword [edi], ADDM_INIT + 8
+    jne short phase_unary_mem_fail
+    jmp phase_done
+
+phase_unary_mem_fail:
+    jmp fail_02
 
 phase_done:
     mov al, STATUS_PASS

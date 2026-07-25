@@ -10,7 +10,7 @@ localparam logic [2:0] RECIPE_EARLY_STACK  = 3'd7;
 
 function automatic logic [2:0] recipe_early_kind(input logic [11:0] entry);
     unique case (entry)
-        12'h003, 12'h005, 12'h01D, 12'h01F, 12'h021, 12'h023, 12'h025, 12'h0F9, 12'h0FF, 12'h105, 12'h1E8, 12'h1F0: recipe_early_kind = RECIPE_EARLY_NONE;
+        12'h003, 12'h005, 12'h01D, 12'h01F, 12'h021, 12'h023, 12'h025, 12'h0F9, 12'h0FC, 12'h0FF, 12'h102, 12'h105, 12'h1E8, 12'h1F0: recipe_early_kind = RECIPE_EARLY_NONE;
         12'h0B9: recipe_early_kind = RECIPE_EARLY_EA;
         12'h019, 12'h027, 12'h02C, 12'h031, 12'h035, 12'h1EB, 12'h1F3: recipe_early_kind = RECIPE_EARLY_LOAD;
         12'h013, 12'h015: recipe_early_kind = RECIPE_EARLY_STORE;
@@ -109,6 +109,24 @@ function automatic fast_class_t recipe_fast_class(input dec_entry_t e);
                     r.reads_ecx = 1'b1; r.writes_flags = 1'b1;
                 end
             end
+            12'h0FC: begin
+                if (e.has_0f && (e.modrm[7:6] == 2'b11) &&
+                    ((e.opcode == 8'hA4) || (e.opcode == 8'hAC))) begin
+                    r.fast = 1'b1; r.multi_word = 1'b1;
+                    r.commit_sel = FAST_COMMIT_SHIFT;
+                    r.reads_dst = 1'b1; r.reads_src = 1'b1;
+                    r.writes_flags = 1'b1;
+                end
+            end
+            12'h102: begin
+                if (e.has_0f && (e.modrm[7:6] == 2'b11) &&
+                    ((e.opcode == 8'hA5) || (e.opcode == 8'hAD))) begin
+                    r.fast = 1'b1; r.multi_word = 1'b1;
+                    r.commit_sel = FAST_COMMIT_SHIFT;
+                    r.reads_dst = 1'b1; r.reads_src = 1'b1;
+                    r.reads_ecx = 1'b1; r.writes_flags = 1'b1;
+                end
+            end
             12'h1E8, 12'h1F0: begin
                 r.fast = 1'b1; r.multi_word = 1'b1;
                 r.commit_sel = FAST_COMMIT_SIGSRC;
@@ -189,6 +207,7 @@ function automatic fast_class_t recipe_fast_class(input dec_entry_t e);
             end
             12'h075: begin
                 r.fast = 1'b1; r.multi_word = 1'b1;
+                if (e.data32) r.commit_sel = FAST_COMMIT_ESP;
                 r.uses_ea = 1'b1; r.br_rel = 1'b1;
             end
             12'h072: begin

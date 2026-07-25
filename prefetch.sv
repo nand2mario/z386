@@ -8,7 +8,7 @@ module prefetch
     input             reset_n,
 
     // Queue read interface to the decoder (two cursors, one pop point)
-    output reg [31:0] win_d1,        // registered window at the D1 cursor
+    output     [63:0] win_d1,        // registered raw window at the D1 cursor
     output     [5:0]  d1_avail,      // bytes fetched beyond the D1 cursor
     input      [3:0]  d1_adv,        // D1 cursor advance this cycle (0-11: a
                                      //   prefix, or the instruction rest at handoff)
@@ -44,7 +44,9 @@ module prefetch
                                      // spec fetch: its taken-flush address equals
                                      // the spec target BY CONSTRUCTION (same
                                      // adder inputs), so no address compare
-    input             spec_kill
+    input             spec_store_valid,
+    input      [31:0] spec_store_linear,
+    input             spec_global_kill
 );
 
 // 32-byte prefetch queue (8 x 32-bit words).  Cache fills write up to four
@@ -75,6 +77,13 @@ reg         spec_valid;              // spec_line holds the line at spec_addr
 reg         spec_adopted_r;          // post-flush fill is an adopted spec line: buffer it too
 reg         spec_poison;             // a store/snoop occurred since the fetch started
 reg [127:0] spec_line;
+
+// Normal 386 self-modifying code performs a frontend-flushing branch after
+// the store. Keep the buffered target coherent for that branch without
+// discarding it for unrelated data stores. Global events remain conservative.
+wire spec_store_hit = spec_store_valid &&
+                      (spec_addr == spec_store_linear[31:4]);
+wire spec_kill = spec_global_kill || spec_store_hit;
 
 // synthesis translate_off
 bit TRACE_FLUSH_EN;
@@ -304,12 +313,21 @@ end
 // Details: doc/z386x/implementation_notes.md#src-24-z386x-prefetch-sv-342
 wire [31:0] d1_word_cur_next = queue_next[ptr_idx(d1_word_next)];
 wire [31:0] d1_word_nxt_next = queue_next[ptr_idx(d1_word_next + 4'd1)];
+wire [31:0] d1_word_2nd_next = queue_next[ptr_idx(d1_word_next + 4'd2)];
 
-wire [31:0] win_d1_next =
-    d1_boff_next == 2'd0 ? d1_word_cur_next :
-    d1_boff_next == 2'd1 ? {d1_word_nxt_next[7:0],  d1_word_cur_next[31:8]} :
-    d1_boff_next == 2'd2 ? {d1_word_nxt_next[15:0], d1_word_cur_next[31:16]} :
-                           {d1_word_nxt_next[23:0], d1_word_cur_next[31:24]};
+wire [63:0] win_d1_next =
+    d1_boff_next == 2'd0 ? {d1_word_nxt_next,       d1_word_cur_next} :
+    d1_boff_next == 2'd1 ? {d1_word_2nd_next[7:0],  d1_word_nxt_next,
+                                                     d1_word_cur_next[31:8]} :
+    d1_boff_next == 2'd2 ? {d1_word_2nd_next[15:0], d1_word_nxt_next,
+                                                     d1_word_cur_next[31:16]} :
+                           {d1_word_2nd_next[23:0], d1_word_nxt_next,
+                                                     d1_word_cur_next[31:24]};
+
+// Keep the queue/decoder boundary physical. Quartus retiming this register
+// turns an icache response into a same-cycle cache -> aligner -> D1 PLA path.
+(* preserve *) reg [63:0] win_d1_r;
+assign win_d1 = win_d1_r;
 
 always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n) begin
@@ -326,7 +344,7 @@ always_ff @(posedge clk or negedge reset_n) begin
         pf_linear_addr <= 32'h0;
         pf_redirect_queued <= 1'b0;
         pf_ack_prev <= 1'b0;
-        win_d1 <= 32'h0;
+        win_d1_r <= 64'h0;
         spec_pend <= 1'b0;
         spec_inflight <= 1'b0;
         spec_valid <= 1'b0;
@@ -343,7 +361,7 @@ always_ff @(posedge clk or negedge reset_n) begin
         pf_byte_offset <= byte_offset_next;
         d1_word <= d1_word_next;
         d1_boff <= d1_boff_next;
-        win_d1 <= win_d1_next;
+        win_d1_r <= win_d1_next;
         for (int k = 0; k < 8; k++)
             prefetch_queue[k] <= queue_next[k];
 

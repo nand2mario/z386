@@ -87,6 +87,8 @@ STEADY_PHASES = [
     # 80386 ref ~ 5 + 4*count; 64B ~= 261.  z386 currently ~333 (~5.2 cyc/byte).
     SteadyPhase("rep_movsb", "rep movsb (64B)", 261.0, (0x1B10, 0x1B21, 0x1B32, 0x1B43, 0x1B54, 0x1B65, 0x1B76, 0x1B87)),
     SteadyPhase("alu_mem_rmw", "add [edi], eax", 7.0, (0x1C10, 0x1C12, 0x1C14, 0x1C16, 0x1C18, 0x1C1A, 0x1C1C, 0x1C1E)),
+    SteadyPhase("shld_reg_imm", "shld r32, r32, 8", 3.0, (0x1D1E, 0x1D22, 0x1D26, 0x1D2A, 0x1D2E, 0x1D32, 0x1D36, 0x1D3A)),
+    SteadyPhase("unary_mem_rmw", "inc dword [edi]", 6.0, (0x1E0B, 0x1E0D, 0x1E0F, 0x1E11, 0x1E13, 0x1E15, 0x1E17, 0x1E19)),
 ]
 
 BRANCH_PHASES = [
@@ -125,6 +127,8 @@ Z386_04_MIN_CYCLES = {
     "alu_reg_imm": 2.0,
     "rep_movsb": 333.0,
     "alu_mem_rmw": 6.0,
+    "shld_reg_imm": 3.0,
+    "unary_mem_rmw": 5.0,
     "conditional_jump_taken": 6.0,
     "unconditional_jump": 6.0,
     "call_taken": 7.0,
@@ -158,6 +162,8 @@ TARGET_486_CYCLES = {
     "alu_reg_imm": 1.0,
     "rep_movsb": 204.0,          # i486 REP MOVSB ~ 12 + 3n, n = 64
     "alu_mem_rmw": 3.0,          # i486 ADD m,r
+    "shld_reg_imm": 2.0,
+    "unary_mem_rmw": 3.0,
     "conditional_jump_taken": 3.0,
     "unconditional_jump": 3.0,
     "call_taken": 3.0,
