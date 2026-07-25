@@ -271,10 +271,14 @@ assign cpu_resp_valid = lookup_read_hit_now || resp_valid_r;
 
 // Store-queue drain issue, decoupled from the FSM: drains may launch while the FSM is accepting or patching, so back-to-back writes are...
 // Details: doc/z386x/implementation_notes.md#src-24-z386x-l1-cache-sv-280
+// Uncacheable reads cannot bypass posted stores.  Besides preserving normal
+// memory ordering, VGA reads depend on all earlier planar writes being visible.
+// Keep draining while such a read waits, then reserve the memory port once the
+// queue is empty.
 wire drain_block_state = (state == S_RESET_INIT) || (state == S_FILL) ||
                          (state == S_BYPASS_WAIT) ||
                          ((state == S_LOOKUP) && !req_protect_write_r && !req_write_r &&
-                          (req_uncacheable_r || !lookup_hit));
+                          (req_uncacheable_r ? storeq_empty : !lookup_hit));
 wire drain_issue_now = !storeq_empty && !storeq_draining && !mem_valid_r &&
                        !mem_busy && !drain_block_state;
 
@@ -541,7 +545,7 @@ always_ff @(posedge clk) begin
                     state <= S_IDLE;
                     ready_r <= (storeq_count_wr_next != STOREQ_DEPTH_VALUE);
                 end else if (req_uncacheable_r) begin
-                    if (!mem_valid_r && !mem_busy) begin
+                    if (storeq_empty && !storeq_draining && !mem_valid_r && !mem_busy) begin
                         mem_valid_r <= 1'b1;
                         mem_write_r <= 1'b0;
                         mem_addr_r <= req_addr_r;

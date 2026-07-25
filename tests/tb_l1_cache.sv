@@ -24,6 +24,9 @@ module tb_l1_cache;
     wire        mem_valid;
     wire        mem_write;
     reg         mem_resp_valid = 1'b0;
+    reg         mem_stall = 1'b0;
+    reg         check_uncached_order = 1'b0;
+    reg         saw_uncached_write_104 = 1'b0;
 
     reg  [31:0] snoop_addr = 32'h0;
     reg         snoop_valid = 1'b0;
@@ -73,7 +76,8 @@ module tb_l1_cache;
     endtask
 
     function automatic [31:0] mem_get32(input [31:0] addr);
-        mem_get32 = {mem[addr + 3], mem[addr + 2], mem[addr + 1], mem[addr + 0]};
+        mem_get32 = {mem[addr[11:0] + 3], mem[addr[11:0] + 2],
+                     mem[addr[11:0] + 1], mem[addr[11:0] + 0]};
     endfunction
 
     always_ff @(posedge clk) begin
@@ -88,14 +92,20 @@ module tb_l1_cache;
             rd_left <= rd_left - 8'd1;
         end
 
-        if (mem_valid && !mem_ready && rd_left == 8'd0) begin
+        if (mem_valid && !mem_ready && rd_left == 8'd0 && !mem_stall) begin
             mem_ready <= 1'b1;
             if (mem_write) begin
-                if (mem_be[0]) mem[mem_addr + 0] <= mem_din[7:0];
-                if (mem_be[1]) mem[mem_addr + 1] <= mem_din[15:8];
-                if (mem_be[2]) mem[mem_addr + 2] <= mem_din[23:16];
-                if (mem_be[3]) mem[mem_addr + 3] <= mem_din[31:24];
+                if (check_uncached_order && mem_addr == 32'h000A_0104)
+                    saw_uncached_write_104 <= 1'b1;
+                if (mem_be[0]) mem[mem_addr[11:0] + 0] <= mem_din[7:0];
+                if (mem_be[1]) mem[mem_addr[11:0] + 1] <= mem_din[15:8];
+                if (mem_be[2]) mem[mem_addr[11:0] + 2] <= mem_din[23:16];
+                if (mem_be[3]) mem[mem_addr[11:0] + 3] <= mem_din[31:24];
             end else begin
+                if (check_uncached_order && mem_addr == 32'h000A_0108 && !saw_uncached_write_104) begin
+                    $display("L1 ORDER FAIL uncached read bypassed older posted write");
+                    $fatal(1);
+                end
                 rd_addr <= mem_addr;
                 rd_left <= mem_burstcount == 8'd0 ? 8'd1 : mem_burstcount;
             end
@@ -166,6 +176,28 @@ module tb_l1_cache;
 
         cache_write(32'h80, 4'hF, 32'hDEAD_BEEF);      // write miss, no allocate
         cache_read(32'h80, 4'hF, 32'hDEAD_BEEF);       // fill patched from store queue
+
+        // Uncacheable reads must wait for every older posted store.  VGA uses
+        // this ordering when it restores a software cursor before saving the
+        // background at the cursor's next position.
+        mem_stall = 1'b1;
+        check_uncached_order = 1'b1;
+        saw_uncached_write_104 = 1'b0;
+        mem_put32(32'h108, 32'hA55A_C33C);
+        fork
+            begin
+                cache_write(32'h000A_0100, 4'hF, 32'h1122_3344);
+                cache_write(32'h000A_0104, 4'hF, 32'h5566_7788);
+                // A different-address read still observes the preceding writes:
+                // planar VGA read latches make ordering global to the aperture.
+                cache_read(32'h000A_0108, 4'hF, 32'hA55A_C33C);
+            end
+            begin
+                repeat (5) @(posedge clk);
+                mem_stall = 1'b0;
+            end
+        join
+        check_uncached_order = 1'b0;
 
         repeat (20) @(posedge clk);
         mem_put32(32'h40, 32'hCAFE_BABE);
