@@ -744,6 +744,7 @@ localparam DEST_PROTUN = 7'h15;  // Protection unit register
 localparam DEST_TMPeIP = 7'h16;  // Saved EIP for fault handling
 localparam DEST_TMPeSP = 7'h17;  // Saved ESP for fault handling
 localparam DEST_DR6 = 7'h18;     // Debug register 6
+localparam DEST_DR7 = 7'h19;     // Debug register 7
 localparam DEST_CSOPCD = 7'h1A;  // CS opcode temp (used by FSAVE and IRETD)
 localparam DEST_FSVeIP = 7'h1B;  // Saved EIP for FPU/segment operations
 localparam DEST_OPROFF = 7'h1C;  // Operand offset

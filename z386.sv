@@ -1323,7 +1323,7 @@ function automatic [8:0] gpr_dest_probe(input [6:0] dst);
         DEST_EIP, DEST_eIP, DEST_IP, DEST_EFLAGS, DEST_FLAGS,
         DEST_FLAGSB, DEST_FLAGSL, DEST_COUNTR, DEST_COUNT5,
         DEST_MDTMP, DEST_MDTMP4, DEST_PROTUN, DEST_SLCTR,
-        DEST_TMP_TR, DEST_FSVeIP, DEST_DR6,
+        DEST_TMP_TR, DEST_FSVeIP, DEST_DR6, DEST_DR7,
         7'h7F:                          gpr_dest_probe = 9'h0;
         default: ;
     endcase
@@ -1798,14 +1798,6 @@ always_ff @(posedge clk) begin
         ss_fault_r <= ss_segment_fault;
     end
 end
-
-// synthesis translate_off
-// Debug: log every protected-mode (non-V86) fault delivery
-always @(posedge clk) begin
-    if (reset_n && uc_addr == 12'h890 && !EFLAGS[17])
-        $display("%0t: PM FAULT CS:EIP=%0x:%0x SIGMA=%08x TMPF=%08x EFL=%08x", $time, CS, EIP, SIGMA, TMPF, EFLAGS);
-end
-// synthesis translate_on
 
 // CR3 register update
 always_ff @(posedge clk) begin
@@ -3499,7 +3491,9 @@ always_ff @(posedge clk) begin
     if (!reset_n) begin
         EAX <= 32'h0;
         ECX <= 32'h0;
-        EDX <= 32'h0;
+        // BOOTUP ucode 9B5-9B6 would load this 80386 signature, but reset
+        // currently enters the BIOS frontend directly instead of running it.
+        EDX <= 32'h0000_0303;
         EBX <= 32'h0;
         ESP <= 32'h0;
         EBP <= 32'h0;
@@ -3516,8 +3510,11 @@ always_ff @(posedge clk) begin
         TR <= 16'h0000;
         SLCTR <= 32'h0;
 
-        CR0 <= 32'h0;       // CR0 must clear PE and PG at reset
+        // BOOTUP 9BA-9BB leaves PE/MP/EM/TS/PG clear and sets ET for 80387.
+        CR0 <= 32'h0000_0010;
         CR2 <= 32'h0;
+        DR6 <= 32'h0;
+        DR7 <= 32'h0;
 
         TMPB <= 32'h0;
         TMPC <= 32'h0;
@@ -3616,6 +3613,7 @@ always_ff @(posedge clk) begin
             end
 
             DEST_DR6: DR6 <= dest_value;
+            DEST_DR7: DR7 <= dest_value;
 
             // Paging-related destinations (NOP for now)
             DEST_PAGER5: ; // Page cache register - paging-related, NOP

@@ -53,9 +53,20 @@ start:
     cmp ebx, CR3_EXPECT
     jne .fail_4
 
-    ; DR6/DR7 reads take a different tail but cover the 3A6/3AA routines
+    ; DR6/DR7 use dedicated microcode destinations and readback paths.
+    mov eax, 0x13579BDF
+    mov dr6, eax
     mov ecx, dr6
+    cmp ecx, eax
+    jne .fail_5
+
+    ; Keep breakpoint enables and GD clear; bit 10 is the inert fixed-one bit.
+    mov eax, 0x00000400
+    mov dr7, eax
     mov ecx, dr7
+    cmp ecx, eax
+    jne .fail_5
+
     mov ebx, cr3
     cmp ebx, CR3_EXPECT
     jne .fail_5

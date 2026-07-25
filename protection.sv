@@ -34,7 +34,7 @@ module protection_unit
     input               pe_mode,          // Protected mode enabled (CR0.PE)
 
     // CR0 flags for FPU tests (multiplexed into state vector)
-    input               cr0_et,           // CR0.ET (1=287, 0=387)
+    input               cr0_et,           // CR0.ET (1=387, 0=287)
     input               cr0_ts,           // CR0.TS (Task Switched)
     input               cr0_em,           // CR0.EM (Emulation)
     input               cr0_mp,           // CR0.MP (Monitor Coprocessor)

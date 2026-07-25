@@ -53,6 +53,8 @@ CPP_PROT_SRCS := sim_main_protected_mode.cpp
 # L1 cache unit test
 TB_L1_SRCS := tb_l1_cache.sv
 CPP_L1_SRCS := sim_main_l1_cache.cpp
+TB_L1I_SRCS := tb_l1_icache.sv
+CPP_L1I_SRCS := sim_main_l1_icache.cpp
 
 # PLA4 verification testbench sources
 TB_PLA4_SRCS := tb_protection_pla4.sv
@@ -60,7 +62,7 @@ CPP_PLA4_SRCS := sim_main_pla4.cpp
 PLA4_RTL := $(Z386_DIR)/protection.sv
 
 # Targets
-.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache dhrystone clean help
+.PHONY: all build test-simple test-full test-386 test-186 test-protected test-pla4 test-l1-cache test-l1-icache dhrystone clean help
 
 all: build
 
@@ -90,6 +92,11 @@ obj_dir/Vtb_l1_cache: $(Z386_DIR)/l1_cache.sv $(TB_L1_SRCS) $(CPP_L1_SRCS)
 	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_l1_cache $(TB_L1_SRCS) $(Z386_DIR)/l1_cache.sv $(CPP_L1_SRCS)
 	@echo "Build complete: obj_dir/Vtb_l1_cache"
 
+obj_dir/Vtb_l1_icache: $(Z386_DIR)/l1_icache.sv $(TB_L1I_SRCS) $(CPP_L1I_SRCS)
+	@echo "Building L1 instruction cache unit test with Verilator..."
+	$(VERILATOR) $(VFLAGS_NOTRACE) --top-module tb_l1_icache $(TB_L1I_SRCS) $(Z386_DIR)/l1_icache.sv $(CPP_L1I_SRCS)
+	@echo "Build complete: obj_dir/Vtb_l1_icache"
+
 test: test-simple
 
 # Run tests
@@ -113,6 +120,10 @@ test-l1-cache: obj_dir/Vtb_l1_cache
 	@echo "Running L1 cache unit test..."
 	./obj_dir/Vtb_l1_cache
 
+test-l1-icache: obj_dir/Vtb_l1_icache
+	@echo "Running L1 instruction cache unit test..."
+	./obj_dir/Vtb_l1_icache
+
 dhrystone:
 	$(MAKE) -C dhrystone compare
 
@@ -133,6 +144,7 @@ help:
 	@echo "  make test-simple    - Run default test suite (~13 test files)"
 	@echo "  make test-386       - Run test386.asm"
 	@echo "  make test-l1-cache  - Run PIPT L1 cache unit test"
+	@echo "  make test-l1-icache - Run PIPT L1 instruction cache unit test"
 	@echo "  make dhrystone      - Compare z386 0.1 and current z386 on Dhrystone"
 	@echo "  make clean          - Remove build artifacts"
 	@echo "  make help           - Show this help message"

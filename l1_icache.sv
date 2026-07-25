@@ -253,10 +253,16 @@ wire [3:0] lookup_hit_vec = {
 wire lookup_hit = |lookup_hit_vec;
 wire [1:0] lookup_way = way_encode(lookup_hit_vec);
 wire [127:0] lookup_way_line = way_line_mux(lookup_way, rd_line0_r, rd_line1_r, rd_line2_r, rd_line3_r);
+// A snoop can arrive after the synchronous RAM lookup captured a valid line.
+// Reject that stale hit and refill; data-bearing snoops patch the refill below.
+wire lookup_snoop_conflict =
+    (snoop_valid_r && (snoop_tag_r == req_tag_r) && (snoop_set_r == req_set_r)) ||
+    (snoop_valid && (snoop_tag == req_tag_r) && (snoop_set == req_set_r));
+wire lookup_hit_usable = lookup_hit && !lookup_snoop_conflict;
 wire can_accept_cpu = (state == S_IDLE) && !reset;
 wire accept_cpu = cpu_valid && ready_r && can_accept_cpu;
 wire lookup_read_hit_now = (state == S_LOOKUP) && req_valid_r &&
-                           !req_uncacheable_r && lookup_hit;
+                           !req_uncacheable_r && lookup_hit_usable;
 logic [PATCHQ_DEPTH-1:0] patchq_snoop_match;
 logic patchq_snoop_hit;
 logic [31:0] fill_word_next;
@@ -449,7 +455,7 @@ always_ff @(posedge clk) begin
                         mem_burstcount_r <= 8'd1;
                         state <= S_BYPASS_WAIT;
                     end
-                end else if (lookup_hit) begin
+                end else if (lookup_hit_usable) begin
                     plru_set[req_set_r] <= plru_update(rd_plru_r, lookup_way);
                     state <= S_IDLE;
                     ready_r <= 1'b1;
