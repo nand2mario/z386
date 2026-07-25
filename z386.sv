@@ -1684,8 +1684,12 @@ reg inhibit_interrupts;     // STI shadow: real 386 suppresses interrupt recogni
 // waiting for literals. It is not an EX uop yet and must not issue its bus op.
 assign mem_op_eligible = core_live && !mem_servicing &&
                          !stall_d2 && !d2_release_hold;
-wire uc_data_busreq = (uc_is_mem_busop && !mem_is_io) ||
-                      io_busop_rd || io_busop_wr;
+// A failed protection test redirects after its third architectural delay uop.
+// That uop may finish internal setup, but its protected bus operation must not
+// escape before the fault handler takes control (notably denied VM86 I/O).
+wire uc_data_busreq = !prot_redirect_prev &&
+                      ((uc_is_mem_busop && !mem_is_io) ||
+                       io_busop_rd || io_busop_wr);
 wire uc_busreq = uc_data_busreq || iack_busop;
 wire mem_req_current = mem_op_eligible && uc_busreq;    // drives paging unit
 
@@ -1983,6 +1987,7 @@ reg        instr_is_shxd;           // Instruction is a SHxD operation
 reg        instr_cf;                // CF bit at start of instruction
 reg        instr_is_cmp;
 reg        instr_ind_is_ea;
+reg        instr_is_port_io;        // IN/OUT/INS/OUTS: VM86 must always check the TSS bitmap
 reg  [4:0] alu_grp_op;              // Pre-decoded ALU op for ALUJMP_ALU/INCDEC (from i_bus at i_pop)
 reg        instr_is_loop;           // E0/E1: LOOPNE/LOOPE (eliminates 7-bit compare from jump path)
 reg  [1:0] instr_bt_sel;            // BT operation selector (eliminates 8-bit compare from ALU path)
@@ -2145,7 +2150,8 @@ function automatic logic is_reljump_taken(input [6:0] aluop);
         ALUJMP_JMISC2:  is_reljump_taken = misc2_flag;
         ALUJMP_JNERRC:  is_reljump_taken = !error_code_flag;
         ALUJMP_JNT:     is_reljump_taken = EFLAGS[14];
-        ALUJMP_JIO_OK:  is_reljump_taken = !pe || cpl <= EFLAGS[13:12]; // JIO_OK: CPL <= IOPL
+        ALUJMP_JIO_OK:  is_reljump_taken = !pe ||
+            (cpl <= EFLAGS[13:12] && (!vm || !instr_is_port_io));
         ALUJMP_JMP:     is_reljump_taken = 1'b1;                // Unconditional jump
         ALUJMP_JNOINT:  is_reljump_taken = !interrupt_pending;  // Jump if NO interrupt
         ALUJMP_JNBUSY:  is_reljump_taken = 1'b1;                // FPU busy — always taken (no FPU)
@@ -2687,6 +2693,7 @@ always_ff @(posedge clk) begin
         i <= '0;
         instr_is_cmp <= 1'b0;
         instr_is_shxd <= 1'b0;
+        instr_is_port_io <= 1'b0;
         instr_cf <= 1'b0;
         instr_ind_is_ea <= 1'b0;
         jcc_active <= 1'b0;
@@ -2717,6 +2724,10 @@ always_ff @(posedge clk) begin
                                           (i_bus.opcode == 8'hAC) || (i_bus.opcode == 8'hAD));
         instr_cf <= eflags_fwd[0];      // RCL/RCR carry-in: forward the committing CF (eflags_fwd)
         instr_is_cmp <= i_bus.opcode[7:2] == 6'b100000 || i_bus.opcode[7:3] == 5'b00111;
+        instr_is_port_io <= !i_bus.has_0f &&
+            ((i_bus.opcode[7:2] == 6'b011011) ||  // 6C-6F: INS/OUTS
+             (i_bus.opcode[7:2] == 6'b111001) ||  // E4-E7: IN/OUT imm8
+             (i_bus.opcode[7:2] == 6'b111011));   // EC-EF: IN/OUT DX
         instr_ind_is_ea <= i_bus.has_modrm || i_bus.stack_op || i_bus.has_moffs;
         // Pre-decode ALU group op: eliminates i.opcode/i.modrm muxes from ALU critical path
         alu_grp_op <= i_bus.opcode[7] ? i_bus.modrm[5:3] : i_bus.opcode[5:3];

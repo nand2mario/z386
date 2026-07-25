@@ -204,9 +204,9 @@ gdt:
     db 00000000b
     db 0x00
 
-    ; 32-bit TSS, base=0x10000+tss, limit=0x67.
+    ; 32-bit TSS, base=0x10000+tss, including the I/O bitmap.
 tss_desc:
-    dw 0x0067
+    dw tss_end - tss - 1
     dw tss
     db 0x01
     db 10001001b
@@ -271,7 +271,12 @@ tss:
     dd 0                    ; +5C GS
     dd 0                    ; +60 LDTR
     dw 0                    ; +64 debug trap
-    dw 104                  ; +66 IOPB offset
+    dw io_bitmap - tss      ; +66 IOPB offset
+
+io_bitmap:
+    times 5 db 0            ; Allow ports 00h-27h, including PIC port 20h.
+    db 0xff                 ; Required all-ones terminator.
+tss_end:
 
 first_entry_sp: dw 0
 int21_count:    dw 0
