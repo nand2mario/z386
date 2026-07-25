@@ -54,7 +54,8 @@ module tb_test386;
         .dbg_EIP(),
         .dbg_CS_base(),
         .dbg_pe(),
-        .dbg_vm()
+        .dbg_vm(),
+        .triple_fault_reset()
     );
 
     // Memory: 1MB for protected mode testing

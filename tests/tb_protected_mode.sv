@@ -32,6 +32,7 @@ module tb_protected_mode;
     reg         intr = 0;
     reg         nmi = 0;
     wire        inta;
+    wire        triple_fault_reset;
 
     // Instantiate the z386 CPU
     z386 dut (
@@ -57,7 +58,8 @@ module tb_protected_mode;
         .dbg_CS(),
         .dbg_EIP(),
         .dbg_pe(),
-        .dbg_vm()
+        .dbg_vm(),
+        .triple_fault_reset(triple_fault_reset)
     );
 
     // Memory: 512KB for protected mode testing
@@ -523,6 +525,16 @@ module tb_protected_mode;
     always @(posedge clk) begin
         if (reset_n) begin
             cycle <= cycle + 1;
+
+            if (triple_fault_reset && $test$plusargs("expect_triple_fault")) begin
+                $display("");
+                $display("========================================");
+                $display("  TEST PASSED! Triple-fault reset requested.");
+                $display("  Total cycles: %0d", cycle);
+                $display("========================================");
+                #50;
+                $finish;
+            end
 
             // Count instructions
             prev_instruction_boundary <= instruction_boundary;

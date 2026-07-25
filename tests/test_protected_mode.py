@@ -293,6 +293,8 @@ def run_simulation(test_name, test_config, hex_file, code_phys_base, verbose=Fal
     cmd.append(f"+d_init={d_init}")
     if test_config.get('continue_on_hlt', False):
         cmd.append("+continue_on_hlt")
+    if test_config.get('expect_triple_fault', False):
+        cmd.append("+expect_triple_fault")
     if 'mem_latency' in test_config:
         cmd.append(f"+mem_latency={test_config['mem_latency']}")
 

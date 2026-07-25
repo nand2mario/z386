@@ -54,7 +54,10 @@ module z386
     output     [31:0]  dbg_EIP,
     output     [31:0]  dbg_CS_base,
     output             dbg_pe,
-    output             dbg_vm
+    output             dbg_vm,
+
+    // A fault while delivering #DF shuts down the 386 and requests reset.
+    output reg          triple_fault_reset
 );
 
 reg dbg_first_done;                 // Debug: first instruction finished execution
@@ -1658,6 +1661,16 @@ wire        any_fault_pop = gp_fault_trigger || page_fault;
 wire        any_fault = any_fault_pop || div_overflow;
 reg         any_fault_r;  // Registered any_fault: used for deferred SIGMA/TMPeSP writes
 always_ff @(posedge clk) any_fault_r <= any_fault;
+localparam logic [1:0] FAULT_IDLE       = 2'd0;
+localparam logic [1:0] FAULT_DELIVERING = 2'd1;
+localparam logic [1:0] FAULT_DOUBLE     = 2'd2;
+reg  [1:0] fault_delivery_state;
+reg        fault_seen_r;
+reg        fault_combine_active;
+reg        gp_fault_double_r;
+wire       fault_start = any_fault && !fault_seen_r;
+wire       double_fault_start = (fault_delivery_state == FAULT_DELIVERING) &&
+                                fault_combine_active;
 wire [2:0]  pg_fault_code;        // Page fault error code
 wire [31:0] pg_cr2_out;           // Faulting address for CR2
 
@@ -2314,10 +2327,12 @@ always_comb begin
             uaddr_now = 12'h5FB;
 
         if (div_overflow)
-            uaddr_now = UADDR_DIVIDE_ERROR;
+            uaddr_now = double_fault_start
+                      ? UADDR_DOUBLE_FAULT : UADDR_DIVIDE_ERROR;
 
         if (page_fault)
-            uaddr_now = UADDR_PAGE_FAULT;
+            uaddr_now = double_fault_start
+                      ? UADDR_DOUBLE_FAULT : UADDR_PAGE_FAULT;
 
         if (gate_detect_now)
             uaddr_now = 12'h5BE;
@@ -2327,7 +2342,8 @@ always_comb begin
     if (fast_issue)
         uaddr_now = fast_issue1 ? i_bus2.entry_point : i_bus.entry_point;
     if (gp_fault_r)
-        uaddr_now = ss_fault_r ? UADDR_STACK_FAULT : UADDR_GENERAL_FAULT1;
+        uaddr_now = gp_fault_double_r ? UADDR_DOUBLE_FAULT :
+                    (ss_fault_r ? UADDR_STACK_FAULT : UADDR_GENERAL_FAULT1);
 
     if (i_rni_delay && !stall && !page_fault) begin // interrupt dispatch
         if (nmi_request_active && !single_step)
@@ -2339,6 +2355,70 @@ always_comb begin
     if (!reset_n)
         uaddr_now = 12'h000;
 end
+
+// Interrupt paths clear delivery state only after committing handler CS/SS.
+// A fault while #DF is being delivered requests processor reset.
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        fault_delivery_state <= FAULT_IDLE;
+        fault_seen_r <= 1'b0;
+        fault_combine_active <= 1'b0;
+        gp_fault_double_r <= 1'b0;
+        triple_fault_reset <= 1'b0;
+    end else begin
+        fault_seen_r <= any_fault;
+        triple_fault_reset <= 1'b0;
+
+        if (gp_fault_trigger)
+            gp_fault_double_r <= double_fault_start;
+
+        if (uc_exec && uc_aluop == ALUJMP_SCNTFF)
+            fault_combine_active <= 1'b1;
+
+        if (fault_start) begin
+            case (fault_delivery_state)
+                FAULT_IDLE: begin
+                    fault_delivery_state <= FAULT_DELIVERING;
+                    fault_combine_active <= 1'b0;
+                end
+                FAULT_DELIVERING: begin
+                    if (fault_combine_active) begin
+                        fault_delivery_state <= FAULT_DOUBLE;
+                        fault_combine_active <= 1'b0;
+                    end
+                end
+                default:          triple_fault_reset <= 1'b1;
+            endcase
+        end
+
+        if (uc_exec &&
+            (uc_addr == UADDR_TRAP_INT_DONE || uc_addr == UADDR_PRIV_INT_DONE) &&
+            !any_fault) begin
+            fault_delivery_state <= FAULT_IDLE;
+            fault_combine_active <= 1'b0;
+        end
+    end
+end
+
+// synthesis translate_off
+always @(posedge clk) begin
+    if (reset_n && $test$plusargs("trace_fault_state")) begin
+        if (fault_start)
+            $display("%0t FAULT-START state=%0d combine=%b gp=%b ss=%b pf=%b div=%b uaddr=%03x CS:EIP=%04x:%08x addr=%08x",
+                     $time, fault_delivery_state, fault_combine_active,
+                     gp_fault_trigger, ss_segment_fault, page_fault, div_overflow, uc_addr,
+                     CS, EIP, page_fault ? pg_cr2_out : IND);
+        if (uc_exec && uc_aluop == ALUJMP_SCNTFF)
+            $display("%0t FAULT-COMBINE state=%0d uaddr=%03x", $time,
+                     fault_delivery_state, uc_addr);
+        if (uc_exec &&
+            (uc_addr == UADDR_TRAP_INT_DONE || uc_addr == UADDR_PRIV_INT_DONE))
+            $display("%0t FAULT-DONE state=%0d", $time, fault_delivery_state);
+        if (triple_fault_reset)
+            $display("%0t TRIPLE-FAULT RESET", $time);
+    end
+end
+// synthesis translate_on
 
 // Main microcode sequencer
 always_ff @(posedge clk) begin

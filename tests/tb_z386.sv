@@ -58,8 +58,10 @@ module tb_z386;
         .single_step(1'b1), // Halt after each instruction for single-step tests
         .dbg_CS(),
         .dbg_EIP(),
+        .dbg_CS_base(),
         .dbg_pe(),
-        .dbg_vm()
+        .dbg_vm(),
+        .triple_fault_reset()
     );
 
     // Access debug signals

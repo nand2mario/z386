@@ -998,8 +998,11 @@ localparam BUSOP_IACK = 6'h28;        // IACK - Interrupt acknowledge bus cycle
 localparam [11:0] UADDR_GENERAL_FAULT1 = 12'h85B;  // #GP(0) - sets SIGMA=4, error code=0
 localparam [11:0] UADDR_STACK_FAULT    = 12'h863;  // #SS(0) - sets SIGMA=3, error code=0
 localparam [11:0] UADDR_DIVIDE_ERROR   = 12'h824;  // #DE(0) - divide error (vector 0)
+localparam [11:0] UADDR_DOUBLE_FAULT   = 12'h83F;  // #DF - vector 8, zero error code
 localparam [11:0] UADDR_HARDWARE_IRQ   = 12'h82D;  // INTR handler entry point
 localparam [11:0] UADDR_NMI            = 12'h836;  // NMI handler entry point
+localparam [11:0] UADDR_PRIV_INT_DONE  = 12'h639;  // Cross-privilege handler CS/SS committed
+localparam [11:0] UADDR_TRAP_INT_DONE  = 12'h8E3;  // Handler CS committed; delivery complete
 localparam [11:0] UADDR_TSS_PROBLEM    = 12'h85D;  // #TS path used by protected-mode descriptor checks
 
 // Group 2 instructions
