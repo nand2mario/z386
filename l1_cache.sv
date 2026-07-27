@@ -71,11 +71,19 @@ wire [SET_BITS-1:0] snoop_set = snoop_addr[SET_MSB:SET_LSB];
 wire cpu_uncacheable = !cache_enable || (cpu_addr[31:17] == 15'h5);
 wire cpu_protect_write = PROTECT_UMA_ROM && cpu_write && (cpu_addr[24:18] == 7'b000_0011);
 
+`ifdef Z386_DISABLE_CACHE_RAM_HINTS
+reg [TAG_RAM_BITS-1:0] tag_way0 [0:NUM_SETS-1];
+reg [TAG_RAM_BITS-1:0] tag_way1 [0:NUM_SETS-1];
+reg [TAG_RAM_BITS-1:0] tag_way2 [0:NUM_SETS-1];
+reg [TAG_RAM_BITS-1:0] tag_way3 [0:NUM_SETS-1];
+`else
 // Tag/data storage.
 (* ram_style = "block" *) reg [TAG_RAM_BITS-1:0] tag_way0 [0:NUM_SETS-1] /* synthesis syn_ramstyle="block_ram" */;
 (* ram_style = "block" *) reg [TAG_RAM_BITS-1:0] tag_way1 [0:NUM_SETS-1] /* synthesis syn_ramstyle="block_ram" */;
 (* ram_style = "block" *) reg [TAG_RAM_BITS-1:0] tag_way2 [0:NUM_SETS-1] /* synthesis syn_ramstyle="block_ram" */;
 (* ram_style = "block" *) reg [TAG_RAM_BITS-1:0] tag_way3 [0:NUM_SETS-1] /* synthesis syn_ramstyle="block_ram" */;
+`endif
+
 reg valid_way0 [0:NUM_SETS-1];
 reg valid_way1 [0:NUM_SETS-1];
 reg valid_way2 [0:NUM_SETS-1];
