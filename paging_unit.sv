@@ -74,9 +74,11 @@ module paging_unit
     output logic [31:0] dcache_req_wdata,     // Write data (pre-positioned on bus)
     output logic        dcache_req_is_io,     // Request is IO space
     output logic        dcache_req_is_inta,   // Request is INTA cycle
+    output logic        dcache_req_is_vga_mem,// Physical VGA aperture
 
     input               dcache_req_accepted,  // Demand-side request accepted this cycle
     input               dcache_req_complete,  // Demand-side request complete
+    input               dcache_read_complete, // Demand-side read data is valid this cycle
     input        [31:0] dcache_rdata,         // Demand-side read data
 
     //=========================================================================
@@ -123,6 +125,7 @@ wire [31:0] tlb_physical_addr;
 wire        tlb_writable;
 wire        tlb_user;
 wire        tlb_dirty;
+wire        tlb_is_vga_mem;
 // Live (combinational) TLB lookup of the demand linear, used at PG_IDLE to
 // precompute whether a write will post, so the post-write DLY grace at
 // PG_MEM_TLB needs no combinational TLB term on the uc_exec path.
@@ -131,6 +134,7 @@ wire [31:0] live_tlb_physical;
 wire        live_tlb_writable;
 wire        live_tlb_user;
 wire        live_tlb_dirty;
+wire        live_tlb_is_vga_mem;
 // TLB update signals (from page walker)
 logic        tlb_update_valid;
 logic [19:0] tlb_update_vpn;
@@ -185,12 +189,14 @@ paging_tlb tlb_inst (
     .writable       (tlb_writable),
     .user           (tlb_user),
     .dirty          (tlb_dirty),
+    .is_vga_mem     (tlb_is_vga_mem),
     .linear_addr_live(linear_addr),       // same registered linear -> seg-adder off the live-TLB cone
     .live_hit       (live_tlb_hit),
     .live_physical_addr(live_tlb_physical),
     .live_writable  (live_tlb_writable),
     .live_user      (live_tlb_user),
     .live_dirty     (live_tlb_dirty),
+    .live_is_vga_mem(live_tlb_is_vga_mem),
     .update_valid   (tlb_update_valid),
     .update_vpn     (tlb_update_vpn),
     .update_pfn     (tlb_update_pfn),
@@ -392,6 +398,10 @@ wire        early_wr_present   = early_wr_idx_drive && !idle_mem_crossing &&
 wire        early_idx_drive    = early_rd_idx_drive || early_wr_idx_drive;
 wire [31:0] early_phys         = pg_enable ? {live_tlb_physical[31:12], linear_addr[11:0]}
                                           : linear_addr;
+wire        early_is_vga_mem   = pg_enable ? live_tlb_is_vga_mem
+                                           : (linear_addr[31:17] == 15'h5);
+wire        req_is_vga_mem     = pg_enable ? tlb_is_vga_mem
+                                           : (req_linear[31:17] == 15'h5);
 wire        early_rd_accept    = early_rd_present && dcache_req_accepted;
 wire        early_wr_accept    = early_wr_present && dcache_req_accepted;
 wire        early_present      = early_rd_present || early_wr_present;
@@ -422,6 +432,9 @@ assign dcache_req_wdata = early_wr_present ?
                           dcache_req_wdata_r;
 assign dcache_req_is_io = (early_present || req_mem_present) ? 1'b0 : dcache_req_is_io_r;
 assign dcache_req_is_inta = (early_present || req_mem_present) ? 1'b0 : dcache_req_is_inta_r;
+assign dcache_req_is_vga_mem = early_present ? early_is_vga_mem :
+                               req_mem_present ? req_is_vga_mem :
+                               (dcache_req_phys_addr_r[31:17] == 15'h5);
 assign icache_req_valid = icache_req_valid_r || fast_pf_candidate;
 assign icache_req_phys_addr = icache_req_valid_r ? icache_req_phys_addr_r : fast_pf_phys;
 
@@ -623,13 +636,13 @@ always_ff @(posedge clk or negedge reset_n) begin
         // BIU completion: write OPR_R / pf_rdata / walker data
         //=====================================================================
         if (dcache_req_complete) begin
-            if (opr_is_walk_r) begin
+            if (dcache_read_complete && opr_is_walk_r) begin
                 // Walker: raw data routed to walker via dcache_rdata (combinational)
                 // synthesis translate_off
                 if (TRACE_PAGING_EN)
                     $display("BIU WALK DONE: data=%08x", dcache_rdata);
                 // synthesis translate_on
-            end else if (!dcache_posted_write_done && !early_wr_accept && !opr_is_write_r && !opr_suppress_r) begin
+            end else if (dcache_read_complete && !opr_is_write_r && !opr_suppress_r) begin
                 // Memory/IO/INTA read: byte-lane extraction (suppressed for first INTA dummy)
                 write_opr_r_bytes(dcache_rdata, opr_phys_low_r, opr_offset_r, opr_bytes_r);
                 // synthesis translate_off

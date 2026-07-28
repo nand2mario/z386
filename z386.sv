@@ -590,8 +590,10 @@ wire [3:0]  dcache_req_be;
 wire [31:0] dcache_req_wdata;
 wire        dcache_req_is_io;
 wire        dcache_req_is_inta;
+wire        dcache_req_is_vga_mem;
 wire        dcache_req_accepted;
 wire        dcache_req_complete;
+wire        dcache_read_complete;
 wire [31:0] dcache_rdata;
 wire        icache_req_valid;
 wire [31:0] icache_req_phys_addr_raw;
@@ -635,8 +637,12 @@ reg         dcache_cpu_rd_pending;
 reg         icache_cpu_rd_pending;
 reg         direct_rd_pending;
 
-wire dcache_cpu_req = dcache_req_valid && !dcache_req_is_io && !dcache_req_is_inta;
-wire dcache_direct_req = dcache_req_valid && (dcache_req_is_io || dcache_req_is_inta);
+// VGA aperture accesses are device transactions. Bypass the posted L1 store
+// queue so an ET4000 bank-register write cannot overtake framebuffer writes.
+wire dcache_cpu_req = dcache_req_valid && !dcache_req_is_io &&
+                      !dcache_req_is_inta && !dcache_req_is_vga_mem;
+wire dcache_direct_req = dcache_req_valid &&
+                         (dcache_req_is_io || dcache_req_is_inta || dcache_req_is_vga_mem);
 wire dcache_read_pending = (dcache_rd_pending != 8'd0);
 wire icache_read_pending = (icache_rd_pending != 8'd0);
 wire dcache_read_accept = dcache_cpu_req && !dcache_req_write && dcache_cpu_ready;
@@ -685,6 +691,7 @@ assign dcache_req_complete = dcache_cpu_resp_valid ||
                              (dcache_cpu_req && dcache_req_write && dcache_cpu_ready) ||
                              direct_rd_resp_now ||
                              (ext_direct_accept && ext_write_r);
+assign dcache_read_complete = dcache_cpu_resp_valid || direct_rd_resp_now;
 assign dcache_rdata = dcache_cpu_resp_valid ? dcache_cpu_dout : din;
 assign icache_req_accepted = icache_cpu_ready;
 assign icache_req_complete = icache_cpu_resp_valid;
@@ -1377,8 +1384,17 @@ wire head_ea_usable = head_ea_v &&
     !ea_inval_all;
 
 // synthesis translate_off
+reg ldtrace_en = 1'b0;
+reg agu_dbg_en = 1'b0;
+reg trace_fault_state_en = 1'b0;
+initial begin
+    ldtrace_en = $test$plusargs("ldtrace");
+    agu_dbg_en = $test$plusargs("agu_dbg");
+    trace_fault_state_en = $test$plusargs("trace_fault_state");
+end
+
 // +ldtrace: memory-instruction anatomy (pop/first/request/complete edges).
-always @(posedge clk) if ($test$plusargs("ldtrace")) begin
+always @(posedge clk) if (ldtrace_en) begin
     if (i_pop)   $display("%0t LD pop  op=%02x eav=%b", $time, i_bus.opcode, head_ea_usable);
     if (i_first) $display("%0t LD first op=%02x uaddr=%03x", $time, i.opcode, uc_addr);
     if (mem_req_to_paging && mem_accepted)
@@ -1392,12 +1408,12 @@ reg dbg_exec_prev;
 always @(posedge clk) begin
     dbg_esi_prev <= ESI; dbg_inval_prev <= ea_inval_gpr;
     dbg_ucdest_prev <= uc_dest; dbg_exec_prev <= uc_exec;
-    if ($test$plusargs("agu_dbg") && (ESI !== dbg_esi_prev) && !dbg_inval_prev[6])
+    if (agu_dbg_en && (ESI !== dbg_esi_prev) && !dbg_inval_prev[6])
         $display("%0t ESIWR-MISSED %08x->%08x prev_ucdest=%02x prev_exec=%b prev_inval=%02x uaddr=%03x",
                  $time, dbg_esi_prev, ESI, dbg_ucdest_prev, dbg_exec_prev,
                  dbg_inval_prev, uc_addr);
 end
-always @(posedge clk) if ($test$plusargs("agu_dbg")) begin
+always @(posedge clk) if (agu_dbg_en) begin
     if (d2_push)
         $display("%0t AGUDBG land op=%02x v=%b lin=%08x bs=%02x agubase=%08x ESI=%08x aguseg=%0d segbase=%08x disp=%08x",
                  $time, d2_entry.opcode, d2_agu_valid, d2_agu_lin,
@@ -1782,8 +1798,10 @@ paging_unit paging_inst (
     .dcache_req_wdata   (dcache_req_wdata),
     .dcache_req_is_io   (dcache_req_is_io),
     .dcache_req_is_inta (dcache_req_is_inta),
+    .dcache_req_is_vga_mem(dcache_req_is_vga_mem),
     .dcache_req_accepted(dcache_req_accepted),
     .dcache_req_complete(dcache_req_complete),
+    .dcache_read_complete(dcache_read_complete),
     .dcache_rdata       (dcache_rdata),
 
     // Instruction-prefetch physical request interface
@@ -2402,7 +2420,7 @@ end
 
 // synthesis translate_off
 always @(posedge clk) begin
-    if (reset_n && $test$plusargs("trace_fault_state")) begin
+    if (reset_n && trace_fault_state_en) begin
         if (fault_start)
             $display("%0t FAULT-START state=%0d combine=%b gp=%b ss=%b pf=%b div=%b uaddr=%03x CS:EIP=%04x:%08x addr=%08x",
                      $time, fault_delivery_state, fault_combine_active,

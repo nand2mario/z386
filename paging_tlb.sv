@@ -15,6 +15,7 @@ module paging_tlb
     output reg          writable,       // Combined PDE & PTE R/W
     output reg          user,           // Combined PDE & PTE U/S
     output reg          dirty,          // D bit from PTE
+    output              is_vga_mem,     // Physical address is in A0000-BFFFF
 
     // Live demand lookup interface. This keeps the idle demand fast path off
     // the registered-address mux used by prefetch/walker lookups.
@@ -24,6 +25,7 @@ module paging_tlb
     output reg          live_writable,
     output reg          live_user,
     output reg          live_dirty,
+    output              live_is_vga_mem,
 
     // Update interface (from page walker)
     input               update_valid,
@@ -40,6 +42,7 @@ module paging_tlb
 
 // 8 sets × 4 ways
 tlb_entry_t tlb [7:0][3:0];
+reg vga_mem [7:0][3:0];
 
 // PLRU bits per set: 3 bits each for 4-way replacement [B0] B0: 0=left subtree, 1=right subtree / \ [B1] [B2] B1: 0=way0, 1=way1 / \ / \...
 // Details: doc/z386x/implementation_notes.md#src-24-z386x-paging-tlb-sv-50
@@ -57,6 +60,13 @@ wire hit0 = tlb[lookup_set][0].valid && (tlb[lookup_set][0].vpn[19:3] == lookup_
 wire hit1 = tlb[lookup_set][1].valid && (tlb[lookup_set][1].vpn[19:3] == lookup_tag);
 wire hit2 = tlb[lookup_set][2].valid && (tlb[lookup_set][2].vpn[19:3] == lookup_tag);
 wire hit3 = tlb[lookup_set][3].valid && (tlb[lookup_set][3].vpn[19:3] == lookup_tag);
+
+// Compute device classification per way, in parallel with hit detection. This
+// avoids putting the selected-PFN mux on cache request routing controls.
+assign is_vga_mem = (hit0 && vga_mem[lookup_set][0]) ||
+                    (hit1 && vga_mem[lookup_set][1]) ||
+                    (hit2 && vga_mem[lookup_set][2]) ||
+                    (hit3 && vga_mem[lookup_set][3]);
 
 // Encode hit into 2-bit way index
 wire [1:0] hit_way = hit0 ? 2'd0 :
@@ -80,6 +90,12 @@ wire live_hit0 = tlb[live_set0][0].valid && (tlb[live_set0][0].vpn[19:3] == live
 wire live_hit1 = tlb[live_set1][1].valid && (tlb[live_set1][1].vpn[19:3] == live_tag1);
 wire live_hit2 = tlb[live_set2][2].valid && (tlb[live_set2][2].vpn[19:3] == live_tag2);
 wire live_hit3 = tlb[live_set3][3].valid && (tlb[live_set3][3].vpn[19:3] == live_tag3);
+
+assign live_is_vga_mem =
+    (live_hit0 && vga_mem[live_set0][0]) ||
+    (live_hit1 && vga_mem[live_set1][1]) ||
+    (live_hit2 && vga_mem[live_set2][2]) ||
+    (live_hit3 && vga_mem[live_set3][3]);
 
 wire [1:0] live_hit_way = live_hit0 ? 2'd0 :
                           live_hit1 ? 2'd1 :
@@ -227,6 +243,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                     tlb[update_set][0].user <= update_user;
                     tlb[update_set][0].dirty <= update_dirty;
                     tlb[update_set][0].accessed <= update_accessed;
+                    vga_mem[update_set][0] <= (update_pfn[19:5] == 15'h5);
                     plru[update_set][0] <= 1'b1; plru[update_set][1] <= 1'b1;
                 end
                 2'd1: begin
@@ -237,6 +254,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                     tlb[update_set][1].user <= update_user;
                     tlb[update_set][1].dirty <= update_dirty;
                     tlb[update_set][1].accessed <= update_accessed;
+                    vga_mem[update_set][1] <= (update_pfn[19:5] == 15'h5);
                     plru[update_set][0] <= 1'b1; plru[update_set][1] <= 1'b0;
                 end
                 2'd2: begin
@@ -247,6 +265,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                     tlb[update_set][2].user <= update_user;
                     tlb[update_set][2].dirty <= update_dirty;
                     tlb[update_set][2].accessed <= update_accessed;
+                    vga_mem[update_set][2] <= (update_pfn[19:5] == 15'h5);
                     plru[update_set][0] <= 1'b0; plru[update_set][2] <= 1'b1;
                 end
                 2'd3: begin
@@ -257,6 +276,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                     tlb[update_set][3].user <= update_user;
                     tlb[update_set][3].dirty <= update_dirty;
                     tlb[update_set][3].accessed <= update_accessed;
+                    vga_mem[update_set][3] <= (update_pfn[19:5] == 15'h5);
                     plru[update_set][0] <= 1'b0; plru[update_set][2] <= 1'b0;
                 end
             endcase

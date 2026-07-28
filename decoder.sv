@@ -466,6 +466,8 @@ wire [2:0] push_recipe_early = recipe_early_kind(push_entry.entry_point);
 fast_class_t push_legacy_fc, push_recipe_fc;
 assign push_legacy_fc = dec_fast_class(push_entry);
 assign push_recipe_fc = recipe_fast_class(push_entry);
+reg recipe_cov_en = 1'b0;
+initial recipe_cov_en = $test$plusargs("recipe_cov");
 always @(posedge clk) begin
     if (reset_n && d2_done) begin
         if (push_recipe_fc !== push_legacy_fc)
@@ -496,7 +498,7 @@ always @(posedge clk) begin
                 $fatal(1, "FAST recipe invalid early kind: entry=%03x kind=%0d",
                        push_entry.entry_point, push_recipe_early);
         endcase
-        if ($test$plusargs("recipe_cov"))
+        if (recipe_cov_en)
             $display("RECIPE_COV entry=%03x kind=%0d opcode=%02x modrm=%02x fc=%04x",
                      push_entry.entry_point, push_recipe_early,
                      push_entry.opcode, push_entry.modrm, push_legacy_fc);

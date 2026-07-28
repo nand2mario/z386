@@ -37,7 +37,14 @@ SDRAM-like timing model so CPI is closer to the board memory path. Use
 `--mem-model simple` for the old fast behavioral memory when only checking
 functionality.
 
-By default the runner compares these source directories:
+By default the runner builds and runs the local `24.z386x` core. To compare a
+386-faithful release tree explicitly, use:
+
+```bash
+./run_dhrystone.py --core both --z386-release-dir /path/to/z386
+```
+
+The source-directory defaults are:
 
 ```text
 z386_release -> ../../../z386_MiSTer/src/z386

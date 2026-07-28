@@ -198,14 +198,16 @@ module tb_z386;
         int k;
         begin
             // Single-step result checks read the external RAM model directly.
-            // Posted stores may retire architecturally before they drain to
-            // that RAM, so wait for the dcache write-through queue to empty.
+            // Posted stores and direct VGA/device writes may retire before
+            // they reach that RAM, so wait for both paths to drain.
             #1;
             k = 0;
             while (k < 64 &&
                    (dut.dcache_inst.storeq_count != 0 ||
                     dut.dcache_inst.storeq_draining ||
-                    dut.dcache_inst.mem_valid_r)) begin
+                    dut.dcache_inst.mem_valid_r ||
+                    dut.dcache_direct_req ||
+                    (dut.ext_valid_r && dut.ext_write_r))) begin
                 @(posedge clk);
                 #1;
                 k++;
