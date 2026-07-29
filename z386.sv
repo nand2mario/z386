@@ -4380,7 +4380,7 @@ always_ff @(posedge clk) begin
             2'd1:    count_mod = {2'd0, count_raw[3:0]};  // mod 16
             default: count_mod = count_raw;               // mod 32, count is already 0..31
         endcase
-        shift_size = count_raw;  // Store original count for OF check (count==1)
+        shift_size <= count_raw;  // Store original count for OF check (count==1)
         sh1_width_r <= width;
 
         if (instr_is_shxd) begin   // i.opcode[3], 1: SHRD, 0: SHLD
