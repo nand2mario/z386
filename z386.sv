@@ -1634,6 +1634,7 @@ always_ff @(posedge clk) begin
         uc_cond_jump_taken_prev <= 1'b0;
         stack_init_pending <= 1'b0;
         dbg_first_done <= 1'b0;
+        halted <= 1'b0;
         debug_ip <= 32'h0;
         gate_in_progress <= 1'b0;
         interrupt_entry <= 1'b0;
