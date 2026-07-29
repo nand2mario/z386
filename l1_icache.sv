@@ -70,20 +70,35 @@ wire [WORD_OFFSET_BITS-1:0] snoop_word = snoop_addr[LINE_OFFSET_BITS-1:BYTE_OFFS
 // bypass without corrupting branch targets in the middle of the line.
 wire cpu_uncacheable = !cache_enable;
 
+`ifdef Z386_DISABLE_CACHE_RAM_HINTS
+reg [TAG_RAM_BITS-1:0] tag_way0 [0:NUM_SETS-1];
+reg [TAG_RAM_BITS-1:0] tag_way1 [0:NUM_SETS-1];
+reg [TAG_RAM_BITS-1:0] tag_way2 [0:NUM_SETS-1];
+reg [TAG_RAM_BITS-1:0] tag_way3 [0:NUM_SETS-1];
+`else
 (* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way0 [0:NUM_SETS-1];
 (* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way1 [0:NUM_SETS-1];
 (* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way2 [0:NUM_SETS-1];
 (* ramstyle = "M10K" *) reg [TAG_RAM_BITS-1:0] tag_way3 [0:NUM_SETS-1];
+`endif
+
 reg valid_way0 [0:NUM_SETS-1];
 reg valid_way1 [0:NUM_SETS-1];
 reg valid_way2 [0:NUM_SETS-1];
 reg valid_way3 [0:NUM_SETS-1];
 reg [2:0] plru_set [0:NUM_SETS-1];
 
+`ifdef Z386_DISABLE_CACHE_RAM_HINTS
+reg [127:0] data_way0 [0:NUM_SETS-1];
+reg [127:0] data_way1 [0:NUM_SETS-1];
+reg [127:0] data_way2 [0:NUM_SETS-1];
+reg [127:0] data_way3 [0:NUM_SETS-1];
+`else
 (* ramstyle = "M10K" *) reg [127:0] data_way0 [0:NUM_SETS-1];
 (* ramstyle = "M10K" *) reg [127:0] data_way1 [0:NUM_SETS-1];
 (* ramstyle = "M10K" *) reg [127:0] data_way2 [0:NUM_SETS-1];
 (* ramstyle = "M10K" *) reg [127:0] data_way3 [0:NUM_SETS-1];
+`endif
 
 reg [TAG_BITS-1:0] rd_tag0_r, rd_tag1_r, rd_tag2_r, rd_tag3_r;
 reg rd_valid0_r, rd_valid1_r, rd_valid2_r, rd_valid3_r;
