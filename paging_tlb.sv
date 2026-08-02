@@ -7,6 +7,7 @@
 // Tag: VPN[19:3] (linear_addr[31:15]), 17 bits
 //
 `timescale 1ns/1ns
+`default_nettype none
 
 module paging_tlb
     import z386_pkg::*;

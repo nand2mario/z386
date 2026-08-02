@@ -111,6 +111,9 @@ reg                 rd_ind_active;     // BUSOP_RD_IND active (internal; demoted
 wire pg_enable = cr0[31];   // PG - Paging enable
 wire wp_enable = cr0[16];   // WP - Write protect
 
+// Fast path metadata (mem non-crossing emits directly from PG_IDLE)
+reg        fast_path_pending; // A fast-path BIU request is in flight
+
 // Compile-time-off sim trace flags to keep hot scheduler paths free of
 // per-cycle $test$plusargs overhead under Verilator.
 localparam bit TRACE_MEM_EN    = 1'b0;
@@ -325,8 +328,6 @@ reg        opr_suppress_r;  // Suppress OPR_R update (INTA first cycle)
 reg [1:0]  opr_phys_low_r;   // Physical address [1:0] for byte extraction
 reg        opr_is_walk_r;    // Is walker request (no OPR_R)
 
-// Fast path metadata (mem non-crossing emits directly from PG_IDLE)
-reg        fast_path_pending; // A fast-path BIU request is in flight
 
 // PIPT cache completion is deliberately registered through mem_servicing clear.
 // Do not feed cache response/tag-compare timing back into the microsequencer.

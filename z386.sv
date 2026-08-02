@@ -12,6 +12,9 @@
 //   7. Control Unit (microcode sequencer)
 //   8. Data Unit (ALU, register file, barrel shifter)
 //
+`timescale 1ns/1ns
+`default_nettype none
+
 module z386
     import z386_pkg::*;
 #(
@@ -74,6 +77,7 @@ wire [15:0] BP = EBP[15:0];
 wire [15:0] SI = ESI[15:0];
 wire [15:0] DI = EDI[15:0];
 
+seg_desc_t seg_cache [0:10];        // Indexed by SEG_* constants
 seg_desc_t cs_seg_desc;
 assign cs_seg_desc = seg_cache[SEG_CS];
 wire D = cs_seg_desc.D_B;  // Default operand size (0=16-bit in real mode, 1=32-bit)
@@ -106,6 +110,191 @@ reg [1:0]  srcreg_size_decode;      // Decoded srcreg_size (saved at i_pop, rest
 wire       is_dword = (op_size == 2'd2); // Runtime dword flag
 wire       is_dword_src = (op_size_src == 2'd2);
 
+// Forward declarations for early control logic
+wire [31:0] pf_flush_addr;
+wire [5:0]  uc_buscode;             // Bus operation code from microcode
+wire [6:0]  uc_dest;                // Destination field from microcode
+wire [5:0]  uc_source;              // Source field from microcode
+wire [31:0] dest_value;             // Destination value for writes
+wire        gp_fault_trigger;       // GP fault trigger
+wire        div_overflow;           // Division overflow
+wire        page_fault;             // Page fault (declared fully at paging unit instantiation)
+
+// Memory requests
+wire        mem_servicing; // memory request in flight
+wire        mem_dly_grace; // optimistic read: DLY may execute this (lookup) cycle
+wire        mem_write_dly_grace; // posted write in PG_MEM_TLB: next non-bus uop may execute now
+wire        mem_opt_wait; // optimistic read missed: stall all uops until fill done
+wire        mem_accepted; // memory request accepted (ready pulse)
+wire        mem_complete_now; // combinational, request completing THIS cycle
+wire        prot_result_valid;      // Pipelined result is valid (2 cycles after test)
+wire        decq_empty;             // Decoder instruction queue empty
+wire        any_fault;
+wire        interrupt_pending;
+wire        nmi_request_active;
+wire        mem_is_io;              // registered in segmentation_unit alongside seg_sel
+wire        io_busop_rd;
+wire        io_busop_wr;
+wire        iack_busop;             // IACK bus operation (interrupt acknowledge)
+wire        uc_bus_or_dly;
+wire        uc_is_mem_busop;
+wire        uc_is_write;
+wire        uc_is_check_write;
+wire        uc_is_word_op;
+wire        uc_is_dword_op;
+wire        uc_jpereq_fwd;
+wire        uc_p_io_rd;             // IO-capable read buscode
+wire        uc_p_io_wr;             // IO-capable write buscode
+wire        uc_p_iack;              // IACK bus cycle
+wire        uc_p_pure_dly;          // DLY without a bus request of its own
+wire        uc_p_rpt;               // RPT opcode
+wire        uc_p_wio;               // WIO (RPT opcode + WIO subcode)
+wire        uc_is_wio;              // WIO: wait for interrupt/IO (HLT, only with RPT)
+wire        uc_is_rpt;
+wire        uc_busreq;
+wire        mem_op_eligible;
+wire        mem_req_current;        // drives paging unit
+wire        core_live;
+wire        dly_grace_now;
+wire        posted_write_release;   // release non-busop writes after one cycle
+wire        mem_block_busy;         // demand op in flight
+wire        mem_block_idle;         // uop wants the bus, paging not ready
+wire        stall_mem;
+wire        stall_wio;
+wire        stall;
+wire        prot_result_now;
+wire        repeat_active;
+wire        uc_exec;
+wire        uc_exec_writeback;      // local copy for reducing fanout
+wire        uc_exec_mul_start;      // local copy for reducing fanout
+wire        uc_exec_result;         // local copy for reducing fanout
+wire        uc_exec_shift;          // local copy for reducing fanout
+wire        slctr_fwd_en;           // Forward SLCTR from dest_value when being written in the same cycle
+wire [31:0] slctr_fwd;              // Forwarded SLCTR value (combinational)
+wire        early_redirect;
+wire        pe_mode_toggle_now;     // CR0.PE changed this cycle: re-decode next bytes in new mode
+wire        q_flush;                // Flush queue (branch/jump) - combinational for i.immediate gating
+wire        seg_cmd_valid;          // 1 when seg_cmd should execute (i_pop or uc_exec)
+wire        prot_is_ptovrr;         // 0x68: uses saved test constant
+wire        br_is_jmp_rel;
+wire        br_is_call_rel;
+wire        br_jcc_taken;
+reg         uc_active;              // Tracks when instruction execution has begun
+reg         fault_suppress_delay_slot; // Fault handling: suppress delay slot after fault triggers
+reg         interrupt_entry;        // Interrupt handler being entered (suppress i_entry/i_pop)
+reg         prot_test_inflight;     // Protection test is in pipeline (waiting for result)
+reg [31:0]  COUNTR;                 // Counter register
+reg         uc_cond_jump_taken_prev; // Conditional jump taken last cycle (for PREF suppression)
+reg         early_redirected;
+reg         i_first;                // First ucode execution cycle after i_pop
+reg [31:0] SLCTR;                   // Selector temp used by protected-mode descriptor microcode (32-bit: LAR/LSL store full descriptor hi DWORD)
+reg [31:0] desc_raw_hi;             // raw high DWORD saved at TSTDES time (before barrel-shift modifies PROTUN)
+reg [5:0]  prot_saved_test_const;   // Protection test: PTSAV saves test constant for later PTOVRR to use
+reg        uc_ctl_pref;             // Previous-cycle predecode: current uop is BUSOP_PREF
+reg        stack_init_pending;      // Cycle after i_pop for stack op - ALU computes new SP
+reg        instr_ind_is_ea;
+wire       gate_detect_cond;
+reg        prot_redirect_prev;      // Protection redirect fired last cycle (suppresses LJUMP + relative jumps in delay slot)
+wire       prot_redirect_taken;
+reg [31:0] ea_reg;                  // Early EA registered at i_pop (ALU path / stack-dest EA, e.g. POP [mem]); read via SRC_EA, off the i_first seg/TLB cone
+reg [2:0]  seg_reg_sel;             // Segment register index (0=ES,1=CS,2=SS,3=DS,4=FS,5=GS)
+reg [31:0] TMPeIP;                  // Saved EIP for RPTI (repeat instruction)
+reg [31:0] TMPeSP;                  // Saved ESP for fault handling
+reg        flags_backup_active;     // Set at i_pop/FLGSBA, cleared on interrupt_entry - guards FLAGSB writes
+reg        clear_if_pending;        // Set by {-2E-}, used by {-2F-} to clear IF during INT
+reg        misc1_flag;              // Set by SMISC1 {-33-}, tested by JMISC1 {-53-}
+reg        misc2_flag;              // Set by SMISC2 {-35-}, tested by JMISC2 {-55-}
+reg        error_code_flag;         // Set by SERRCF {-36-}, tested by JNERRC {-56-}
+reg        interrupt_hw;            // Set for hardware interrupts, tested by JINTSW {-52-}
+reg        intr_pending;            // Latched INTR request (level-sampled, cleared by CINTLA)
+reg        intr_latch_inhibit;      // Suppress re-latching after CINTLA until intr deasserts
+reg        nmi_pending;             // Latched NMI request (edge-detected, cleared on NMI entry)
+reg        nmi_blocked;             // NMI service in progress (set by SETNMI, cleared by CLRNMI)
+reg        nmi_prev;                // Previous NMI value for edge detection
+reg        jcc_active;              // Currently executing a Jcc instruction (for alu_src_r in BUSOP_IND_PLUS_ALU)
+reg        instr_eip_written;       // EIP was written during instruction (RPTI restart)
+reg        gate_in_progress;        // Prevent second LDTST (at 5C3) from re-triggering gate detection
+reg        instr_is_shxd;           // Instruction is a SHxD operation
+reg        instr_cf;                // CF bit at start of instruction
+reg        instr_is_cmp;
+reg        instr_is_loop;           // E0/E1: LOOPNE/LOOPE (eliminates 7-bit compare from jump path)
+reg [1:0]  instr_bt_sel;            // BT operation selector (eliminates 8-bit compare from ALU path)
+reg [4:0]  instr_szext_op;          // Pre-decoded MOVZX/MOVSX/CBW ALU op
+
+
+
+// --- RNI opcode decodes ---
+wire        uc_is_rni;
+wire        uc_is_rni_lc;
+wire        uc_is_rni_inhibit;
+
+wire [31:0] mul_upper;
+wire        is_signed_mul;
+wire        dsp_mul_early_exit;
+wire        in_rpti_routine;
+wire [31:0] eflags_fwd;
+wire        flag2_zf;
+wire        flag2_sf;
+wire        flag2_pf;
+wire [31:0] shift_lo;
+wire        shift_pf;
+wire        shift_zf;
+wire        shift_sf;
+wire        shift_last_out_lsb;
+wire        shift_last_out_msb;
+wire        shift_cf;
+wire [5:0]  width;
+wire [31:0] shift_width_mask;
+
+reg [31:0]  IND_DELTA;
+reg         arpl_m_flag_s1, arpl_m_flag_s2;
+reg [31:0]  DIVTMP;
+reg [31:0]  MULTMP;
+reg [31:0]  RESULT;
+reg         div_r_nonneg;
+reg         idiv_dividend_neg;
+reg         idiv_divisor_neg;
+reg         div_first_cycle; // Set when starting DIV, cleared after first DIV7 cycle
+reg         flag2_eflags_p; // commit to EFLAGS this cycle (producer had uc[37])
+reg         flag2_ucflags_p; // commit to uc_flags this cycle
+reg         flag2_cf_r, flag2_af_r, flag2_of_r, flag2_zsp_r;
+reg         sh2_commit_p, sh2_we_zsp, sh2_we_of;
+reg         sh2_cf, sh2_of, sh2_zf, sh2_sf, sh2_pf;
+reg         shift_SET_Nzs;
+reg  [2:0]  shift_op; // ROL/ROR/RCL/RCR/SHL/SHR/SAR, for flag update
+
+logic [31:0] div7_q_next;
+logic [31:0] div7_r_next;
+logic        div7_r_nonneg_next;
+logic [31:0] prediv_q_next;
+logic [31:0] prediv_r_next;
+logic        prediv_r_nonneg_next;
+logic [31:0] div_divisor_masked;
+logic [31:0] div_divisor_abs;
+logic        div_dividend_neg;
+logic        div_divisor_neg;
+logic [31:0] prediv_r_in;
+logic [4:0]  shift_size; // original shift amount
+logic        shift_overflow; // SHL/SHR/SAR count > width (result is 0 or sign-extended)
+logic        shift_eq_width; // count == width (for SHL/SHR CF special case)
+logic        shift_eq_cf; // saved CF for count==width case
+
+// Microcode ROM
+wire [50:0] uc_rom_q;
+wire [50:0] uc_rom_early;
+wire [50:0] uc; // Current microcode word + pre-computed bits (50:37)
+wire [50:0] uc_next;
+assign uc = uc_rom_q;
+assign uc_next = uc_rom_early;
+
+wire [5:0] uc_alu_src      = uc[36:31];  // ABCDEF: ALU source / jump offset
+assign     uc_dest         = uc[30:24];  // GHIJKLM: destination
+assign     uc_source       = uc[23:18];  // NOPQRS: source
+wire [6:0] uc_aluop        = uc[17:11];  // TUVWXYZ: ALU operation / jump condition
+wire [2:0] uc_opcode       = uc[10:8];   // 012: opcode (RNI, RPT, etc.)
+assign     uc_buscode      = uc[5:0];    // 56789&: bus operation code
+wire [5:0] uc_next_buscode = uc_next[5:0];
+
 // ALU signals (35-bit for MUL/DIV iteration support)
 reg [31:0] alu_dst, alu_src;        // ALU inputs this cycle
 reg [4:0]  alu_op5;                 // ALU operation this cycle
@@ -125,15 +314,7 @@ reg [15:0] DS = 16'h0000;
 reg [15:0] FS = 16'h0000;
 reg [15:0] GS = 16'h0000;
 reg [15:0] LDTR, TR;                // Task Register
-reg [31:0] SLCTR;                   // Selector temp used by protected-mode descriptor microcode (32-bit: LAR/LSL store full descriptor hi DWORD)
-// Forward SLCTR from dest_value when being written in the same cycle
-wire        slctr_fwd_en = uc_exec && (uc_dest == DEST_SLCTR || uc_dest == DEST_TMP_TR) && !prot_is_ptovrr;
-wire [31:0] slctr_fwd = slctr_fwd_en ? dest_value : SLCTR;
 
-reg [31:0] desc_raw_hi;             // raw high DWORD saved at TSTDES time (before barrel-shift modifies PROTUN)
-reg [5:0]  prot_saved_test_const;   // Protection test: PTSAV saves test constant for later PTOVRR to use
-
-seg_desc_t seg_cache [0:10];        // Indexed by SEG_* constants
 wire [31:0] CS_base = seg_cache[SEG_CS].base;
 
 wire       pe = CR0[0];             // Protected mode enable
@@ -155,25 +336,13 @@ wire       pf_full;
 wire       pf_empty;
 wire [5:0] pf_count;                // Prefetch bytes currently buffered
 wire [2:0] q_pop_bytes;             // Pop 1/2/4 bytes from queue
-wire       q_flush;                 // Flush queue (branch/jump) - combinational for i.immediate gating
-wire       pe_mode_toggle_now;      // CR0.PE changed this cycle: re-decode next bytes in new mode
-reg        uc_ctl_pref;             // Previous-cycle predecode: current uop is BUSOP_PREF
 
 assign pe_mode_toggle_now = uc_exec && (uc_dest == DEST_CR0) && (dest_value[0] != CR0[0]);
 assign q_flush = (uc_exec && uc_ctl_pref && !uc_cond_jump_taken_prev && !early_redirected)
                || early_redirect || pe_mode_toggle_now;
 
-wire        page_fault;             // Page fault (declared fully at paging unit instantiation)
 wire [1:0]  prot_cpl;               // CPL for protection unit (declared fully near protection logic)
 reg  [1:0]  arpl_rpl_latch;         // ARPL RPL latch (declared fully near ARPL logic)
-
-// Memory requests
-wire        mem_servicing;          // memory request in flight
-wire        mem_dly_grace;          // optimistic read: DLY may execute this (lookup) cycle
-wire        mem_write_dly_grace;    // posted write in PG_MEM_TLB: next non-bus uop may execute now
-wire        mem_opt_wait;           // optimistic read missed: stall all uops until fill done
-wire        mem_accepted;           // memory request accepted (ready pulse)
-wire        mem_complete_now;       // combinational, request completing THIS cycle
 
 // Prefetch ↔ paging unit toggle signals
 wire        pf_req_toggle;
@@ -190,19 +359,14 @@ wire        pf_fault;
 reg [11:0] uaddr_now;               // Next address, launched early to the ucode ROM
 reg [11:0] uaddr;                   // Address being fetched in the current ucode pipeline
 reg [11:0] uc_addr;                 // Address of current uc (for debug)
-wire [50:0] uc;                     // Current microcode word + pre-computed bits (50:37)
-wire [50:0] uc_next;
 
 // Instruction Life cycle: entry -> pop -> first -> RNI -> RNI delay slot -> inactive
 wire       i_entry;                 // Load entry point into uaddr, set init_cycle (queue NOT popped yet)
 wire       i_pop;                   // Actually pop from instruction queue (during init_cycle)
-reg        i_first;                 // First ucode execution cycle after i_pop
 wire       i_rni;                   // RNI detected in this cycle (combinational from uc bits)
 reg        i_rni_delay;             // RNI delay slot - RNI has been executed. this is last instruction cycle
 
 reg        init_cycle;              // Cycle or cycles after i_entry - uc is being latched, not yet valid
-reg        uc_active;               // Tracks when instruction execution has begun
-reg        fault_suppress_delay_slot;   // Fault handling: suppress delay slot after fault triggers
 
 // i_entry: load entry point into uaddr (e.g. when RNI), set init_cycle (queue NOT popped yet)
 wire       i_entry_raw = (i_rni || i_rni_delay || ~uc_active) && ~halted && !stall && !decq_empty && !q_flush && !init_cycle &&
@@ -213,43 +377,40 @@ assign     i_entry = i_entry_raw && !any_fault;
 wire       interrupt_at_boundary = i_rni_delay && interrupt_pending && !single_step;
 assign     i_pop = init_cycle && !stall && !page_fault && !interrupt_at_boundary && !q_flush;
 
-wire       core_live = !halted && uc_active && !fault_suppress_delay_slot && !interrupt_entry;
-wire       dly_grace_now = mem_dly_grace && uc_p_pure_dly;
-wire       posted_write_release = mem_write_dly_grace && !uc_busreq;    // release non-busop writes after one cycle
-wire       mem_block_busy = (uc_bus_or_dly && !dly_grace_now && !posted_write_release) || mem_opt_wait; // demand op in flight
-wire       mem_block_idle = (uc_busreq && !mem_accepted);  // uop wants the bus, paging not ready
-wire       stall_mem = mem_servicing ? mem_block_busy : (mem_req_current && !mem_accepted);
-wire       stall_wio = (uc_is_wio && !interrupt_pending && !single_step);
-wire       stall = stall_mem || stall_wio;
-
-// Repeat
-wire       prot_result_now = prot_result_valid && prot_test_inflight;
-wire       repeat_active = uc_is_rpt && (COUNTR[4:0] != 0 || prot_test_inflight) && !prot_result_now
-                           && !(uc_is_wio && interrupt_pending);
-
-// uc_exec: master enable for microcode execution
-wire       uc_exec = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) && !stall_wio;
-wire       uc_exec_writeback = uc_exec;  // local copies for reducing fanout
-wire       uc_exec_mul_start = uc_exec;
-wire       uc_exec_result = uc_exec;
-wire       uc_exec_shift = uc_exec;
-
 // seg_cmd_valid: seg_unit should commit the current seg_cmd this cycle
 assign     seg_cmd_valid = i_pop || uc_exec;
 
+// Core execution / stall / memory-block control
+assign core_live            = !halted && uc_active && !fault_suppress_delay_slot && !interrupt_entry;
+assign dly_grace_now        = mem_dly_grace && uc_p_pure_dly;
+assign posted_write_release = mem_write_dly_grace && !uc_busreq;    // release non-busop writes after one cycle
+assign mem_block_busy       = (uc_bus_or_dly && !dly_grace_now && !posted_write_release) || mem_opt_wait; // demand op in flight
+assign mem_block_idle       = (uc_busreq && !mem_accepted);  // uop wants the bus, paging not ready
+assign stall_mem            = mem_servicing ? mem_block_busy : (mem_req_current && !mem_accepted);
+assign stall_wio            = (uc_is_wio && !interrupt_pending && !single_step);
+assign stall                = stall_mem || stall_wio;
+
+// Repeat
+assign prot_result_now      = prot_result_valid && prot_test_inflight;
+assign repeat_active        = uc_is_rpt && (COUNTR[4:0] != 0 || prot_test_inflight) && !prot_result_now
+                              && !(uc_is_wio && interrupt_pending);
+
+// uc_exec: master enable for microcode execution
+assign uc_exec              = core_live && !(mem_servicing ? mem_block_busy : mem_block_idle) && !stall_wio;
+assign uc_exec_writeback    = uc_exec;  // local copies for reducing fanout
+assign uc_exec_mul_start    = uc_exec;
+assign uc_exec_result       = uc_exec;
+assign uc_exec_shift        = uc_exec;
+
 dec_entry_t i_bus;            // Decoded instruction from decoder module
 wire        decq_has_jmp_call; // decode queue holds a JMP/CALL rel (halt speculative prefetch)
-wire       decq_empty;        // Decoder instruction queue empty
+// wire       decq_empty;        // Decoder instruction queue empty
 
 // The microcode ROM contains 2560 entries of 37-bit ucode + 14-bit predecode
 wire        microcode_rom_ce = !stall && !repeat_active;
-wire [50:0] uc_rom_q;
-wire [50:0] uc_rom_early;
 wire [5:0]  uc_source_shift;
 wire [5:0]  uc_alu_src_shift;
 wire [6:0]  uc_aluop_shift;
-assign uc = uc_rom_q;
-assign uc_next = uc_rom_early;
 
 ucode_rom microcode_rom (
     .clk(clk),
@@ -273,20 +434,9 @@ wire [15:0] ea_regs_16 = decode_base_register_16(i_bus.modrm);
 //=============================================================================
 // Prefetch queue and Bus Interface Unit
 //=============================================================================
-// Forward declarations to avoid implicit wire inference in synthesis
-wire [31:0] pf_flush_addr;          // Prefetch flush address
-wire [5:0]  uc_buscode;             // Bus operation code from microcode
-wire [6:0]  uc_dest;                // Destination field from microcode
-wire [5:0]  uc_source;              // Source field from microcode
-wire [31:0] dest_value;             // Destination value for writes
-wire        gp_fault_trigger;       // GP fault trigger
-wire        div_overflow;           // Division overflow
-// stack_init_pending is a reg, declared later
-
 wire [11:0] prot_jump_addr;         // Microcode jump address from protection unit
 wire        prot_jump_valid;        // jump_addr is a redirect (non-zero)
 wire        prot_validation_ok;     // M flag: Descriptor validated
-wire        prot_result_valid;      // Pipelined result is valid (2 cycles after test)
 
 wire        dcache_req_valid;
 wire [31:0] dcache_req_phys_addr;
@@ -629,7 +779,6 @@ wire [31:0] seg_lar_result, seg_llim_result, seg_lbas_result;
 reg  [3:0]  seg_cmd;
 reg  [3:0]  seg_cmd_target;
 reg  [31:0] seg_cmd_data;
-wire        seg_cmd_valid;          // 1 when seg_cmd should execute (i_pop or uc_exec)
 
 // Decoded instruction register (all fields from decoder, latched at i_pop)
 dec_entry_t i;
@@ -658,7 +807,7 @@ wire [3:0] init_final_seg = i_bus.stack_op ? init_default_seg :
 // Pre-computed access size for limit check (replaces op_size + is_dword in seg unit)
 wire [1:0] gp_access_adj = (op_size == 2'd0) ? 2'd0 : is_dword ? 2'd3 : 2'd1;
 
-wire        mem_op_eligible, gp_fault_mem_op, gp_fault_wr_op, ss_segment_fault;
+wire        gp_fault_mem_op, gp_fault_wr_op, ss_segment_fault;
 reg         copy_stack_dpl_s2, conform_dpl_s2;
 reg  [1:0]  copy_dpl_s2;
 reg  [1:0]  conform_dpl_value_s2;
@@ -790,7 +939,7 @@ wire [31:0] mem_wdata = (uc_buscode == BUSOP_WR_OPR) ? OPR_R :
     (uc_dest == DEST_OPR_W) ? (stack_init_pending ? read_uc_source(uc_source) : dest_value) :
     OPR_W;
 
-wire        any_fault = gp_fault_trigger || div_overflow || page_fault;
+assign      any_fault = gp_fault_trigger || div_overflow || page_fault;
 reg         any_fault_r;  // Registered any_fault: used for deferred SIGMA/TMPeSP writes
 always_ff @(posedge clk) any_fault_r <= any_fault;
 wire [2:0]  pg_fault_code;        // Page fault error code
@@ -800,26 +949,26 @@ wire [31:0] pg_cr2_out;           // Faulting address for CR2
 wire cr3_write = uc_exec && uc_buscode == BUSOP_SPCR && uc_dest == DEST_PDBR;
 
 // IO request detection
-wire mem_is_io = mem_seg_is_io;     // registered in segmentation_unit alongside seg_sel
-wire io_busop_rd = uc_p_io_rd && mem_is_io;
-wire io_busop_wr = uc_p_io_wr && mem_is_io;
+assign mem_is_io = mem_seg_is_io;     // registered in segmentation_unit alongside seg_sel
+assign io_busop_rd = uc_p_io_rd && mem_is_io;
+assign io_busop_wr = uc_p_io_wr && mem_is_io;
 
-wire iack_busop = uc_p_iack;        // IACK bus operation (interrupt acknowledge)
+assign iack_busop = uc_p_iack;        // IACK bus operation (interrupt acknowledge)
 
 // Interrupt pending: NMI has priority over INTR
 wire nmi_edge = nmi && !nmi_prev && !nmi_blocked;
-wire nmi_request_active = nmi_pending || nmi_edge;
-wire interrupt_pending = nmi_request_active || (intr_pending && EFLAGS[9]);
+assign nmi_request_active = nmi_pending || nmi_edge;
+assign interrupt_pending = nmi_request_active || (intr_pending && EFLAGS[9]);
 wire nmi_accept_boundary = i_rni_delay && !stall && !page_fault &&
                            nmi_request_active && !single_step;
 
 reg inhibit_interrupts;     // STI shadow: real 386 suppresses interrupt recognition for one instruction after STI
 
 assign mem_op_eligible = core_live && !mem_servicing;   // current RD/WR/IACK uop request
-wire uc_busreq = (uc_is_mem_busop && !mem_is_io) ||
-                 io_busop_rd || io_busop_wr ||
-                 iack_busop;
-wire mem_req_current = mem_op_eligible && uc_busreq;    // drives paging unit
+assign uc_busreq = (uc_is_mem_busop && !mem_is_io) ||
+                   io_busop_rd || io_busop_wr ||
+                   iack_busop;
+assign mem_req_current = mem_op_eligible && uc_busreq;    // drives paging unit
 
 // Delay prefetch on upcoming demand memory
 wire mem_req_upcoming = uc_next[39] && !halted && (uc_active || !decq_empty);
@@ -953,11 +1102,13 @@ wire prot_pipe_en = !stall;
 // aluop 0x6? range: bit3=0 is PTSAV (save only), bit3=1 fires test
 wire prot_is_6x = (uc_aluop[6:4] == 3'b110);
 wire prot_is_ptsav = prot_is_6x && !uc_aluop[3];  // PTSAV1(0x61), PTSAV3(0x63), PTSAV7(0x67)
-wire prot_is_ptovrr = (uc_aluop == ALUJMP_PTOVRR); // 0x68: uses saved test constant
+assign prot_is_ptovrr = (uc_aluop == ALUJMP_PTOVRR); // 0x68: uses saved test constant
 wire [5:0] prot_test_const = prot_is_ptovrr ? prot_saved_test_const : uc_alu_src[5:0];
 // FPU tests (test_const 0x34, 0x38-0x3F) must fire even in real mode
 wire is_fpu_prot_test = prot_test_const[5] && prot_test_const[4] && (prot_test_const[3] || prot_test_const[2]);
 wire prot_test_en = uc_exec && prot_is_6x && !prot_is_ptsav && (pe || is_fpu_prot_test);
+assign slctr_fwd_en = uc_exec && (uc_dest == DEST_SLCTR || uc_dest == DEST_TMP_TR) && !prot_is_ptovrr;
+assign slctr_fwd = slctr_fwd_en ? dest_value : SLCTR;
 wire selector_null_wire = (slctr_fwd[15:3] == 13'b0) && !slctr_fwd[2]; // Null selector: Index=0, TI=0
 wire [15:0] selector_desc_end = {slctr_fwd[15:3], 3'b111}; // Last byte offset of 8-byte descriptor
 wire selector_oob_wire = slctr_fwd[2] ?
@@ -1279,15 +1430,6 @@ end
 // Control Unit (Microcode Sequencer)
 //=============================================================================
 
-wire [5:0] uc_alu_src   = uc[36:31];  // ABCDEF: ALU source / jump offset
-assign uc_dest          = uc[30:24];  // GHIJKLM: destination
-assign uc_source        = uc[23:18];  // NOPQRS: source
-wire [6:0] uc_aluop     = uc[17:11];  // TUVWXYZ: ALU operation / jump condition
-wire [2:0] uc_opcode    = uc[10:8];   // 012: opcode (RNI, RPT, etc.)
-// subcode field uc[7:6] (DLY/UNL/WIO) is consumed via ROM predecode bits only
-assign uc_buscode       = uc[5:0];    // 56789&: bus operation code
-wire [5:0] uc_next_buscode = uc_next[5:0];
-
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         uc_ctl_pref <= 1'b0;
@@ -1300,63 +1442,31 @@ reg [11:0] microcode_return_stack [0:3]; // 4-entry return address stack
 reg [1:0]  microcode_sp;                 // Stack pointer (0-3)
 
 reg        uc_jump_taken_prev;      // Jump taken last cycle (for RNi: terminate only in delay slot)
-reg        uc_cond_jump_taken_prev; // Conditional jump taken last cycle (for PREF suppression)
 
 //   RNI/RnI terminate unless we're in a delay slot of a taken jump (loop continues)
 //   RNi only terminates when in delay slot (after a jump)
 assign i_rni = ((uc_is_rni || uc_is_rni_inhibit) && !uc_jump_taken_prev) ||
                            (uc_is_rni_lc && uc_jump_taken_prev);
 
-reg        instr_is_shxd;           // Instruction is a SHxD operation
-reg        instr_cf;                // CF bit at start of instruction
-reg        instr_is_cmp;
-reg        instr_ind_is_ea;
 reg  [4:0] alu_grp_op;              // Pre-decoded ALU op for ALUJMP_ALU/INCDEC (from i_bus at i_pop)
-reg        instr_is_loop;           // E0/E1: LOOPNE/LOOPE (eliminates 7-bit compare from jump path)
-reg  [1:0] instr_bt_sel;            // BT operation selector (eliminates 8-bit compare from ALU path)
-reg  [4:0] instr_szext_op;          // Pre-decoded MOVZX/MOVSX/CBW ALU op
-reg        stack_init_pending;      // Cycle after i_pop for stack op - ALU computes new SP
-reg        prot_test_inflight;      // Protection test is in pipeline (waiting for result)
-reg        prot_redirect_prev;      // Protection redirect fired last cycle (suppresses LJUMP + relative jumps in delay slot)
 
-reg [31:0] ea_reg;                  // Early EA registered at i_pop (ALU path / stack-dest EA, e.g. POP [mem]); read via SRC_EA, off the i_first seg/TLB cone
-
-reg [2:0]  seg_reg_sel;             // Segment register index (0=ES,1=CS,2=SS,3=DS,4=FS,5=GS)
-
-reg [31:0] COUNTR;                  // Counter register
 wire [31:0] countr_masked = i.addr32 ? COUNTR : {16'h0, COUNTR[15:0]};
-reg [31:0] TMPeIP;                  // Saved EIP for RPTI (repeat instruction)
-reg [31:0] TMPeSP;                  // Saved ESP for fault handling
-reg        flags_backup_active;     // Set at i_pop/FLGSBA, cleared on interrupt_entry - guards FLAGSB writes
-reg        clear_if_pending;        // Set by {-2E-}, used by {-2F-} to clear IF during INT
-reg        misc1_flag;              // Set by SMISC1 {-33-}, tested by JMISC1 {-53-}
-reg        misc2_flag;              // Set by SMISC2 {-35-}, tested by JMISC2 {-55-}
-reg        error_code_flag;         // Set by SERRCF {-36-}, tested by JNERRC {-56-}
-reg        interrupt_hw;            // Set for hardware interrupts, tested by JINTSW {-52-}
-reg        intr_pending;            // Latched INTR request (level-sampled, cleared by CINTLA)
-reg        intr_latch_inhibit;      // Suppress re-latching after CINTLA until intr deasserts
-reg        nmi_pending;             // Latched NMI request (edge-detected, cleared on NMI entry)
-reg        nmi_blocked;             // NMI service in progress (set by SETNMI, cleared by CLRNMI)
-reg        nmi_prev;                // Previous NMI value for edge detection
-reg        interrupt_entry;         // Interrupt handler being entered (suppress i_entry/i_pop)
-reg        jcc_active;              // Currently executing a Jcc instruction (for alu_src_r in BUSOP_IND_PLUS_ALU)
-reg        instr_eip_written;       // EIP was written during instruction (RPTI restart)
-reg        gate_in_progress;        // Prevent second LDTST (at 5C3) from re-triggering gate detection
 
 // Microcode PREF restarts from IND
+wire        br_is_jcc      = (i.opcode[7:4] == 4'b0111 && !i.has_0f) ||
+                             (i.opcode[7:4] == 4'b1000 && i.has_0f);
+assign      br_is_jmp_rel  = !i.has_0f && (i.opcode == 8'hEB || i.opcode == 8'hE9);
+assign      br_is_call_rel = !i.has_0f && (i.opcode == 8'hE8);
+wire        br_is_rel8     = !i.has_0f && (i.opcode[7:4] == 4'b0111 || i.opcode == 8'hEB);
+wire [31:0] br_disp        = br_is_rel8 ? {{24{i.displacement[7]}}, i.displacement[7:0]}
+                                        : i.displacement;
+wire [31:0] br_target      = EIP + br_disp;
+
 wire [31:0] pf_flush_ip = IND;
 assign pf_flush_addr = early_redirect     ? (CS_base + br_target) :
                        pe_mode_toggle_now ? (CS_base + EIP) :
                                             (CS_base + pf_flush_ip);
 
-wire        br_is_jcc      = (i.opcode[7:4] == 4'b0111 && !i.has_0f) ||
-                             (i.opcode[7:4] == 4'b1000 && i.has_0f);
-wire        br_is_jmp_rel  = !i.has_0f && (i.opcode == 8'hEB || i.opcode == 8'hE9);
-wire        br_is_call_rel = !i.has_0f && (i.opcode == 8'hE8);
-wire        br_is_rel8     = !i.has_0f && (i.opcode[7:4] == 4'b0111 || i.opcode == 8'hEB);
-wire [31:0] br_disp        = br_is_rel8 ? {{24{i.displacement[7]}}, i.displacement[7:0]}
-                                        : i.displacement;
-wire [31:0] br_target      = EIP + br_disp;
 // synthesis translate_off
 always @(posedge clk) begin
     // Validate the microcode-PREF flush path
@@ -1368,10 +1478,9 @@ end
 // synthesis translate_on
 
 // i_first PRECISE early branch redirect (NOT a prediction). 
-wire br_jcc_taken = br_is_jcc && check_condition(i.opcode[3:0]);    
-wire early_redirect = i_first && is_dword &&
+assign br_jcc_taken = br_is_jcc && check_condition(i.opcode[3:0]);
+assign early_redirect = i_first && is_dword &&
                       (br_is_jmp_rel || br_is_call_rel || br_jcc_taken);
-reg  early_redirected;
 always_ff @(posedge clk or negedge reset_n) begin
     if (!reset_n)                            early_redirected <= 1'b0;
     else if (early_redirect)                 early_redirected <= 1'b1;
@@ -1382,11 +1491,11 @@ end
 //   000 = RNI  : Run Next Instruction (normal termination)
 //   001 = RNi  : RNI only if in delay slot (lowercase i)
 //   010 = RnI  : RNI with interrupt inhibit for next instruction
-wire uc_is_rni = (uc_opcode == 3'b000);
-wire uc_is_rni_lc = (uc_opcode == 3'b001);
-wire uc_is_rni_inhibit = (uc_opcode == 3'b010);
-wire uc_is_wio = uc_p_wio;  // WIO: wait for interrupt/IO (HLT, only with RPT)
-wire uc_is_rpt = uc_p_rpt;
+assign uc_is_rni = (uc_opcode == 3'b000);
+assign uc_is_rni_lc = (uc_opcode == 3'b001);
+assign uc_is_rni_inhibit = (uc_opcode == 3'b010);
+assign uc_is_wio = uc_p_wio;  // WIO: wait for interrupt/IO (HLT, only with RPT)
+assign uc_is_rpt = uc_p_rpt;
 
 // LOOP/REP Condition Logic
 wire loop_zf_sense = instr_is_loop ? i.opcode[0] : i.rep_lock[0];  // ZF sense for branch
@@ -1479,7 +1588,6 @@ reg [1:0] conform_dpl_value_s1;
 reg write_rpl_s1, write_rpl_s2;
 reg cpl_transition;
 
-reg        arpl_m_flag_s1, arpl_m_flag_s2;
 assign     prot_cpl = cpl_transition ? SLCTR[1:0] : cpl;
 always_ff @(posedge clk) begin
     if (!reset_n) begin
@@ -1539,7 +1647,7 @@ always_ff @(posedge clk) begin
     end
 end
 
-wire prot_redirect_taken = uc_exec && prot_result_now && prot_jump_valid;
+assign prot_redirect_taken = uc_exec && prot_result_now && prot_jump_valid;
 wire uc_jump_taken = uc_reljump_taken || prot_redirect_taken || (uc_exec && (
     (uc_aluop == ALUJMP_LJMPP && pe && !vm) ||
     (uc_aluop == ALUJMP_LJMPNP && (pe && (cpl != 2'b00))) ||
@@ -1548,7 +1656,7 @@ wire uc_jump_taken = uc_reljump_taken || prot_redirect_taken || (uc_exec && (
     ljump_taken
 ));
 
-wire gate_detect_cond = pe && (uc_buscode == BUSOP_SDEL) &&
+assign gate_detect_cond = pe && (uc_buscode == BUSOP_SDEL) &&
                         !gate_in_progress && !desc_raw_hi[12] && (desc_raw_hi[11:8] == 4'hC);
 wire gate_detect_now = uc_exec && gate_detect_cond;
 
@@ -2662,7 +2770,6 @@ function automatic logic check_condition(input [3:0] cond);
 endfunction
 
 // IND register (address register) and ind_linear (relocated linear address of IND)
-reg [31:0] IND_DELTA;
 always_ff @(posedge clk) begin
     if (!reset_n) begin
         IND <= 32'h0;
@@ -2810,32 +2917,14 @@ end
 // Computes 32x32->64 bit in 4 cycles instead of 32 cycles (shift-and-add)
 // For 8/16-bit operands, completes in 1 cycle
 
-reg [31:0] DIVTMP;
-reg [31:0] MULTMP;
-reg [31:0] RESULT;
-reg        div_r_nonneg;
-reg        idiv_dividend_neg;
-reg        idiv_divisor_neg;
-reg        div_first_cycle;      // Set when starting DIV, cleared after first DIV7 cycle
 
 wire [63:0] mul_acc;             // DSP multiplier result
-wire [31:0] mul_upper = op_size == 2'b00 ? {24'h0, mul_acc[39:32]} :
+assign      mul_upper = op_size == 2'b00 ? {24'h0, mul_acc[39:32]} :
                         op_size == 2'b01 ? {16'h0, mul_acc[47:32]} :
                         mul_acc[63:32];
-logic [31:0] div7_q_next;
-logic [31:0] div7_r_next;
-logic        div7_r_nonneg_next;
-logic [31:0] prediv_q_next;
-logic [31:0] prediv_r_next;
-logic        prediv_r_nonneg_next;
-logic [31:0] div_divisor_masked;
-logic [31:0] div_divisor_abs;
-logic        div_dividend_neg;
-logic        div_divisor_neg;
 logic [31:0] prediv_q_in;
-logic [31:0] prediv_r_in;
 // IMUL: F6.5, F7.5, 0FAF, 69, 6B, MUL: F6.4 and F7.4
-wire is_signed_mul = i.opcode[7:6] != 2'b11 || i.modrm[3];
+assign is_signed_mul = i.opcode[7:6] != 2'b11 || i.modrm[3];
 
 
 // Start DSP multiply on first cycle of IMUL3/IMUL4 RPT loop
@@ -2873,7 +2962,7 @@ end
 
 // Early exit: force COUNTR to 0 when DSP multiply completes during RPT loop
 // This causes repeat_active to become false, exiting the loop early
-wire dsp_mul_early_exit = dsp_mul_done && repeat_active && mul_is_imul;
+assign dsp_mul_early_exit = dsp_mul_done && repeat_active && mul_is_imul;
 
 // Division: prepare inputs for DIV7 and PREDIV steps
 always_comb begin
@@ -2948,23 +3037,23 @@ wire        alu_zsp_update;
 // Derive control signals from ALU opcode
 // INC=11000, DEC=11001, INC2=11100, DEC2=11101: all have op[4:3]==11 && op[1]==0
 wire alu_update_carry = !(alu_op5[4:3] == 2'b11 && !alu_op5[1]);
-wire in_rpti_routine = (uaddr >= 12'h208) && (uaddr <= 12'h20e);   // TODO: Remove this special case
+assign in_rpti_routine = (uaddr >= 12'h208) && (uaddr <= 12'h20e);   // TODO: Remove this special case
 
 // Pre-computed ROM bits (eliminates wide combinational comparisons from hot paths)
 wire alu_update_flags  = uc[37];
-wire uc_bus_or_dly     = uc[38];
-wire uc_is_mem_busop   = uc[39];
-wire uc_is_write       = uc[40];
-wire uc_is_check_write = uc[41];
-wire uc_is_word_op     = uc[42];
-wire uc_is_dword_op    = uc[43];
-wire uc_jpereq_fwd     = uc[44];
-wire uc_p_io_rd        = uc[45];   // IO-capable read buscode
-wire uc_p_io_wr        = uc[46];   // IO-capable write buscode
-wire uc_p_iack         = uc[47];   // IACK bus cycle
-wire uc_p_pure_dly     = uc[48];   // DLY without a bus request of its own
-wire uc_p_rpt          = uc[49];   // RPT opcode
-wire uc_p_wio          = uc[50];   // WIO (RPT opcode + WIO subcode)
+assign uc_bus_or_dly     = uc[38];
+assign uc_is_mem_busop   = uc[39];
+assign uc_is_write       = uc[40];
+assign uc_is_check_write = uc[41];
+assign uc_is_word_op     = uc[42];
+assign uc_is_dword_op    = uc[43];
+assign uc_jpereq_fwd     = uc[44];
+assign uc_p_io_rd        = uc[45];   // IO-capable read buscode
+assign uc_p_io_wr        = uc[46];   // IO-capable write buscode
+assign uc_p_iack         = uc[47];   // IACK bus cycle
+assign uc_p_pure_dly     = uc[48];   // DLY without a bus request of its own
+assign uc_p_rpt          = uc[49];   // RPT opcode
+assign uc_p_wio          = uc[50];   // WIO (RPT opcode + WIO subcode)
 
 always_comb begin
     // Use the ROM-delay-cycle field registers for the hot ALU datapath. They
@@ -3018,10 +3107,7 @@ alu u_alu (
 // Flags are timing critical in x86, so pipelining them over two cycles.
 // Cycle 1: registers the raw result and the cheap carry-chain flags (CF/AF/OF)
 // Cycle 2: derives ZF/SF/PF and commits to EFLAGS and uc_flags
-reg        flag2_eflags_p;     // commit to EFLAGS this cycle (producer had uc[37])
-reg        flag2_ucflags_p;    // commit to uc_flags this cycle
 reg [31:0] flag2_result_r;     // raw ALU result of the producer
-reg        flag2_cf_r, flag2_af_r, flag2_of_r, flag2_zsp_r;
 reg [1:0]  flag2_size_r;
 wire flag2_class_uc = (uc_aluop == ALUJMP_ALU)    || (uc_aluop == ALUJMP_INCDEC) ||
                       (uc_aluop == ALUJMP_CMPTST) || (uc_aluop == ALUJMP_AND)    ||
@@ -3046,21 +3132,19 @@ always_ff @(posedge clk) begin
         end
     end
 end
-wire flag2_zf = (flag2_size_r == 2'd0) ? (flag2_result_r[7:0]  == 8'h0)  :
+assign flag2_zf = (flag2_size_r == 2'd0) ? (flag2_result_r[7:0]  == 8'h0)  :
                 (flag2_size_r == 2'd1) ? (flag2_result_r[15:0] == 16'h0) :
                                          (flag2_result_r       == 32'h0);
-wire flag2_sf = (flag2_size_r == 2'd0) ? flag2_result_r[7]  :
+assign flag2_sf = (flag2_size_r == 2'd0) ? flag2_result_r[7]  :
                 (flag2_size_r == 2'd1) ? flag2_result_r[15] :
                                          flag2_result_r[31];
-wire flag2_pf = ~^flag2_result_r[7:0];
+assign flag2_pf = ~^flag2_result_r[7:0];
 
 //=============================================================================
 // Two-cycle shifter flag retirement
 //=============================================================================
 // SHIFT2 registers the final CF/OF/ZF/SF/PF values here, the EFLAGS/uc_flags 
 // commit applies them next cycle.
-reg sh2_commit_p, sh2_we_zsp, sh2_we_of;
-reg sh2_cf, sh2_of, sh2_zf, sh2_sf, sh2_pf;
 always_ff @(posedge clk) begin
     if (!reset_n)
         sh2_commit_p <= 1'b0;
@@ -3107,7 +3191,7 @@ always_ff @(posedge clk) begin
 end
 
 // EFLAGS as it will be after this cycle's pending two-cycle flag commit
-wire [31:0] eflags_fwd =
+assign      eflags_fwd =
     sh2_commit_p ? { EFLAGS[31:12],
                      sh2_we_of  ? sh2_of : EFLAGS[11],
                      EFLAGS[10:8],
@@ -3140,10 +3224,6 @@ wire [31:0] eflags_fwd =
 
 logic        shift_swap;
 logic [5:0]  shift_count;    // 64-bit shift count (6 bits: needs to hold value 32 for LDBSLU with count=0)
-logic [4:0]  shift_size;     // original shift amount
-logic        shift_overflow; // SHL/SHR/SAR count > width (result is 0 or sign-extended)
-logic        shift_eq_width; // count == width (for SHL/SHR CF special case)
-logic        shift_eq_cf;    // saved CF for count==width case
 
 // Optimization: shift/bit-test execution microcode uses a smaller source-selector subset
 logic [31:0] shift_src_value;
@@ -3191,7 +3271,7 @@ end
 
 // Combinational: use latched shift_swap with shift-specific operands
 wire [31:0]  shift_hi = shift_swap ? shift_alu_value : shift_src_value;
-wire [31:0]  shift_lo = shift_swap ? shift_src_value : shift_alu_value;
+assign       shift_lo = shift_swap ? shift_src_value : shift_alu_value;
 wire         is_sar = (i.modrm[5:3] == SAR) && !instr_is_shxd;
 wire [63:0]  shift_in = op_size == 2'b00 ? {shift_hi, shift_lo[7:0]} :
                         op_size == 2'b01 ? {shift_hi, shift_lo[15:0]} :
@@ -3202,31 +3282,29 @@ wire  [63:0] shifted = shift_in >> shift_count;
 // For SAR with overflow, result is sign-extended (all 1s if negative, all 0s if positive)
 wire [31:0]  sar_overflow_result = shift_lo[width-1] ? 32'hFFFFFFFF : 32'h0;
 assign       shift_result = shift_overflow ? (is_sar ? sar_overflow_result : 32'h0) : shifted[31:0];
-wire         shift_pf = ~^shift_result[7:0];
+assign       shift_pf = ~^shift_result[7:0];
 
 // ZF/SF taken from the raw barrel output (shifted), with the overflow special
 // cases resolved separately
 wire         shift_lo_sign = (op_size == 2'd0) ? shift_lo[7] :
                              (op_size == 2'd1) ? shift_lo[15] : shift_lo[31];
-wire         shift_zf = shift_overflow ? (is_sar ? ~shift_lo_sign : 1'b1) :
+assign       shift_zf = shift_overflow ? (is_sar ? ~shift_lo_sign : 1'b1) :
                         (op_size == 2'd0) ? (shifted[7:0] == 8'h0) :
                         (op_size == 2'd1) ? (shifted[15:0] == 16'h0) :
                                             (shifted[31:0] == 32'h0);
-wire         shift_sf = shift_overflow ? (is_sar ? shift_lo_sign : 1'b0) :
+assign       shift_sf = shift_overflow ? (is_sar ? shift_lo_sign : 1'b0) :
                         (op_size == 2'd0) ? shifted[7] :
                         (op_size == 2'd1) ? shifted[15] :
                                             shifted[31];
 
 // flags related
-reg          shift_SET_Nzs;
-reg   [2:0]  shift_op;     // ROL/ROR/RCL/RCR/SHL/SHR/SAR, for flag update
-wire         shift_last_out_lsb = shift_in[shift_count-1];
-wire         shift_last_out_msb = shifted[width];
+assign       shift_last_out_lsb = shift_in[shift_count-1];
+assign       shift_last_out_msb = shifted[width];
 // Simplified shift CF for uc_flags: left shift uses MSB, right shift uses LSB
-wire         shift_cf = shift_swap ? shift_last_out_msb : shift_last_out_lsb;
+assign       shift_cf = shift_swap ? shift_last_out_msb : shift_last_out_lsb;
 
-wire  [5:0]  width = (op_size == 2'd0) ? 6'd8 : (op_size == 2'd1) ? 6'd16 : 6'd32;
-wire  [31:0] shift_width_mask = (op_size == 2'd0) ? 32'h0000_00FF :
+assign       width = (op_size == 2'd0) ? 6'd8 : (op_size == 2'd1) ? 6'd16 : 6'd32;
+assign       shift_width_mask = (op_size == 2'd0) ? 32'h0000_00FF :
                                 (op_size == 2'd1) ? 32'h0000_FFFF :
                                                     32'hFFFF_FFFF;
 
