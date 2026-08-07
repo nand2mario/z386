@@ -68,10 +68,12 @@ function automatic [13:0] ucode_predecode(input [36:0] w);
     // (and in the retired gen_ucode45.py), so the base store never issued a
     // memory request — EMM386/VCPI context saves silently lost the IDT/GDT
     // base.  Found via TC3-under-EMM386 whole-system debugging, 2026-06-12.
-    mem_busop = (buscode == BUSOP_RD_BW) || (buscode == BUSOP_RD_D) ||
+    mem_busop = (buscode == BUSOP_RD_OPR_WORD) ||
+                (buscode == BUSOP_RD_BW) || (buscode == BUSOP_RD_D) ||
                 (buscode == BUSOP_RD) || (buscode == BUSOP_RD_WORD) ||
                 (buscode == BUSOP_RD_IND) || (buscode == BUSOP_WR) ||
-                (buscode == BUSOP_WR_OPR) || (buscode == BUSOP_WR_WORD) ||
+                (buscode == BUSOP_WR_OPR) || (buscode == BUSOP_WR_OPR_WORD) ||
+                (buscode == BUSOP_WR_WORD) ||
                 (buscode == BUSOP_WR_D) || (buscode == BUSOP_CW);
     // bit37: ALU group op (arithmetic flags path)
     ucode_predecode[0] = (aluop == ALUJMP_ALU) || (aluop == ALUJMP_INCDEC) ||
@@ -84,11 +86,15 @@ function automatic [13:0] ucode_predecode(input [36:0] w);
     ucode_predecode[2] = mem_busop;
     // bit40: memory write
     ucode_predecode[3] = (buscode == BUSOP_WR) || (buscode == BUSOP_WR_OPR) ||
+                         (buscode == BUSOP_WR_OPR_WORD) ||
                          (buscode == BUSOP_WR_WORD) || (buscode == BUSOP_WR_D);
     // bit41: check write (CW)
     ucode_predecode[4] = (buscode == BUSOP_CW);
     // bit42: word-sized access
-    ucode_predecode[5] = (buscode == BUSOP_RD_WORD) || (buscode == BUSOP_WR_WORD);
+    ucode_predecode[5] = (buscode == BUSOP_RD_OPR_WORD) ||
+                         (buscode == BUSOP_RD_WORD) ||
+                         (buscode == BUSOP_WR_OPR_WORD) ||
+                         (buscode == BUSOP_WR_WORD);
     // bit43: descriptor/auxiliary dword access (always 32-bit regardless of
     // operand size); includes the SGDT/SIDT base store
     ucode_predecode[6] = (buscode == BUSOP_RD_D) || (buscode == BUSOP_RD_IND) ||

@@ -92,6 +92,7 @@ typedef struct packed {
     // chain gates and the early-start latch do not re-derive them from ModR/M.
     logic [7:0]  ea_base_onehot;
     logic [7:0]  ea_index_onehot;
+    logic [3:0]  mem_seg;             // resolved SS/DS/override segment for memory EA
 } dec_entry_t;
 
 // Optimizer-generated recipe lookup and entry-point-derived FAST classifier.
@@ -673,29 +674,42 @@ localparam ALUJMP_SETNMI = 7'h26;  // Set NMI blocking flag (NMI handler entry)
 localparam ALUJMP_CINTLA = 7'h2D;  // Clear interrupt latch (HARDWARE_IRQ at 830)
 localparam ALUJMP_SEZF = 7'h29;    // Set Zero Flag (ARPL/LSL)
 localparam ALUJMP_BITSDE = 7'h2A;  // Restore instruction's original bit size
+localparam ALUJMP_ICEBRK = 7'h2B;  // ICE breakpoint notification; inert without an ICE
 localparam ALUJMP_SCNTFF = 7'h2C;  // Set contributory fault flag
 localparam ALUJMP_CLI = 7'h2E;     // Clear IF (prime clear_if_pending flag)
 localparam ALUJMP_CLT = 7'h2F;    // Clear TF always, clear IF if primed by CLI
 localparam ALUJMP_SINTHW = 7'h32;  // SINTHW: Set interrupt_hw flag (HW IRQ/NMI/exception, not INT n)
 localparam ALUJMP_SMISC1 = 7'h33;  // Set MISC1 flag (INT handler sets this; JMISC1 tests it)
+localparam ALUJMP_STSKS  = 7'h34;  // Mark the outgoing task state as saved
 localparam ALUJMP_SMISC2 = 7'h35;  // Set MISC2 microcode flag
+localparam ALUJMP_SNOFLT = 7'h37;  // Suppress faults for LAR/LSL/VERR/VERW descriptor probes
+localparam ALUJMP_SREPF  = 7'h39;  // Mark an interruptible REP MOVS operation active
 localparam ALUJMP_CMISC2 = 7'h3C;  // Clear MISC2 microcode flag
+localparam ALUJMP_CREPF  = 7'h3D;  // Clear the REP restart/correction latch
 localparam ALUJMP_SERRCF = 7'h36;  // Set error code flag (ERROR_CODE_FLAG = true)
 localparam ALUJMP_J16BIT = 7'h40;   // Jump if 286-format TSS in TR (16-bit stack switch / task save-load / IO map)
 localparam ALUJMP_JNBUSY = 7'h42;   // Jump if BUSY# inactive (always taken: no FPU)
-localparam ALUJMP_JTSSAF  = 7'h50;   // JTSSAF: Jump if TSS access flag is set (never taken: no task switching)
+localparam ALUJMP_JTSSAF  = 7'h50;   // JTSSAF: Jump if TSS access flag is set
 localparam ALUJMP_JG = 7'h51;        // JG: Jump if Greater (ZF=0 AND SF=OF)
 localparam ALUJMP_JINTSW = 7'h52;    // JINTSW: Jump if software interrupt (!interrupt_hw)
 localparam ALUJMP_JMISC1 = 7'h53;   // JMISC1: Jump if MISC1 flag set (INT vs call gate)
+localparam ALUJMP_JEXTFT = 7'h4C;   // Jump when the current event is external to the program
 localparam ALUJMP_JMISC2 = 7'h55;   // JMISC2: Jump if MISC2 flag set
 localparam ALUJMP_JNERRC = 7'h56;    // JNERRC: Jump if no error code (!error_code_flag)
+localparam ALUJMP_JNOFLT = 7'h57;   // Suppress a descriptor-probe fault
 localparam ALUJMP_JPEREQ = 7'h4E;    // JPEREQ: Jump if PEREQ (coprocessor request) — always taken (no FPU)
+localparam ALUJMP_JBUSY = 7'h4F;     // x87 BUSY# branch; never taken without an FPU
 localparam ALUJMP_JNFLGB = 7'h58;    // JNFLGB: Jump if flags backup NOT active
+localparam ALUJMP_JREP = 7'h59;      // Jump when interrupted REP MOVS needs state correction
 localparam ALUJMP_JNO = 7'h5C;       // JNO: Jump if Not Overflow (OF=0) - used by INTO
 localparam ALUJMP_JNC = 7'h5D;       // JNC: Jump if Not Carry (CF=0)
+localparam ALUJMP_JICEWT = 7'h5E;    // ICE wait branch; never taken without an ICE
 localparam ALUJMP_JNOINT = 7'h5F;    // JNOINT: Jump if no interrupt pending (always taken in our impl)
 localparam ALUJMP_STSSAF = 7'h30;  // Set TSS access flag; also clears stack push mode
 localparam ALUJMP_CTSSAF = 7'h3A;  // Clear TSS access flag
+localparam ALUJMP_CTSKS  = 7'h3B;  // Clear the task-saved latch after switching
+localparam ALUJMP_JSTSKL = 7'h4D;  // Skip backlink/NT setup for a non-nested task switch
+localparam ALUJMP_JNTSKS = 7'h54;  // Jump while the outgoing task still needs saving
 localparam ALUJMP_PTSAV1 = 7'h61;    // Protection test: save state 1
 localparam ALUJMP_PTSAV3 = 7'h63;    // Protection test: save state 3
 localparam ALUJMP_PTSAV7 = 7'h67;    // Protection test: save state 7
@@ -710,11 +724,15 @@ localparam ALUJMP_LJUMP = 7'h71;
 localparam ALUJMP_LJMPNP = 7'h72;   // Long jump if not privileged/protected
 localparam ALUJMP_LJMP86 = 7'h73;   // Long jump if V86 mode
 localparam ALUJMP_LJMPP = 7'h74;    // Long jump if protected mode enabled
+localparam ALUJMP_ICEENT = 7'h75;   // Enter ICE mode; inert without an ICE
+localparam ALUJMP_ICEEXT = 7'h76;   // Exit ICE mode; inert without an ICE
 localparam ALUJMP_LDBSRM = 7'h78;   // Load barrel shifter right count: SHRCNT = alu_src & BITS_V
 localparam ALUJMP_LDBSLM = 7'h79;   // Load barrel shifter left count: SHLCNT = alu_src & BITS_V
 localparam ALUJMP_LDBSRU = 7'h7a;   // Load barrel shifter right count: SHRCNT = alu_src & 0x1F
 localparam ALUJMP_LDBSLU = 7'h7b;   // Load barrel shifter left count: SHLCNT = alu_src & 0x1F
 localparam ALUJMP_RETURN = 7'h7C;
+localparam ALUJMP_ICESIG = 7'h7D;   // ICE event notification; inert without an ICE
+localparam ALUJMP_PAGEFT = 7'h7E;   // PAGEFT notification; paging fault state is latched in hardware
 localparam ALUJMP_NOPMOVE = 7'h7F;
 
 localparam DEST_EAX = 7'h00;
@@ -818,6 +836,7 @@ localparam DEST_DESERR = 7'h6C;  // Descriptor that caused fault
 localparam DEST_LATTTF = 7'h78;  // Faulting linear address (page fault)
 localparam DEST_PFERRC = 7'h7A;  // Page fault error code
 localparam DEST_PDBR = 7'h7B;    // Page directory base register (CR3) for LPCR reads
+localparam DEST_USTEP_BSWAP = 7'h7C; // 486 BSWAP extension: byte-swap SRCREG
 localparam DEST_PAGER5 = 7'h7D;  // Page cache register (paging-related, NOP for now)
 localparam DEST_USTEP_ALU = 7'h7E; // Optimized FAST word: ALU result -> DSTREG
 
@@ -944,6 +963,7 @@ localparam SRC_NEG1 = 6'h3F;          // -1 (all ones)
 
 // Bus operation codes (6-bit field from microcode)
 // Read operations
+localparam BUSOP_RD_OPR_WORD = 6'h05; // rd W - Locked word read for descriptor/TSS RMW
 localparam BUSOP_RD_BW = 6'h06;       // RD b/w - Memory read (byte/word based on operand size)
 localparam BUSOP_RD_D = 6'h07;        // RD_D - Descriptor/auxiliary dword read
 localparam BUSOP_RD_WORD = 6'h15;     // RD w - Word read (POP seg, MOV Sreg,[mem], LDS/LES)
@@ -953,6 +973,7 @@ localparam BUSOP_RD = 6'h16;          // RD - Memory read
 localparam BUSOP_WR_WORD = 6'h11;     // WR w - Word write (PUSH seg, MOV [mem],Sreg)
 localparam BUSOP_WR = 6'h12;          // WR - Memory write
 localparam BUSOP_WR_D = 6'h13;        // WR D - Dword write (SGDT/SIDT base store)
+localparam BUSOP_WR_OPR_WORD = 6'h19; // wr W - Locked word write-back using OPR_R
 localparam BUSOP_WR_OPR = 6'h1A;      // wr - Write-back using OPR_R (string ops, PUSH [mem])
 
 // Check write (probe)
@@ -1002,6 +1023,7 @@ localparam [11:0] UADDR_DIVIDE_ERROR   = 12'h824;  // #DE(0) - divide error (vec
 localparam [11:0] UADDR_DOUBLE_FAULT   = 12'h83F;  // #DF - vector 8, zero error code
 localparam [11:0] UADDR_HARDWARE_IRQ   = 12'h82D;  // INTR handler entry point
 localparam [11:0] UADDR_NMI            = 12'h836;  // NMI handler entry point
+localparam [11:0] UADDR_SINGLE_STEP    = 12'h93F;  // #DB(1) - TF single-step trap
 localparam [11:0] UADDR_PRIV_INT_DONE  = 12'h639;  // Cross-privilege handler CS/SS committed
 localparam [11:0] UADDR_TRAP_INT_DONE  = 12'h8E3;  // Handler CS committed; delivery complete
 localparam [11:0] UADDR_TSS_PROBLEM    = 12'h85D;  // #TS path used by protected-mode descriptor checks

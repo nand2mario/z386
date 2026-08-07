@@ -2,10 +2,9 @@
 ;
 ; Test:
 ;   1) Program IVT[0x20] with ISR recording a marker byte
-;   2) Enable IF without any pending interrupt
-;   3) Configure testbench to assert INTR after one retired instruction
-;   4) Request INTR, execute MOV SS, then one marker instruction
-;   5) Verify ISR observed marker=1 (interrupt taken after post-MOV-SS instruction)
+;   2) Assert INTR while IF=0
+;   3) Execute STI, MOV SS, then one marker instruction
+;   4) Verify ISR observed marker=1 (interrupt taken after post-MOV-SS instruction)
 
 BITS 16
 org 0
@@ -47,23 +46,22 @@ start:
     out dx, al
 
     mov dx, SIGNAL_INSTR_PORT
-    mov ax, 2               ; request + (mov ax,ss) + (mov ss,ax)
+    mov ax, 1               ; assert when the request OUT retires
     out dx, ax
 
     mov dx, SIGNAL_CYCLES_PORT
     mov ax, 1
     out dx, ax
 
-    ; Ensure IF=1 and no STI shadow in flight.
-    sti
-    nop
-
-    ; Request INTR, then execute MOV SS and the shadowed next instruction.
-    mov dx, SIGNAL_PORT
-    mov al, 1
-    out dx, al
-
+    ; Assert INTR while IF=0, then use STI's shadow to reach MOV SS. MOV SS
+    ; must extend the shadow through the marker instruction.
     mov ax, ss
+    mov cx, ax
+    mov dx, SIGNAL_PORT
+    mov ax, 1
+    out dx, ax
+    mov ax, cx
+    sti
     mov ss, ax              ; establishes interrupt shadow window
     mov byte [marker], 1    ; must execute before ISR entry
     nop

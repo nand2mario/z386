@@ -174,7 +174,7 @@ reg        uc_ctl_pref;             // Previous-cycle predecode: current uop is 
 wire cr0_wr_bit0 = (uc_source == SRC_MDTMP) ? RESULT[0] :
                    (uc_source == SRC_SIGMA) ? SIGMA[0]  : 1'b0;
 assign pe_mode_toggle_now = uc_exec && (uc_dest == DEST_CR0) && (cr0_wr_bit0 != CR0[0]);
-assign q_flush = (uc_exec && uc_ctl_pref && !uc_cond_jump_taken_prev && !early_redirected)
+assign q_flush = (uc_exec && uc_ctl_pref && !uc_pref_suppress_prev && !early_redirected)
                || early_redirect || pe_mode_toggle_now;
 // synthesis translate_off
 always @(posedge clk)
@@ -204,6 +204,12 @@ wire        pf_redirect_queued;
 wire        pf_ack_toggle;
 wire [127:0] pf_rdata;
 wire        pf_fault;
+wire [2:0]  pf_fault_code;
+wire [31:0] pf_fault_addr;
+wire        ifetch_page_fault;
+wire [2:0]  ifetch_fault_code;
+wire [31:0] ifetch_fault_addr;
+wire        decoder_fetch_blocked;
 
 //
 // Microcode Sequencer State
@@ -282,11 +288,13 @@ assign     i_entry = i_entry_raw && !any_fault_pop;
 
 // D2 -> EX readiness. Keep this factored from the valid bit so v53 can move
 // D2 ownership without changing the meaning of the transfer edge.
-wire       interrupt_deliverable = nmi_request_active ||
+wire       tf_trap_pending = tf_active_r && !tf_trap_suppress_r;
+wire       interrupt_deliverable = tf_trap_pending || nmi_request_active ||
                                    (intr_pending && EFLAGS[9] && !inhibit_interrupts);
 wire       interrupt_at_boundary = i_rni_delay && interrupt_deliverable && !single_step;
 assign     d2_valid = d2_valid_r;
 assign     d2_ready = d2_push && !stall && !any_fault_pop &&
+                      !(i_rni && tf_trap_pending && !single_step) &&
                       !interrupt_at_boundary && !q_flush;
 assign     d2_fire  = d2_valid && d2_ready;
 assign     i_pop    = d2_fire;
@@ -445,7 +453,8 @@ wire       fast_issueJ    = fast_active && fast_jcc_r && uc_exec &&
 wire       fast_issue     = (fast_issue1 || fast_issueN || fast_issueJ) &&
                             (!d2_valid || d2_fire) &&
                             !d2_waited_r &&
-                            !interrupt_pending && !single_step && !any_fault_pop;
+                            !interrupt_pending && !tf_active_r &&
+                            !single_step && !any_fault_pop;
 
 // A normal boundary uses i_entry. FAST chaining launches the successor on the
 // predecessor's transfer/execute edge and may overlap d2_fire.
@@ -894,6 +903,16 @@ prefetch prefetch_inst (
     .pf_ack_toggle(pf_ack_toggle),
     .pf_rdata(pf_rdata),
     .pf_fault(pf_fault),
+    .pf_fault_code(pf_fault_code),
+    .pf_fault_addr(pf_fault_addr),
+    // Decode may run ahead while an older instruction is still active.  A
+    // retained fetch fault becomes precise once EX is empty or the older
+    // instruction reaches its non-stalled retirement boundary.
+    .fetch_blocked(decoder_fetch_blocked &&
+                   (!uc_active || (i_rni_delay && !stall))),
+    .ifetch_fault(ifetch_page_fault),
+    .ifetch_fault_code(ifetch_fault_code),
+    .ifetch_fault_addr(ifetch_fault_addr),
     // Control
     .pf_suspend(page_fault),
     .halt_speculative(decq_has_jmp_call),
@@ -977,7 +996,8 @@ decoder decoder_inst (
     .d2_push    (d2_push),
     .d1_issue_direct(d1_issue_direct),
     .d1_issue_entry_point(d1_issue_entry_point),
-    .d1_issue_entry(d1_issue_entry)
+    .d1_issue_entry(d1_issue_entry),
+    .fetch_blocked(decoder_fetch_blocked)
 );
 
 wire        d2_push;
@@ -1295,9 +1315,7 @@ wire [63:0] d2_agu_prep  = calc_ea_prep(d2_agu_base, d2_agu_index,
 wire [31:0] d2_agu_a = d2_agu_prep[63:32];
 wire [31:0] d2_agu_b = d2_agu_prep[31:0];
 wire [31:0] d2_agu_c = d2_agu_dec.disp;
-wire [3:0] d2_agu_seg = apply_seg_override_type(
-    calc_default_seg_type(d2_entry.modrm, d2_entry.sib, d2_entry.has_sib,
-                          d2_entry.addr32), d2_entry.seg);
+wire [3:0] d2_agu_seg = d2_entry.mem_seg;
 wire [31:0] d2_agu_segbase = seg_cache[d2_agu_seg].base;
 wire [31:0] d2_agu_lin = (d2_agu_a ^ d2_agu_b ^ d2_agu_c)
                        + (((d2_agu_a & d2_agu_b) | (d2_agu_a & d2_agu_c) |
@@ -1322,6 +1340,7 @@ function automatic [8:0] gpr_dest_probe(input [6:0] dst);
         DEST_EDI, DEST_DI, DEST_eDI:    gpr_dest_probe = {1'b0, 8'h80};
         DEST_DSTREG: gpr_dest_probe = {1'b0, gpr_wr_expand(i.dst_reg_sel)};
         DEST_SRCREG: gpr_dest_probe = {1'b0, gpr_wr_expand(i.src_reg_sel)};
+        DEST_USTEP_BSWAP: gpr_dest_probe = {1'b0, gpr_wr_expand(i.src_reg_sel)};
         DEST_USTEP_ALU: gpr_dest_probe = {1'b0, gpr_wr_expand(i.dst_reg_sel)};
         DEST_IRF:    gpr_dest_probe = (COUNTR[5:3] != 3'b100)
                                     ? {1'b0, 8'h01 << COUNTR[2:0]}
@@ -1593,7 +1612,8 @@ always_comb begin
     if (d2_valid) begin
         seg_cmd_target = init_final_seg;
         seg_cmd_data = {30'd0, i_bus.stack_op, i_bus.addr32};
-    end else if ((uc_buscode == BUSOP_IND_PLUS_ALU || uc_buscode == BUSOP_IND_SRC)
+    end else if ((uc_buscode == BUSOP_IND_PLUS_ALU || uc_buscode == BUSOP_IND_ALU2 ||
+                  uc_buscode == BUSOP_IND_SRC)
                  && (uc_dest == DEST_DES_OS || uc_dest == DEST_DES_SR)) begin
         seg_cmd_target = modrm_resolved_seg;
     end else begin
@@ -1607,6 +1627,7 @@ always_comb begin
     end else begin
         case (uc_buscode)
             BUSOP_IND_PLUS_ALU,
+            BUSOP_IND_ALU2,
             BUSOP_IND_SRC: begin
                 seg_cmd = SEG_CMD_UPDATE_SEG;
                 // DESSTK: set clear_descsw flag in seg_data[0]
@@ -1667,7 +1688,8 @@ wire ind_delta_dword = (IND_DELTA == 32'd4) || (IND_DELTA == -32'd4);
 wire [1:0] mem_eff_size = uc_is_word_op ? (ind_delta_dword ? 2'd2 : 2'd1) :
                           uc_is_dword_op ? 2'd2 : srcreg_size;
 
-wire [31:0] mem_wdata = (uc_buscode == BUSOP_WR_OPR) ? OPR_R :
+wire [31:0] mem_wdata = (uc_buscode == BUSOP_WR_OPR ||
+                         uc_buscode == BUSOP_WR_OPR_WORD) ? OPR_R :
     uc_is_word_op ? read_uc_source(uc_source) :
     (uc_dest == DEST_OPR_W) ? (stack_init_pending ? read_uc_source(uc_source) : dest_value) :
     OPR_W;
@@ -1687,8 +1709,14 @@ reg        gp_fault_double_r;
 wire       fault_start = any_fault && !fault_seen_r;
 wire       double_fault_start = (fault_delivery_state == FAULT_DELIVERING) &&
                                 fault_combine_active;
-wire [2:0]  pg_fault_code;        // Page fault error code
-wire [31:0] pg_cr2_out;           // Faulting address for CR2
+wire        data_page_fault;
+wire [2:0]  data_fault_code;
+wire [31:0] data_cr2_out;
+// The executing instruction is older than a blocked frontend fetch. If both
+// faults arrive together, preserve the demand-side exception and CR2 value.
+wire [2:0]  pg_fault_code = data_page_fault ? data_fault_code : ifetch_fault_code;
+wire [31:0] pg_cr2_out = data_page_fault ? data_cr2_out : ifetch_fault_addr;
+assign page_fault = data_page_fault || ifetch_page_fault;
 
 // CR3 write detection for TLB flush
 wire cr3_write = uc_exec && uc_buscode == BUSOP_SPCR && uc_dest == DEST_PDBR;
@@ -1707,7 +1735,14 @@ wire interrupt_pending = nmi_request_active || (intr_pending && EFLAGS[9]);
 wire nmi_accept_boundary = i_rni_delay && !stall && !page_fault &&
                            nmi_request_active && !single_step;
 
-reg inhibit_interrupts;     // STI shadow: real 386 suppresses interrupt recognition for one instruction after STI
+reg inhibit_interrupts;     // Maskable-interrupt shadow after STI or MOV/POP SS
+reg tf_active_r;            // TF sampled when the current macro-instruction starts
+reg tf_trap_suppress_r;     // Current instruction is MOV/POP SS or a TF-clearing software interrupt
+
+function automatic logic instr_mov_or_pop_ss(input dec_entry_t entry);
+    instr_mov_or_pop_ss = (entry.opcode == 8'h17) ||
+        ((entry.opcode == 8'h8E) && (entry.modrm[5:3] == 3'd2));
+endfunction
 
 // A delayed D2 entry may already occupy the shared ROM q while it is still
 // waiting for literals. It is not an EX uop yet and must not issue its bus op.
@@ -1789,6 +1824,8 @@ paging_unit paging_inst (
     .pf_linear_addr     (pf_linear_addr),
     .pf_rdata           (pf_rdata),
     .pf_fault           (pf_fault),
+    .pf_fault_code      (pf_fault_code),
+    .pf_fault_addr      (pf_fault_addr),
 
     // Demand-side physical request interface
     .dcache_req_valid   (dcache_req_valid),
@@ -1815,9 +1852,9 @@ paging_unit paging_inst (
     .OPR_R              (OPR_R),
 
     // Status
-    .page_fault         (page_fault),
-    .fault_code         (pg_fault_code),
-    .cr2_out            (pg_cr2_out)
+    .page_fault         (data_page_fault),
+    .fault_code         (data_fault_code),
+    .cr2_out            (data_cr2_out)
 );
 
 always_ff @(posedge clk) begin
@@ -1995,7 +2032,7 @@ reg [11:0] microcode_return_stack [0:3];// 4-entry return address stack
 reg [1:0]  microcode_sp;                // Stack pointer (0-3)
 
 reg        uc_jump_taken_prev;          // Jump taken last cycle (for RNi: terminate only in delay slot)
-reg        uc_cond_jump_taken_prev;     // Conditional jump taken last cycle (for PREF suppression)
+reg        uc_pref_suppress_prev;       // Taken LOOP/Jcc micro-jump cancels its speculative PREF delay slot
 
 //   RNI/RnI terminate unless we're in a delay slot of a taken jump (loop continues)
 //   RNi only terminates when in delay slot (after a jump)
@@ -2036,6 +2073,9 @@ reg        misc1_flag;              // Set by SMISC1 {-33-}, tested by JMISC1 {-
 reg        misc2_flag;              // Set by SMISC2 {-35-}, tested by JMISC2 {-55-}
 reg        error_code_flag;         // Set by SERRCF {-36-}, tested by JNERRC {-56-}
 reg        interrupt_hw;            // Set for hardware interrupts, tested by JINTSW {-52-}
+reg        task_saved_flag;         // STSKS/CTSKS latch: outgoing TSS has been saved during this switch
+reg        no_fault_flag;           // SNOFLT/JNOFLT: descriptor probes fail by clearing ZF, not raising #GP
+reg        rep_fault_flag;          // SREPF/CREPF/JREP: interrupted REP MOVS needs index/count correction
 reg        intr_pending;            // Latched INTR request (level-sampled, cleared by CINTLA)
 reg        intr_latch_inhibit;      // Suppress re-latching after CINTLA until intr deasserts
 reg        nmi_pending;             // Latched NMI request (edge-detected, cleared on NMI entry)
@@ -2170,18 +2210,58 @@ function automatic logic is_reljump_taken(input [6:0] aluop);
         ALUJMP_JTSSAF:  is_reljump_taken = tss_access_flag;     // Jump if TSS access flag is set
         ALUJMP_JINTSW:  is_reljump_taken = !interrupt_hw;
         ALUJMP_JMISC1:  is_reljump_taken = misc1_flag;
+        ALUJMP_JEXTFT:  is_reljump_taken = interrupt_hw;
+        ALUJMP_JSTSKL:  is_reljump_taken = !misc1_flag && !interrupt_hw;
+        ALUJMP_JNTSKS:  is_reljump_taken = !task_saved_flag;
         ALUJMP_JMISC2:  is_reljump_taken = misc2_flag;
         ALUJMP_JNERRC:  is_reljump_taken = !error_code_flag;
+        ALUJMP_JNOFLT:  is_reljump_taken = no_fault_flag;
+        ALUJMP_JREP:    is_reljump_taken = rep_fault_flag;
         ALUJMP_JNT:     is_reljump_taken = EFLAGS[14];
         ALUJMP_JIO_OK:  is_reljump_taken = !pe ||
             (cpl <= EFLAGS[13:12] && (!vm || !instr_is_port_io));
         ALUJMP_JMP:     is_reljump_taken = 1'b1;                // Unconditional jump
         ALUJMP_JNOINT:  is_reljump_taken = !interrupt_pending;  // Jump if NO interrupt
         ALUJMP_JNBUSY:  is_reljump_taken = 1'b1;                // FPU busy — always taken (no FPU)
+        ALUJMP_JBUSY,
+        ALUJMP_JICEWT:  is_reljump_taken = 1'b0;                // No x87 BUSY# or ICE wait source
         ALUJMP_J16BIT:  is_reljump_taken = !seg_cache[SEG_TR].seg_type[3];
         default:        is_reljump_taken = 1'b0;
     endcase
 endfunction
+
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        task_saved_flag <= 1'b0;
+    end else if (uc_exec) begin
+        if (uc_aluop == ALUJMP_STSKS)
+            task_saved_flag <= 1'b1;
+        else if (uc_aluop == ALUJMP_CTSKS)
+            task_saved_flag <= 1'b0;
+    end
+end
+
+always_ff @(posedge clk) begin
+    if (!reset_n) begin
+        no_fault_flag  <= 1'b0;
+        rep_fault_flag <= 1'b0;
+    end else begin
+        // Fault/interrupt entry does not pulse i_pop, so these remain visible
+        // to the corresponding fault-handler microcode.
+        if (i_pop) begin
+            no_fault_flag  <= 1'b0;
+            rep_fault_flag <= 1'b0;
+        end
+        if (uc_exec) begin
+            if (uc_aluop == ALUJMP_SNOFLT)
+                no_fault_flag <= 1'b1;
+            if (uc_aluop == ALUJMP_SREPF)
+                rep_fault_flag <= 1'b1;
+            else if (uc_aluop == ALUJMP_CREPF)
+                rep_fault_flag <= 1'b0;
+        end
+    end
+end
 
 // TODO: fix special casing
 // Suppress JMP in LD_DESCRIPTOR at 5D3 when Accessed bit needs GDT write-back.
@@ -2197,14 +2277,12 @@ wire uc_reljump_taken = uc_exec && !repeat_active && is_reljump_taken(uc_aluop) 
                         !desc_accessed_writeback && !prot_redirect_prev &&
                         !jcc_fold_active && !branch_ustep_exec;
 
-wire uc_cond_jump_taken = (uc_reljump_taken &&
-    uc_aluop != ALUJMP_JMP &&
-    uc_aluop != ALUJMP_JNOINT && uc_aluop != ALUJMP_JNBUSY) ||
-    (uc_exec && (
-        (uc_aluop == ALUJMP_LJMPP && pe && !vm) ||
-        (uc_aluop == ALUJMP_LJMPNP && (pe && (cpl != 2'b00))) ||
-        (uc_aluop == ALUJMP_LJMP86 && vm)
-    ));
+// Only the LOOP/Jcc entry routines put a wrong-path PREF in a conditional
+// micro-jump delay slot. Other routines, notably task switch 7D0/7D1, require
+// their PREF regardless of the preceding micro-jump outcome.
+wire uc_pref_suppress_taken = uc_reljump_taken &&
+    (uc_aluop == ALUJMP_JNcond || uc_aluop == ALUJMP_JCNTNZ ||
+     uc_aluop == ALUJMP_JCNT1  || uc_aluop == ALUJMP_LOOPnE);
 
 wire [11:0] uc_ljump_target = {uc_source, uc_alu_src};
 wire ljump_taken = (uc_aluop == ALUJMP_LJUMP) && !prot_redirect_prev;
@@ -2348,10 +2426,6 @@ always_comb begin
             uaddr_now = double_fault_start
                       ? UADDR_DOUBLE_FAULT : UADDR_DIVIDE_ERROR;
 
-        if (page_fault)
-            uaddr_now = double_fault_start
-                      ? UADDR_DOUBLE_FAULT : UADDR_PAGE_FAULT;
-
         if (gate_detect_now)
             uaddr_now = 12'h5BE;
     end
@@ -2363,8 +2437,17 @@ always_comb begin
         uaddr_now = gp_fault_double_r ? UADDR_DOUBLE_FAULT :
                     (ss_fault_r ? UADDR_STACK_FAULT : UADDR_GENERAL_FAULT1);
 
-    if (i_rni_delay && !stall && !page_fault) begin // interrupt dispatch
-        if (nmi_request_active && !single_step)
+    // Demand faults occur during uc_exec, but instruction-fetch faults may
+    // arrive while the sequencer is stalled for missing decode bytes.  Fault
+    // entry must override every normal ROM-address source in either case.
+    if (page_fault)
+        uaddr_now = double_fault_start
+                  ? UADDR_DOUBLE_FAULT : UADDR_PAGE_FAULT;
+
+    if (i_rni_delay && !stall && !page_fault) begin // trap/interrupt dispatch
+        if (tf_trap_pending && !single_step)
+            uaddr_now = UADDR_SINGLE_STEP;
+        else if (nmi_request_active && !single_step)
             uaddr_now = UADDR_NMI;
         else if (intr_pending && EFLAGS[9] && !single_step && !inhibit_interrupts)
             uaddr_now = UADDR_HARDWARE_IRQ;
@@ -2450,13 +2533,15 @@ always_ff @(posedge clk) begin
         i_rni_delay <= 1'b0;
         instr_eip_written <= 1'b0;
         uc_jump_taken_prev <= 1'b0;
-        uc_cond_jump_taken_prev <= 1'b0;
+        uc_pref_suppress_prev <= 1'b0;
         stack_init_pending <= 1'b0;
         dbg_first_done <= 1'b0;
         halted <= 1'b0;
         debug_ip <= 32'h0;
         gate_in_progress <= 1'b0;
         interrupt_entry <= 1'b0;
+        tf_active_r <= 1'b0;
+        tf_trap_suppress_r <= 1'b0;
     end else begin
         if (d2_start || d2_fire || q_flush || any_fault) begin
             d2_waited_r <= 1'b0;
@@ -2506,15 +2591,7 @@ always_ff @(posedge clk) begin
 
             // Latch jump_taken for next cycle (to suppress RNI in delay slot)
             uc_jump_taken_prev <= uc_jump_taken;
-            uc_cond_jump_taken_prev <= uc_cond_jump_taken;
-
-            // Page fault handling: latch fault info for microcode access via LPCR bus op.
-            if (page_fault) begin
-                i_rni_delay <= 1'b0;
-                d2_valid_r <= 1'b0;
-                latched_pf_code <= pg_fault_code;
-                latched_pf_addr <= pg_cr2_out;
-            end
+            uc_pref_suppress_prev <= uc_pref_suppress_taken;
 
             // Track RNI/RnI for delay slot handling and capture EIP at termination
             if (i_rni && uc_active && !instr_eip_written && !any_fault) begin
@@ -2568,6 +2645,13 @@ always_ff @(posedge clk) begin
             uc_active <= 1'b1;
             d2_valid_r <= 1'b0;
             i_first <= 1'b1;
+            tf_active_r <= EFLAGS[8];
+            // INT clears TF as it enters its handler and does not also raise
+            // #DB. INTO only does so when OF takes the interrupt. MOV/POP SS
+            // defer a pending debug trap through the following instruction.
+            tf_trap_suppress_r <= instr_mov_or_pop_ss(i_bus) ||
+                (i_bus.opcode == 8'hCC) || (i_bus.opcode == 8'hCD) ||
+                ((i_bus.opcode == 8'hCE) && EFLAGS[11]);
             stack_init_pending <= i_bus.stack_op;
             instr_eip_written <= 1'b0;
             // TMPeIP/TMPeSP writes moved to GPR block (single-driver)
@@ -2591,9 +2675,27 @@ always_ff @(posedge clk) begin
                 uc_active <= 1'b0;
         end
 
-        // Interrupt recognition at instruction completion. MUST be last in the always_ff
+        // Demand faults normally arrive during uc_exec. Instruction-fetch
+        // faults can arrive with an empty frontend and uc_active=0, so fault
+        // entry and metadata capture must not depend on an executing uop.
+        if (page_fault) begin
+            uc_active <= 1'b1;
+            i_rni_delay <= 1'b0;
+            d2_valid_r <= 1'b0;
+            latched_pf_code <= pg_fault_code;
+            latched_pf_addr <= pg_cr2_out;
+        end
+
+        // Trap/interrupt recognition at instruction completion. MUST be last
+        // so it overrides speculative next-instruction state.
         if (i_rni_delay && !stall && !page_fault) begin
-            if (nmi_request_active && !single_step) begin
+            if (tf_trap_pending && !single_step) begin
+                uc_active <= 1'b1;
+                interrupt_entry <= 1'b1;
+                d2_valid_r <= 1'b0;
+                tf_active_r <= 1'b0;
+                tf_trap_suppress_r <= 1'b0;
+            end else if (nmi_request_active && !single_step) begin
                 uc_active <= 1'b1;
                 interrupt_entry <= 1'b1;
                 d2_valid_r <= 1'b0;
@@ -2753,8 +2855,9 @@ always_ff @(posedge clk) begin
         if (intr && EFLAGS[9] && !intr_latch_inhibit)
             intr_pending <= 1'b1;
 
-        // STI shadow: suppress interrupt recognition for one instruction after STI
-        if (i_rni && i.opcode == 8'hFB)
+        // STI and successful MOV/POP SS suppress maskable interrupts through the
+        // following macro-instruction. A consecutive SS load extends the shadow.
+        if (i_rni && ((i.opcode == 8'hFB) || instr_mov_or_pop_ss(i)))
             inhibit_interrupts <= 1'b1;
         else if (i_rni && inhibit_interrupts)
             inhibit_interrupts <= 1'b0;
@@ -3288,6 +3391,12 @@ always_ff @(posedge clk) begin
                 ALUJMP_DIV5: begin
                     // AAM: ensure CF=0 before the ADC micro-op consumes it.
                     EFLAGS[0] <= 1'b0;
+                    // 80386 DIV sets ZF from the quotient despite the flags being
+                    // architecturally undefined. CPU detectors use this to reject
+                    // early Nx586 parts, which preserve ZF across DIV.
+                    if ((i.opcode == 8'hF6 || i.opcode == 8'hF7) &&
+                        i.modrm[5:3] == 3'd6)
+                        EFLAGS[6] <= div_op_by_size(DIV_OP_MASK, DIVTMP, op_size) == 32'd0;
                 end
                 ALUJMP_CLZF: begin
                     // CLZF (BSR/BSF): Clear Zero Flag to indicate bit was found
@@ -3564,6 +3673,11 @@ always_ff @(posedge clk) begin
     if (!reset_n) begin
         flags_backup_active <= 1'b0;
         FLAGSB <= 32'h0;
+    end else if (ifetch_page_fault) begin
+        // No instruction reached i_pop, so establish the fault checkpoint
+        // that instruction-start normally creates.
+        flags_backup_active <= 1'b1;
+        FLAGSB <= EFLAGS;
     end else if (interrupt_entry) begin
         flags_backup_active <= 1'b0;
     end else if (i_pop && !halted) begin
@@ -3672,6 +3786,11 @@ always_ff @(posedge clk) begin
             DEST_AL:     write_gpr(3'd0, dest_value, 2'd0);
             DEST_AH:     write_gpr(3'd4, dest_value, 2'd0);
 
+            DEST_USTEP_BSWAP:
+                write_gpr(i.src_reg_sel,
+                          {dest_value[7:0], dest_value[15:8],
+                           dest_value[23:16], dest_value[31:24]}, 2'd2);
+
             // Optimizer-owned FAST retire word. SEQ/fast_off ignores this
             // destination and reaches the original slot writeback unchanged.
             DEST_USTEP_ALU: begin
@@ -3724,7 +3843,10 @@ always_ff @(posedge clk) begin
                 // At 2F3, if SIGMA=0 but COUNTR!=0, use COUNTR (set by gate_detect for call gates)
                 if (cs_value == 16'h0000 && COUNTR[15:0] != 16'h0000 && uc_addr == 12'h2F3)
                     cs_value = COUNTR[15:0];
-                if (pe && !vm)
+                // LOAD_TASK reads the incoming CS at 76F.  That selector
+                // establishes CPL directly; TASK_RETURN has already cleared
+                // task_saved_flag before reaching this common load sequence.
+                if (pe && !vm && uc_addr != 12'h76F)
                     CS[15:2] <= cs_value[15:2];
                 else
                     CS <= cs_value;
@@ -3843,6 +3965,12 @@ always_ff @(posedge clk) begin
         wr_restart_eip <= TMPeIP;
     if (page_fault && pg_fault_code[1])
         TMPeIP <= wr_restart_eip;
+    else if (ifetch_page_fault) begin
+        // A cross-page instruction can fault before i_pop captures its restart
+        // state. The architectural registers still describe that boundary.
+        TMPeIP <= EIP;
+        TMPeSP <= ESP;
+    end
 end
 
 // COUNTR

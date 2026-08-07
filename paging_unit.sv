@@ -59,7 +59,9 @@ module paging_unit
     input        [31:0] pf_linear_addr,    // LINEAR address (DWORD-aligned)
     input               pf_redirect_queued,// Redirect request queued behind current prefetch
     output      [127:0] pf_rdata,          // Cache line returned to prefetch
-    output reg          pf_fault,          // Page fault (silently drop, suspend)
+    output reg          pf_fault,          // Page fault response to prefetch
+    output reg   [2:0]  pf_fault_code,     // Saved prefetch fault code ([U,W,P])
+    output reg   [31:0] pf_fault_addr,     // Linear address of faulted prefetch
 
     //=========================================================================
     // Demand-side physical request interface
@@ -564,6 +566,8 @@ always_ff @(posedge clk or negedge reset_n) begin
         icache_req_phys_addr_r <= 32'h0;
         page_fault <= 1'b0;
         pf_fault <= 1'b0;
+        pf_fault_code <= 3'b000;
+        pf_fault_addr <= 32'h0;
         fault_code <= 3'b000;
         rd_ind_active <= 1'b0;
         req_linear <= 32'h0;
@@ -708,7 +712,8 @@ always_ff @(posedge clk or negedge reset_n) begin
                         // demand translation to proceed in parallel.
                     end else if (pg_enable && pf_tlb_match && tlb_hit) begin
                         // Permission fail: silently fault, ack prefetch.
-                        ack_prefetch_fault();
+                        ack_prefetch_fault(pf_linear_addr,
+                                           {(cpl == 2'd3), 1'b0, 1'b1});
                     end else if (pf_tlb_match) begin
                         // TLB miss: start page walk for prefetch
                         // For prefetch walks, use supervisor read permissions
@@ -919,7 +924,7 @@ always_ff @(posedge clk or negedge reset_n) begin
                         state <= PG_IDLE;
                     end else if (walk_fault) begin
                         // Prefetch page fault: silently ack with fault flag
-                        ack_prefetch_fault();
+                        ack_prefetch_fault(tlb_lookup_addr, walk_fault_code);
                         state <= PG_IDLE;
                     end else if (cache_lookup_granted) begin
                         // Walk succeeded, emit BIU request with translated address
@@ -1013,8 +1018,13 @@ task automatic raise_walk_fault(
     complete_mem_request();
 endtask
 
-task automatic ack_prefetch_fault();
+task automatic ack_prefetch_fault(
+    input [31:0] fault_addr,
+    input [2:0]  walk_code
+);
     pf_fault <= 1'b1;
+    pf_fault_addr <= fault_addr;
+    pf_fault_code <= walk_code;
     pf_ack_toggle_r <= ~pf_ack_toggle_r;
 endtask
 

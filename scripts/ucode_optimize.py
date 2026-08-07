@@ -24,6 +24,7 @@ ROM_DEPTH = 2560
 UCODE_BITS = 37
 ROM_BITS = 40
 DEST_USTEP_ALU = 0x7E       # Optimizer-owned: commit this word's ALU result to DSTREG.
+DEST_USTEP_BSWAP = 0x7C     # Optimizer-owned: byte-swap SRCREG into itself.
 
 # field name -> (shift, width)
 FIELDS = {
@@ -77,6 +78,12 @@ class Recipe:
 
 
 PATCHES = [
+    # ---- 80486 instruction extensions -----------------------------------
+    # 0F C8-CF has no 80386 PLA entry. The decoder redirects it to this
+    # otherwise unused word and selects the register through opcode[2:0].
+    Patch(0x9C4, "BSWAP r32 extension: SRCREG -> byte-swapped SRCREG + RNI",
+          copy_from=0x003, fields=dict(dst=DEST_USTEP_BSWAP)),
+
     # ---- v52 direct ALU usteps -------------------------------------------
     # Every FAST ALU retire word owns its architectural write through one
     # destination encoding. This replaces the parallel FAST_COMMIT_ALU write

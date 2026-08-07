@@ -29,7 +29,13 @@ module prefetch
     output reg        pf_redirect_queued,
     input             pf_ack_toggle,
     input      [127:0] pf_rdata,
-    input             pf_fault,      // page fault on this fetch (silently drop)
+    input             pf_fault,      // page fault response for this fetch
+    input      [2:0]  pf_fault_code,
+    input      [31:0] pf_fault_addr,
+    input             fetch_blocked, // decoder needs bytes beyond buffered data
+    output reg        ifetch_fault,  // registered one-shot architectural fault
+    output     [2:0]  ifetch_fault_code,
+    output     [31:0] ifetch_fault_addr,
 
     // Control
     input             pf_suspend,    // external suspend (e.g. page fault handler active)
@@ -61,6 +67,9 @@ reg [3:0]  d1_word;                  // D1 cursor word, >= pop cursor
 reg [1:0]  d1_boff;                  // D1 cursor byte offset
 reg [1:0]  pf_fetch_word_start;      // First word to keep from next fetched line
 reg        pf_suspended;             // Prefetch suspended (page fault until flush)
+reg        pf_fault_reported;        // retained fault has been sent to the core
+reg [2:0]  pf_fault_code_r;
+reg [31:0] pf_fault_addr_r;
 reg        pf_drop_inflight;         // Drop next prefetch result (flush during in-flight)
 reg [31:0] pf_fetch_addr;            // Next LINEAR cache-line address to prefetch
 
@@ -145,6 +154,11 @@ wire pf_has_line_space = (pf_words_after_ack <= 5'd4);
 wire pf_can_fetch = pf_has_line_space && !pf_suspended && !pf_suspend &&
                     !q_flush && !pf_inflight && !halt_speculative;
 wire pf_can_fetch_after_flush = q_flush && !pf_suspend && !pf_inflight;
+
+// Fetches may run ahead of execution, so a sequential prefetch fault is not an
+// exception until decode actually needs bytes from the faulted line.
+assign ifetch_fault_code = pf_fault_code_r;
+assign ifetch_fault_addr = pf_fault_addr_r;
 
 // Spec fetch launch: takes priority over sequential prefetch for the shared port; never launches during a flush or while a request is...
 // Details: doc/z386x/implementation_notes.md#src-24-z386x-prefetch-sv-165
@@ -338,6 +352,10 @@ always_ff @(posedge clk or negedge reset_n) begin
         d1_boff <= 2'h0;
         pf_fetch_word_start <= 2'h0;
         pf_suspended <= 1'b0;
+        ifetch_fault <= 1'b0;
+        pf_fault_reported <= 1'b0;
+        pf_fault_code_r <= 3'b000;
+        pf_fault_addr_r <= 32'h0;
         pf_drop_inflight <= 1'b0;
         pf_fetch_addr <= 32'hFFFF_FFF0;  // Reset vector, cache-line aligned
         pf_req_toggle <= 1'b0;
@@ -355,6 +373,7 @@ always_ff @(posedge clk or negedge reset_n) begin
         spec_off <= '0;
     end else begin
         pf_ack_prev <= pf_ack_toggle;
+        ifetch_fault <= 1'b0;
 
         pf_rptr <= rptr_next;
         pf_wptr <= wptr_next;
@@ -370,6 +389,7 @@ always_ff @(posedge clk or negedge reset_n) begin
             pf_fetch_word_start <= pf_flush_addr[3:2];
             pf_linear_addr <= {pf_flush_addr[31:4], 4'b0000};
             pf_suspended <= 1'b0;
+            pf_fault_reported <= 1'b0;
             if (spec_flush_hit) begin
                 // Target line already buffered (or arriving right now): the
                 // queue was seeded combinationally; continue sequentially.
@@ -440,12 +460,20 @@ always_ff @(posedge clk or negedge reset_n) begin
             end else if (pf_drop_inflight || pf_fault) begin
                 pf_drop_inflight <= 1'b0;
                 pf_redirect_queued <= 1'b0;
-                if (pf_fault && !pf_drop_inflight)
+                if (pf_fault && !pf_drop_inflight) begin
                     pf_suspended <= 1'b1;
+                    pf_fault_code_r <= pf_fault_code;
+                    pf_fault_addr_r <= pf_fault_addr;
+                end
             end else begin
                 pf_fetch_addr <= pf_fetch_addr + 32'd16;
                 pf_fetch_word_start <= 2'd0;
             end
+        end
+
+        if (pf_suspended && !pf_fault_reported && fetch_blocked && !q_flush) begin
+            ifetch_fault <= 1'b1;
+            pf_fault_reported <= 1'b1;
         end
 
         // Latch a spec request; a newer request replaces an older PENDING one but never the address of a fetch already in flight. Ownership-based...

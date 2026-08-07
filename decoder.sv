@@ -38,7 +38,8 @@ module decoder
     output              d2_push,        // d2_entry is complete this cycle
     output              d1_issue_direct,// handoff has no older D2 skeleton
     output       [11:0] d1_issue_entry_point,
-    output dec_entry_t  d1_issue_entry  // live structural entry for empty-pipe launch
+    output dec_entry_t  d1_issue_entry, // live structural entry for empty-pipe launch
+    output              fetch_blocked   // decoder is waiting for unfetched bytes
 );
 
 typedef enum logic [1:0] {
@@ -59,6 +60,7 @@ typedef struct packed {
     logic       lit2_sign_extend;
     logic       lit1_mirror_disp;
     logic       lit2_mirror_disp;
+    logic       fields_fit;          // both literal fields fit the first D2 window
     logic       need_sib;
     logic [2:0] pending_imm_size;
     logic       pending_imm_sign_extend;
@@ -127,6 +129,15 @@ always_comb begin
     handoff_d2 = handoff_work;
     {handoff_d2.entry.ea_index_onehot, handoff_d2.entry.ea_base_onehot} =
         dec_ea_onehots(handoff_work.entry);
+    handoff_d2.entry.mem_seg = handoff_work.entry.stack_op ? SEG_SS :
+        apply_seg_override_type(
+            calc_default_seg_type(handoff_work.entry.modrm,
+                                  handoff_work.entry.sib,
+                                  handoff_work.entry.has_sib,
+                                  handoff_work.entry.addr32),
+            handoff_work.entry.seg);
+    handoff_d2.fields_fit = (handoff_work.lit2_kind == LIT_NONE) ||
+        ({1'b0, handoff_work.lit1_size} + {1'b0, handoff_work.lit2_size} <= 4'd4);
 end
 // First literal byte, as an offset from the POP cursor (prefix bytes are
 // not popped until D2 completes): total length minus the literal bytes.
@@ -334,13 +345,12 @@ wire [2:0] sizeB    = skel.lit2_size;
 wire       has_litA = (skel.lit1_kind != LIT_NONE);
 wire       has_litB = (skel.lit2_kind != LIT_NONE);
 wire [3:0] sizeAB   = {1'b0, sizeA} + {1'b0, sizeB};
-wire       ab_fit   = (sizeAB <= 4'd4);   // both fields inside one window
 
 // Once field A is in the registered window, the live literal port is free to
 // preread field B while D2 interprets A.
 wire d2_window_valid = skel_window_valid_r;
 wire prefetch_fieldB = skel_v && d2_window_valid && !d2_phaseB &&
-                       has_litB && !ab_fit;
+                       has_litB && !skel.fields_fit;
 wire [4:0] resident_lit_off = skel_lit_off +
                               ((d2_phaseB || prefetch_fieldB)
                                   ? {2'b00, sizeA} : 5'd0);
@@ -372,10 +382,10 @@ always_comb begin
                             workB.lit2_sign_extend, workB.lit2_mirror_disp);
 end
 
-wire       finishing = d2_phaseB || !has_litB || ab_fit;
+wire       finishing = d2_phaseB || skel.fields_fit;
 wire [3:0] need_now  = d2_phaseB ? {1'b0, sizeB} :
                        !has_litA ? 4'd0 :
-                       (has_litB && ab_fit) ? sizeAB : {1'b0, sizeA};
+                       skel.fields_fit ? sizeAB : {1'b0, sizeA};
 wire       bytes_ok  = (lit_avail >= {2'b00, need_now});
 wire       d2_can    = skel_v && d2_window_valid;
 wire       d2_complete = d2_can && finishing;
@@ -384,11 +394,20 @@ assign     d2_done   = i_pop;
 wire       d2_stepA  = d2_can && !finishing;
 wire       d2_late_capture = skel_v && !d2_window_valid && bytes_ok;
 
+// A retained prefetch fault becomes architectural only when one of the decode
+// stages is genuinely blocked on bytes, not while the queue can still run or
+// D1 is merely backpressured by its skid slot.
+wire d1_bytes_blocked = !skid_v &&
+                        (d1_sib ? !sib_bytes_ok :
+                         (!consume_prefix && !consume_0f && !struct_bytes_ok));
+wire d2_bytes_blocked = skel_v && !d2_window_valid && !bytes_ok;
+assign fetch_blocked = d1_bytes_blocked || d2_bytes_blocked;
+
 decoder_work_t d2_final;
 always_comb begin
     d2_final = d2_phaseB ? capB :
                !has_litA ? skel :
-               (has_litB && ab_fit) ? capAB : capA;
+               skel.fields_fit ? capAB : capA;
 end
 
 always_ff @(posedge clk or negedge reset_n) begin
@@ -441,12 +460,10 @@ always_ff @(posedge clk or negedge reset_n) begin
     end
 end
 
-// Entry-point resolution moved BACK to D1
+// Literal capture does not change structural EA fields; use the selectors and
+// segment index registered at the D1 handoff directly.
 dec_entry_t push_entry;
-always_comb begin
-    push_entry = d2_final.entry;
-    {push_entry.ea_index_onehot, push_entry.ea_base_onehot} = dec_ea_onehots(push_entry);
-end
+assign push_entry = d2_final.entry;
 
 assign d2_entry = push_entry;
 assign d2_push  = d2_complete;
@@ -567,6 +584,7 @@ task automatic build_struct_work(
     logic [2:0]  imm_first_size;
     logic        imm_sign_extend;
     logic        invalid_lock;
+    logic        instr_bswap;
     begin
         w = '0;
         s_len = 3'd1;
@@ -607,9 +625,14 @@ task automatic build_struct_work(
             entry_first;
         invalid_lock = check_lock_invalid(prefix_rep_lock, prefix_0f, opcode,
                                           has_modrm, modrm);
-        w.entry.entry_point = invalid_lock ? 12'h82B : entry_final[11:0];
-        w.entry.stack_op = invalid_lock ? 1'b0 : entry_final[13];
-        w.entry.stack_dir = invalid_lock ? 1'b0 : entry_final[12];
+        instr_bswap = prefix_0f && (opcode[7:3] == 5'b11001);
+        w.entry.entry_point = invalid_lock ? 12'h82B :
+                              instr_bswap ? 12'h9C4 : entry_final[11:0];
+        w.entry.stack_op = (invalid_lock || instr_bswap) ? 1'b0 : entry_final[13];
+        w.entry.stack_dir = (invalid_lock || instr_bswap) ? 1'b0 : entry_final[12];
+        // BSWAP has a fixed r32 operand even in a 16-bit code segment.
+        if (instr_bswap)
+            w.entry.data32 = 1'b1;
 
         if (has_modrm) begin
             has_sib = addr32 && (modrm[7:6] != 2'b11) && (modrm[2:0] == 3'b100);
