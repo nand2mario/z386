@@ -3,9 +3,13 @@
 
 z386 is an 80386-compatible CPU core written in SystemVerilog and built around the original Intel 386 microcode. Instead of implementing each x86 instruction as a separate RTL behavior, z386 implements the hardware structures the microcode expects to control: instruction prefetch, decode, the microcode sequencer, segmentation, paging, protection checks, ALU, shifter, and bus access.
 
-The project is intended as an educational reconstruction, a MiSTer PC core, and a reusable embedded x86 CPU core.
+The project is intended as an educational reconstruction and a reusable
+embedded x86 CPU core.
 
-*For the MiSTer core based on z386, see [z386_MiSTer](https://github.com/nand2mario/z386_MiSTer).*
+For the faster 80486-class successor with a pipelined design, faster frontend,
+hardwired common instructions, and an integrated x87 unit, see
+[z486](https://github.com/nand2mario/z486). The current MiSTer PC core is
+[z486_MiSTer](https://github.com/nand2mario/z486_MiSTer).
 
 Comparison of z386 v0.4 with ao486 on a DE10-Nano:
 
