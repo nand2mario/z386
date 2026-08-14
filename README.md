@@ -42,5 +42,5 @@ z386 was written by nand2mario. It builds on Intel 386 microcode disassembly and
 
 Copyright 2026 nand2mario. The SystemVerilog, Python, and Markdown files
 (`*.sv`, `*.svh`, `*.py`, and `*.md`) are licensed under the
-[Apache License 2.0](LICENSE). The license does not cover `ucode.hex`; see
-[License Scope](LICENSE-SCOPE.md) for details.
+[Apache License 2.0](LICENSE). 
+See [License Scope](LICENSE-SCOPE.md) for details.
