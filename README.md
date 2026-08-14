@@ -37,3 +37,10 @@ I also wrote a blog series analyzing the 386 microarchitecture and documenting t
 * [80386 Early Start Memory Access](https://nand2mario.github.io/posts/2026/80386_early_start/)
 
 z386 was written by nand2mario. It builds on Intel 386 microcode disassembly and silicon reverse-engineering work by [reenigne](https://www.reenigne.org/blog/), [gloriouscow](https://github.com/dbalsom), [smartest blob](https://github.com/a-mcego), and [Ken Shirriff](https://www.righto.com/).
+
+## License
+
+Copyright 2026 nand2mario. The SystemVerilog, Python, and Markdown files
+(`*.sv`, `*.svh`, `*.py`, and `*.md`) are licensed under the
+[Apache License 2.0](LICENSE). The license does not cover `ucode.hex`; see
+[License Scope](LICENSE-SCOPE.md) for details.
