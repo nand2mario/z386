@@ -1,15 +1,14 @@
-
 # z386 - an 80386-class FPGA CPU built around original microcode
 
-z386 is an 80386-compatible CPU core written in SystemVerilog and built around the original Intel 386 microcode. Instead of implementing each x86 instruction as a separate RTL behavior, z386 implements the hardware structures the microcode expects to control: instruction prefetch, decode, the microcode sequencer, segmentation, paging, protection checks, ALU, shifter, and bus access.
+z386 is an 80386-compatible CPU core written in SystemVerilog. It reconstructs
+the hardware controlled by the original Intel 386 microcode rather than
+reimplementing every x86 instruction directly in RTL.
 
-The project is intended as an educational reconstruction and a reusable
-embedded x86 CPU core.
-
-For the faster 80486-class successor with a pipelined design, faster frontend,
-hardwired common instructions, and an integrated x87 unit, see
-[z486](https://github.com/nand2mario/z486). The current MiSTer PC core is
-[z486_MiSTer](https://github.com/nand2mario/z486_MiSTer).
+The core includes instruction prefetch and decode, a microcode sequencer,
+segmentation, paging, protection checks, integer arithmetic, shifting, and bus
+access. Separate configurable instruction and data caches support FPGA system
+integration. The project is intended both as an educational reconstruction of
+the 80386 and as a reusable embedded x86 core.
 
 ## Performance
 
@@ -25,42 +24,63 @@ only 2.3% more ALMs.
 | z486 | 0.330 | 2.800 | 21,906 |
 
 All cores execute the same i386 binary. z386 and z486 use matched 8 KB
-instruction and 8 KB data caches; ao486 uses its native cache. ALMs are
+instruction and 8 KB data caches; ao486 uses its native cache. Area figures are
 standalone seed-1 fits on the same DE10-Nano Cyclone V with identical Quartus
-settings. The z486 area includes its experimental x87 unit. ao486 counts
-retirement at a different boundary, so its CPI is less directly comparable.
-
-### DOOM
-
-![Board-measured Doom and 3DBench performance](docs/dos_performance.svg)
-
-These are board measurements using each core's native release configuration:
-85 MHz for z386 and z486, and 90 MHz for ao486. The z386 v0.4 result uses its
-release 16 KB instruction and 16 KB data caches, whereas the Dhrystone
-comparison above uses matched 8 KB + 8 KB configurations for z386 and z486.
-
-The complete methodology and analysis are in the
-[z486 technical report](https://nand2mario.github.io/posts/2026/z486/).
+settings. The z486 figure includes its experimental x87 unit. ao486 counts
+retirement at a different pipeline boundary, so its CPI is less directly
+comparable.
 
 The z386 L1 cache size is tunable through the `DCACHE_SET_BITS` and
 `ICACHE_SET_BITS` parameters.
 
-To learn more about the 80386 microcode, read [80386 microcode disassembled](https://www.reenigne.org/blog/80386-microcode-disassembled/).
+## Build and test
 
-I also wrote a blog series analyzing the 386 microarchitecture and documenting the process of building z386:
+The regression tests use Verilator and Python:
 
+```bash
+cd tests
+make test-simple
+make test-protected
+```
+
+The test directory also contains cache and instruction-timing tests, a
+Dhrystone harness, the broader `test386.py` suite, and runners for external
+real- and protected-mode single-step reference datasets.
+
+## Related projects
+
+For the faster 80486-class successor with a pipelined frontend, hardwired
+common instructions, and an integrated x87 unit, see
+[z486](https://github.com/nand2mario/z486). The current MiSTer PC integration
+is [z486_MiSTer](https://github.com/nand2mario/z486_MiSTer).
+
+## Further reading
+
+For background on the recovered ROM, read
+[80386 microcode disassembled](https://www.reenigne.org/blog/80386-microcode-disassembled/).
+
+The following articles describe the 80386 microarchitecture and the development
+of z386:
+
+* [z386: An Open-Source 80386 Built Around Original Microcode](https://nand2mario.github.io/posts/2026/z386/)
 * [80386 Multiplication and Division](https://nand2mario.github.io/posts/2026/80386_multiplication_and_division/)
 * [80386 Barrel Shifter](https://nand2mario.github.io/posts/2026/80386_barrel_shifter/)
 * [80386 Protection](https://nand2mario.github.io/posts/2026/80386_protection/)
 * [80386 Memory Pipeline](https://nand2mario.github.io/posts/2026/80386_memory_pipeline/)
-* [z386: An Open-Source 80386 Built Around Original Microcode](https://nand2mario.github.io/posts/2026/z386/)
 * [80386 Early Start Memory Access](https://nand2mario.github.io/posts/2026/80386_early_start/)
 
-z386 was written by nand2mario. It builds on Intel 386 microcode disassembly and silicon reverse-engineering work by [reenigne](https://www.reenigne.org/blog/), [gloriouscow](https://github.com/dbalsom), [smartest blob](https://github.com/a-mcego), and [Ken Shirriff](https://www.righto.com/).
+## Credits
+
+z386 was written by nand2mario. It builds on Intel 386 microcode disassembly
+and silicon reverse-engineering by
+[reenigne](https://www.reenigne.org/blog/),
+[gloriouscow](https://github.com/dbalsom),
+[smartest blob](https://github.com/a-mcego), and
+[Ken Shirriff](https://www.righto.com/).
 
 ## License
 
 Copyright 2026 nand2mario. The SystemVerilog, Python, and Markdown files
 (`*.sv`, `*.svh`, `*.py`, and `*.md`) are licensed under the
-[Apache License 2.0](LICENSE). 
-See [License Scope](LICENSE-SCOPE.md) for details.
+[Apache License 2.0](LICENSE). See [License Scope](LICENSE-SCOPE.md) for
+details. The recovered microcode image is not covered by this license.
