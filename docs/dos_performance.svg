@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 500" role="img" aria-labelledby="title desc">
+  <title id="title">DOS benchmark performance of z386, ao486, and z486</title>
+  <desc id="desc">z486 reaches 29.1 frames per second in Doom at maximum detail and 51.2 in 3DBench, ahead of ao486 and z386 v0.4 on the same MiSTer setup.</desc>
+  <style>.h{font:600 18px system-ui,sans-serif;fill:#0f172a}.t{font:14px system-ui,sans-serif;fill:#334155}.n{font:12px system-ui,sans-serif;fill:#64748b}.grid{stroke:#e2e8f0}.z386{fill:#94a3b8}.ao{fill:#f59e0b}.z486{fill:#0e7490}.value{font:600 14px system-ui,sans-serif;fill:#0f172a}</style>
+  <rect width="1000" height="500" fill="#fff"/>
+  <text x="500" y="30" text-anchor="middle" class="h">Board-measured DOS performance</text>
+  <g class="grid"><path d="M80 400H460M540 400H920"/><path d="M80 320H460M540 320H920"/><path d="M80 240H460M540 240H920"/><path d="M80 160H460M540 160H920"/><path d="M80 80H460M540 80H920"/></g>
+  <text x="270" y="65" text-anchor="middle" class="h">Doom, maximum detail (FPS)</text><text x="730" y="65" text-anchor="middle" class="h">3DBench (FPS)</text>
+  <rect x="115" y="216" width="72" height="184" class="z386"/><rect x="230" y="232" width="72" height="168" class="ao"/><rect x="345" y="167" width="72" height="233" class="z486"/>
+  <rect x="575" y="133" width="72" height="267" class="z386"/><rect x="690" y="137" width="72" height="263" class="ao"/><rect x="805" y="93" width="72" height="307" class="z486"/>
+  <g class="value" text-anchor="middle"><text x="151" y="206">23.0</text><text x="266" y="222">21.0</text><text x="381" y="157">29.1</text><text x="611" y="123">44.5</text><text x="726" y="127">43.8</text><text x="841" y="83">51.2</text></g>
+  <g class="t" text-anchor="middle"><text x="151" y="425">z386</text><text x="266" y="425">ao486</text><text x="381" y="425">z486</text><text x="611" y="425">z386</text><text x="726" y="425">ao486</text><text x="841" y="425">z486</text></g>
+  <g transform="translate(295 462)"><rect width="16" height="16" class="z386"/><text x="24" y="13" class="n">z386 v0.4</text><rect x="155" width="16" height="16" class="ao"/><text x="179" y="13" class="n">ao486</text><rect x="270" width="16" height="16" class="z486"/><text x="294" y="13" class="n">z486 release</text></g>
+</svg>
