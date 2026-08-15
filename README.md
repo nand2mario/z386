@@ -15,21 +15,20 @@ hardwired common instructions, and an integrated x87 unit, see
 
 ### Dhrystone 2.1
 
-All three x86 cores execute the same i386 binary. z386 and z486 use matched
-8 KB instruction and 8 KB data caches; ao486 retains its native cache
-organization. ALMs are standalone seed-1 fits on the DE10-Nano Cyclone V using
-the same z486_MiSTer production settings.
+z386 delivers 16% more Dhrystone performance per MHz than ao486 while using
+only 2.3% more ALMs.
 
 | Core | DMIPS/MHz | CPI | Cyclone V ALMs |
 | --- | ---: | ---: | ---: |
-| z386 | 0.225 | 4.101 | 15,545 |
+| **z386** | **0.225** | **4.101** | **15,545** |
 | ao486 | 0.194 | 4.556 | 15,190 |
-| **z486** | **0.330** | **2.800** | **21,906** |
+| z486 | 0.330 | 2.800 | 21,906 |
 
-The z486 area includes its experimental x87 unit. With x87 disabled, z486 uses
-16,329 ALMs, only 5.0% more than z386. DMIPS/MHz is the primary performance
-metric; ao486 counts retirement at a different pipeline boundary, so its CPI
-is less directly comparable.
+All cores execute the same i386 binary. z386 and z486 use matched 8 KB
+instruction and 8 KB data caches; ao486 uses its native cache. ALMs are
+standalone seed-1 fits on the same DE10-Nano Cyclone V with identical Quartus
+settings. The z486 area includes its experimental x87 unit. ao486 counts
+retirement at a different boundary, so its CPI is less directly comparable.
 
 ### DOOM
 
