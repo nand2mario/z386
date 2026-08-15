@@ -8,6 +8,10 @@
 //
 // This deliberately avoids the old VIPT preread/finalize split.  The paging
 // unit owns translation and only sends physical requests to this module.
+
+`timescale 1ns/1ns
+`default_nettype none
+
 module l1_cache #(
     // Four ways, 16 bytes per line. SET_BITS=8 gives a 16KB data cache
     // (256 sets x 4 ways x 16 B); =7 was 8KB.
@@ -375,27 +379,13 @@ always_comb begin
     endcase
 end
 
-task automatic write_cache_word(input [1:0] way, input [BRAM_ADDR_BITS-1:0] addr, input [31:0] data);
-begin
-    case (way)
-        2'd0: data_way0[addr] <= data;
-        2'd1: data_way1[addr] <= data;
-        2'd2: data_way2[addr] <= data;
-        default: data_way3[addr] <= data;
+`define WRITE_CACHE_WORD(way, addr, data) \
+    case (way) \
+        2'd0: data_way0[addr] <= data; \
+        2'd1: data_way1[addr] <= data; \
+        2'd2: data_way2[addr] <= data; \
+        default: data_way3[addr] <= data; \
     endcase
-end
-endtask
-
-task automatic write_cache_tag(input [1:0] way, input [SET_BITS-1:0] set, input [TAG_BITS-1:0] tag);
-begin
-    case (way)
-        2'd0: begin tag_way0[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way0[set] <= 1'b1; end
-        2'd1: begin tag_way1[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way1[set] <= 1'b1; end
-        2'd2: begin tag_way2[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way2[set] <= 1'b1; end
-        default: begin tag_way3[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way3[set] <= 1'b1; end
-    endcase
-end
-endtask
 
 // Preread runs on every ready idle cycle, with no cpu_valid/TLB gating: when
 // no request is accepted the preread results are garbage that S_LOOKUP never
@@ -544,7 +534,7 @@ always_ff @(posedge clk) begin
                     storeq_count <= storeq_count_wr_next;
                     if (lookup_hit && !req_uncacheable_r) begin
                         patched = merge32(lookup_way_data, req_din_r, req_be_r);
-                        write_cache_word(lookup_way, req_bram_addr, patched);
+                        `WRITE_CACHE_WORD(lookup_way, req_bram_addr, patched)
                         plru_set[req_set_r] <= plru_update(rd_plru_r, lookup_way);
                     end
                     state <= S_IDLE;
@@ -588,7 +578,7 @@ always_ff @(posedge clk) begin
                 end
 
                 if (mem_resp_valid) begin
-                    write_cache_word(fill_way, {fill_set, fill_count}, fill_word_data);
+                    `WRITE_CACHE_WORD(fill_way, {fill_set, fill_count}, fill_word_data)
 
                     if (fill_count == fill_target_word && !fill_target_returned) begin
                         dout_r <= fill_word_data;
@@ -597,7 +587,12 @@ always_ff @(posedge clk) begin
                     end
 
                     if (fill_count == {WORD_OFFSET_BITS{1'b1}}) begin
-                        write_cache_tag(fill_way, fill_set, fill_tag);
+                        case (fill_way)
+                            2'd0: begin tag_way0[fill_set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, fill_tag}; valid_way0[fill_set] <= 1'b1; end
+                            2'd1: begin tag_way1[fill_set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, fill_tag}; valid_way1[fill_set] <= 1'b1; end
+                            2'd2: begin tag_way2[fill_set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, fill_tag}; valid_way2[fill_set] <= 1'b1; end
+                            default: begin tag_way3[fill_set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, fill_tag}; valid_way3[fill_set] <= 1'b1; end
+                        endcase
                         // Do NOT restore the other ways' valid bits from the
                         // fill-START snapshot -- a snoop invalidation landing
                         // DURING this fill must survive (same bug as l1_icache).

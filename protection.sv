@@ -131,7 +131,9 @@ logic [5:0]  s2_test_const;     // For debug display
 logic [15:0] pla_test_input;
 
 // PLA4 output (18 bits)
-logic [17:0] pla_test_output;
+logic [11:0] pla_test_addr;   // Computed by always_comb block
+logic [3:0]  pla_test_flags;  // Computed by always_comb block
+logic [17:0] pla_test_output; // {pla_test_flags, pla_test_addr, 2'b00};
 
 // Descriptor field extraction
 wire       desc_g    = descriptor_g;
@@ -1256,9 +1258,6 @@ assign pla_test_output = {pla_test_flags, pla_test_addr, 2'b00};
 //   bits[1:0]:   Valid/type bits
 //
 //==============================================================================
-
-logic [11:0] pla_test_addr;      // Computed by always_comb block
-logic [3:0]  pla_test_flags;     // Computed by always_comb block
 
 //==============================================================================
 // Stage 2: Register PLA4 outputs (posedge clk when pipe_en)

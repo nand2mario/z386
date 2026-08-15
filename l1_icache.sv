@@ -7,6 +7,10 @@
 //
 // This is the instruction-cache half of l1_cache.sv with the store buffer and
 // write datapath removed.
+
+`timescale 1ns/1ns
+`default_nettype none
+
 module l1_icache #(
     parameter integer SET_BITS = 8   // 16KB icache (256 sets x 4 ways x 16 B); =7 was 8KB
 ) (
@@ -314,28 +318,6 @@ end
 assign cpu_line = lookup_read_hit_now ? lookup_way_line : line_r;
 assign cpu_resp_valid = lookup_read_hit_now || resp_valid_r;
 
-task automatic write_cache_line(input [1:0] way, input [SET_BITS-1:0] set, input [127:0] line);
-begin
-    case (way)
-        2'd0: data_way0[set] <= line;
-        2'd1: data_way1[set] <= line;
-        2'd2: data_way2[set] <= line;
-        default: data_way3[set] <= line;
-    endcase
-end
-endtask
-
-task automatic write_cache_tag(input [1:0] way, input [SET_BITS-1:0] set, input [TAG_BITS-1:0] tag);
-begin
-    case (way)
-        2'd0: begin tag_way0[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way0[set] <= 1'b1; end
-        2'd1: begin tag_way1[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way1[set] <= 1'b1; end
-        2'd2: begin tag_way2[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way2[set] <= 1'b1; end
-        default: begin tag_way3[set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, tag}; valid_way3[set] <= 1'b1; end
-    endcase
-end
-endtask
-
 always_ff @(posedge clk) begin
     if (accept_cpu) begin
         rd_tag0_r <= tag_way0[cpu_set][TAG_BITS-1:0];
@@ -499,11 +481,31 @@ always_ff @(posedge clk) begin
                     fill_line <= fill_line_next;
 
                     if (fill_count == {WORD_OFFSET_BITS{1'b1}}) begin
-                        write_cache_line(fill_way, fill_set, fill_line_next);
-                        write_cache_tag(fill_way, fill_set, fill_tag);
+                        case (fill_way)
+                            2'd0: begin
+                                data_way0[fill_set] <= fill_line_next;
+                                tag_way0[fill_set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, fill_tag};
+                                valid_way0[fill_set] <= 1'b1;
+                                end
+                            2'd1: begin
+                                data_way1[fill_set] <= fill_line_next;
+                                tag_way1[fill_set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, fill_tag};
+                                valid_way1[fill_set] <= 1'b1;
+                                end
+                            2'd2: begin
+                                data_way2[fill_set] <= fill_line_next;
+                                tag_way2[fill_set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, fill_tag};
+                                valid_way2[fill_set] <= 1'b1;
+                                end
+                            default: begin
+                                data_way3[fill_set] <= fill_line_next;
+                                tag_way3[fill_set] <= {{(TAG_RAM_BITS-TAG_BITS){1'b0}}, fill_tag};
+                                valid_way3[fill_set] <= 1'b1;
+                                end
+                        endcase
                         line_r <= fill_line_next;
                         resp_valid_r <= 1'b1;
-                        // Only write_cache_tag (above) sets valid for fill_way.
+                        // Only the tag_way case above sets valid for fill_way.
                         // Do NOT restore the other ways' valid bits from the
                         // fill-START snapshot: a snoop invalidation that landed
                         // DURING this fill (self-modifying code) must survive.
